@@ -53,7 +53,6 @@ warn_unreachable = true
 files = ["lambdas", "db", "tests"]
 
 [[tool.mypy.overrides]]
-# pg8000 ships no type information (no py.typed); its objects are typed as Any at the boundary.
 module = ["pg8000", "pg8000.*"]
 ignore_missing_imports = true
 

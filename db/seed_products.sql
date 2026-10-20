@@ -1,20 +1,3 @@
--- SEED DATA — hand-written fallback products, not crawled from any lender.
---
--- Applied by `python db/migrate.py --seed`. Lets Workflows B and C run before
--- Workflow A has crawled anything, or when every crawl target is down.
--- Every row is labelled three ways so it can never pass for real data:
--- source = 'seed', is_seed = true, and a "Seed ·" product-name prefix.
---
--- Thresholds sit inside the sample CSV's ranges (income 25k–150k, score
--- 650–800, age 22–50; docs/data-notes.md) so the matching funnel has real
--- clear and borderline pairs. "Seed · Business Loan Lite" carries a free-text
--- criterion (business vintage) that no column captures, which is what Stage 2
--- treats as borderline.
---
--- Idempotent: one INSERT … ON CONFLICT statement. A re-run changes 0 rows
--- unless this file changed, and it can only ever rewrite seed rows, never a
--- crawled product. Keep it a single statement: migrate.py reports its row count.
-
 INSERT INTO loan_products AS p (
     source, product_name, source_url,
     interest_rate_min, interest_rate_max, min_monthly_income,
@@ -26,8 +9,8 @@ SELECT
     v.rate_min, v.rate_max, v.min_income,
     v.min_score, v.max_score, v.min_age, v.max_age,
     v.employment, v.criteria,
-    encode(sha256(convert_to(v.criteria, 'UTF8')), 'hex'),  -- same SHA-256 hex as Workflow A
-    1.0,  -- typed by hand from the criteria text, so fully structured
+    encode(sha256(convert_to(v.criteria, 'UTF8')), 'hex'),
+    1.0,
     true
 FROM (VALUES
     ('Seed · Salaried Personal Loan', 10.50, 16.00, 30000, 700, NULL, 21, 58,
@@ -64,8 +47,6 @@ ON CONFLICT (source, product_name) DO UPDATE SET
     raw_criteria_text  = EXCLUDED.raw_criteria_text,
     content_hash       = EXCLUDED.content_hash,
     parse_confidence   = EXCLUDED.parse_confidence
--- Only seed rows may be rewritten, and only when something changed, so a re-run
--- does not bump updated_at or invalidate cached verdicts for no reason.
 WHERE p.is_seed
   AND (p.interest_rate_min, p.interest_rate_max, p.min_monthly_income,
        p.min_credit_score, p.max_credit_score, p.min_age, p.max_age,

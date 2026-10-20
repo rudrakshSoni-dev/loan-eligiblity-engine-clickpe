@@ -1,8 +1,8 @@
 """Apply database migrations exactly once each, in order, and optionally the product seed.
 
 Usage (from the repo root):
-    uv run python -m db.migrate           # pending migrations only
-    uv run python -m db.migrate --seed    # then upsert the seed products
+    uv run python -m db.migrate           applies pending migrations only
+    uv run python -m db.migrate --seed    also upserts the seed products afterwards
 
 Connection settings: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, and optional
 DB_SSLROOTCERT (path to the RDS CA bundle). With DB_SSLROOTCERT the server certificate and
@@ -11,7 +11,8 @@ rds.force_ssl is on, so there is no silent unencrypted path to RDS.
 
 Every applied file is recorded in schema_migrations with its SHA-256. Re-running is a no-op;
 editing a file that was already applied is refused, because the database would no longer
-match the file anyone reads in the repo. Schema changes go in a new migration instead.
+match the file anyone reads in the repo. MIGRATIONS is ordered and append-only: a schema
+change is a new entry, never an edit of an old file.
 """
 
 from __future__ import annotations
@@ -34,14 +35,11 @@ from pg8000.exceptions import DatabaseError, InterfaceError
 
 DB_DIR = Path(__file__).resolve().parent
 
-# Ordered and append-only. A new schema change is a new entry, never an edit of an old file.
 MIGRATIONS: tuple[tuple[str, Path], ...] = (("0001_schema", DB_DIR / "schema.sql"),)
 
 SEED_FILE = DB_DIR / "seed_products.sql"
 
-# Any constant works; it only has to be the same for every runner, so two concurrent
-# runs (e.g. two terminals on EC2) apply migrations one after the other, never both.
-LOCK_KEY = 8_420_190_001
+MIGRATION_LOCK_KEY = 8_420_190_001
 
 LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -121,8 +119,11 @@ def settings_from_env(env: Mapping[str, str]) -> DbSettings:
 
 
 def connect(settings: DbSettings) -> Any:
-    # create_default_context verifies the certificate chain and the hostname; pg8000's
-    # ssl_context=True would not verify against the RDS CA.
+    """Open a connection; with sslrootcert, verify the certificate chain and the hostname.
+
+    ssl.create_default_context is used because pg8000's ssl_context=True does not verify
+    the server against the RDS CA bundle.
+    """
     context = (
         ssl.create_default_context(cafile=settings.sslrootcert) if settings.sslrootcert else None
     )
@@ -138,16 +139,19 @@ def connect(settings: DbSettings) -> Any:
 
 
 def migrate(conn: Any, files: Sequence[Migration]) -> list[str]:
-    """Apply all pending migrations in one transaction; return the versions applied."""
+    """Apply all pending migrations in one transaction; return the versions applied.
+
+    The advisory lock makes concurrent runners (e.g. two terminals on EC2) apply in turn.
+    Files run through the simple-query protocol because each holds many statements.
+    """
     conn.run("BEGIN")
     try:
-        conn.run("SELECT pg_advisory_xact_lock(:key)", key=LOCK_KEY)
+        conn.run("SELECT pg_advisory_xact_lock(:key)", key=MIGRATION_LOCK_KEY)
         conn.run(LEDGER_DDL)
         applied = {v: c for v, c in conn.run("SELECT version, checksum FROM schema_migrations")}
         todo = pending_migrations(files, applied)
         for m in todo:
             started = time.monotonic()
-            # Simple-query protocol: a migration file holds many statements.
             conn.execute_simple(m.sql)
             conn.run(
                 "INSERT INTO schema_migrations (version, checksum) VALUES (:v, :c)",
@@ -167,7 +171,10 @@ def migrate(conn: Any, files: Sequence[Migration]) -> list[str]:
 
 
 def seed(conn: Any, sql: str) -> int:
-    """Upsert the seed products; return how many rows were inserted or changed."""
+    """Upsert the seed products; return how many rows were inserted or changed.
+
+    The seed file must stay a single statement: its row count is the reported change count.
+    """
     conn.run("BEGIN")
     try:
         conn.run(sql)

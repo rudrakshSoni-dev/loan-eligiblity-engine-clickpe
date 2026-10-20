@@ -26,6 +26,9 @@ from db.migrate import (
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
+SCHEMA_TABLES = 10
+LEDGER_TABLES = 1
+
 
 def admin_settings(database: str) -> DbSettings:
     return DbSettings(
@@ -74,7 +77,6 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         for e in (json.loads(r.getMessage()) for r in caplog.records)
         if e["stage"] in {"migrations_done", "seed_done"}
     ]
-    # First run: 1 migration, 5 seed rows. Second run: nothing at all.
     assert done == [
         ("migrations_done", 1),
         ("seed_done", 5),
@@ -86,7 +88,7 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
     tables = conn.run(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
     )
-    assert tables == [[11]]  # 10 schema tables + schema_migrations
+    assert tables == [[SCHEMA_TABLES + LEDGER_TABLES]]
 
 
 def test_seed_rows_are_flagged_and_hashed(db_env: dict[str, str], conn: Any) -> None:
@@ -115,17 +117,17 @@ def test_seed_never_rewrites_a_crawled_product(db_env: dict[str, str], conn: Any
 
 def test_edited_migration_is_refused_and_nothing_changes(db_env: dict[str, str], conn: Any) -> None:
     assert main([], env=db_env) == 0
-    edited = [Migration(m.version, m.sql + "\n-- edited") for m in load_migrations()]
+    edited = [Migration(m.version, m.sql + "\nSELECT 1;") for m in load_migrations()]
     with pytest.raises(MigrationError, match="edited after it was applied"):
         migrate(conn, edited)
     assert conn.run("SELECT count(*) FROM schema_migrations") == [[1]]
 
 
 def test_failed_migration_rolls_back_completely(db_env: dict[str, str], conn: Any) -> None:
+    """0001 and a half-done 0002 share one transaction, so neither leaves anything behind."""
     broken = [*load_migrations(), Migration("0002_broken", "CREATE TABLE ok_t (id int); SELEC 1;")]
     with pytest.raises(DatabaseError, match="syntax error"):
         migrate(conn, broken)
-    # 0001 and the half-done 0002 shared one transaction, so neither left anything behind.
     assert conn.run("SELECT to_regclass('users'), to_regclass('schema_migrations')") == [
         [None, None]
     ]

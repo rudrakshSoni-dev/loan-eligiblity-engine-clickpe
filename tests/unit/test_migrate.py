@@ -33,7 +33,7 @@ def test_fully_migrated_database_has_nothing_pending() -> None:
 
 
 def test_edited_applied_migration_is_refused() -> None:
-    edited = Migration(FIRST.version, FIRST.sql + " -- changed")
+    edited = Migration(FIRST.version, FIRST.sql + " SELECT 1;")
     with pytest.raises(MigrationError, match="edited after it was applied"):
         pending_migrations([edited, SECOND], {FIRST.version: FIRST.checksum})
 
@@ -56,8 +56,10 @@ def test_registered_migration_files_exist_and_have_unique_versions() -> None:
 
 
 def test_migration_files_leave_the_transaction_to_the_runner() -> None:
-    # An inner COMMIT would end the runner's transaction before the ledger row is written.
-    # Matches "BEGIN;" only: a plpgsql block opener ("BEGIN" with no semicolon) is fine.
+    """An inner COMMIT would end the runner's transaction before the ledger row is written.
+
+    Only "BEGIN;" is refused: a plpgsql block opener ("BEGIN" with no semicolon) is fine.
+    """
     for _, path in MIGRATIONS:
         lines = {line.strip().upper() for line in Path(path).read_text().splitlines()}
         assert not lines & {"BEGIN;", "COMMIT;", "ROLLBACK;"}, path
