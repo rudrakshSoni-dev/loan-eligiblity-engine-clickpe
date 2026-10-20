@@ -1,2 +1,36 @@
 CLAUDE.md
+
+# Real sample CSV and generated synthetic CSVs (may contain personal data)
 data/
+
+# Local secrets: only the placeholder template is committed
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Serverless Framework build output
+.serverless/
+node_modules/
+
+# n8n local runtime data (credentials are encrypted here, still never commit)
+n8n/data/
+n8n/.n8n/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

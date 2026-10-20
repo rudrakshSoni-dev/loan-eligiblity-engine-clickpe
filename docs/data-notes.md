@@ -32,4 +32,4 @@ Observed on 2026-10-20. File: 993,191 bytes, UTF-8, comma-delimited, header row 
 - Duplicate emails matter for Workflow C: do not group or dedupe notifications by email, only by `user_id`. Per CLAUDE.md §0.5, no mail goes to these addresses anyway; they are only quoted as "intended for" in the body.
 
 ## Housekeeping
-- The file is currently at the repo root (`users.csv`), not `/data/` as CLAUDE.md §3 specifies, and is **not yet gitignored**. Move it to `data/users.csv` and add `data/` to `.gitignore` (T05 covers the latter).
+- The file lives at `data/users.csv`, and `data/` is gitignored (`git check-ignore -v data/users.csv` → `.gitignore:4:data/`). The sample is never committed.
