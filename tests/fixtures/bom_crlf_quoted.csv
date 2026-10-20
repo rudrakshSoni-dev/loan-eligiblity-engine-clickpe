@@ -1,0 +1,6 @@
+﻿ AGE , Employment_Status,email,name,user_id,credit_score,monthly_income
+30, self employed ,  Rohan.Mehta@Example.INVALID ,"Mehta, Rohan",00000000-0000-4000-8000-000000000011,700,55000.50
+33,SALARIED,lina.paul@example.invalid,"Lina
+Paul",00000000-0000-4000-8000-000000000012,710,61000
+
+45,business,arun.nair@example.invalid,Arun Nair,00000000-0000-4000-8000-000000000013,780,99000

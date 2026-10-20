@@ -1,0 +1,4 @@
+user_id,name,email,monthly_income,credit_score,employment_status,age
+00000000-0000-4000-8000-000000000041,First Copy,first.copy@example.invalid,30000,700,Salaried,30
+00000000-0000-4000-8000-000000000042,Other User,other.user@example.invalid,40000,720,Business,40
+00000000-0000-4000-8000-000000000041,Second Copy,second.copy@example.invalid,35000,705,Salaried,31

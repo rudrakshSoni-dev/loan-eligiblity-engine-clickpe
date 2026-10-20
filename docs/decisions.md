@@ -32,6 +32,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 18. [Matching and the Optimization Treasure Hunt](#matching-and-the-optimization-treasure-hunt)
 19. [Crawl targets](#crawl-targets)
 20. [Infrastructure as code: Serverless Framework v3](#infrastructure-as-code-serverless-framework-v3)
+21. [Row validation: strict on meaning, lenient on format](#row-validation-strict-on-meaning-lenient-on-format)
 
 ---
 
@@ -159,7 +160,8 @@ implemented".
 
 **Choice.** `split-csv` streams the file once with a quote-aware CSV scan and records the exact byte
 offsets of record boundaries. Each message carries
-`{batch_id, s3_key, chunk_no, total_chunks, start_byte, end_byte, first_line_no, row_count}`.
+`{batch_id, s3_key, chunk_no, total_chunks, start_byte, end_byte, first_line_no, row_count, columns}`,
+where `columns` is the header in file order (a byte-range chunk has no header row; added in T16).
 `load-chunk` issues `Range: bytes=start-end` and receives whole records, so line numbers in the reject
 report are exact.
 
@@ -631,3 +633,37 @@ the per-function roles.
 must exist before `sls package`. `/clickpe/db/host` and `/clickpe/n8n/webhook_url` hold placeholders
 until the RDS endpoint (T11) and the EC2 private IP (T12) exist. The two SecureStrings were generated
 with `openssl rand` and never displayed.
+
+## Row validation: strict on meaning, lenient on format
+
+**Choice (T16).** `lambdas/shared/validation.py` is pure (no AWS, no database). It checks the header
+once, reads CSV records with their file line numbers, and turns each record into a typed `UserRow` or
+a `Reject` that lists every broken field, for example
+`credit_score: '950' is not a whole number from 300 to 900; age: missing`.
+
+- **Columns are matched by name, in any order**, ignoring case, surrounding spaces and a UTF-8 BOM.
+  Missing or repeated required columns refuse the file with all problems in one message. Unknown extra
+  columns are ignored and reported (`ColumnLayout.ignored`). Rejected: a fixed column order, which
+  would refuse a re-ordered spreadsheet export.
+- **Format is normalised, meaning is not guessed.** Emails are trimmed and lowercased, UUIDs
+  canonicalised, and `employment_status` is matched ignoring case and separators (`self employed`,
+  `SELF_EMPLOYED` → `Self-Employed`). Values such as `25,000`, `₹25000`, `750.0`, `1e5` or an unknown
+  status (`Student`) are rejected with a reason, not converted.
+- **Numbers must be ASCII digits.** Python's `int()` accepts `7_50` and Arabic-Indic `٧٥٠`, and `\d`
+  matches any Unicode digit, so the patterns use `[0-9]` and run before conversion.
+- **Never looser than the schema.** Every accepted row satisfies the `users` CHECK constraints, plus
+  rules the schema cannot express: no control characters (Postgres `text` cannot store NUL), ASCII
+  email with a dotted domain and at most 254 characters, name at most 200 characters, income within
+  `numeric(12,2)`. Reason: `load-chunk` COPYs a chunk in one statement, so a single accepted row that
+  the database refused would fail all 5,000 rows of its chunk.
+- **Duplicates.** A repeated `user_id` within a chunk keeps its first row; later copies are rejected
+  with `user_id: duplicate of line N`. Duplicates in different chunks are not visible to one chunk:
+  the upsert still keeps one row per `user_id`, but the version stored is from whichever chunk commits
+  last. Rejected: a cross-chunk check, which would need a second pass over the file or shared state
+  between loaders for a case the sample does not contain (10,000 distinct ids, T01).
+
+**Measured (T16).** All 10,000 sample rows are accepted with 0 rejects in 464 ms on the dev machine,
+and the 10,000 validated rows insert into PostgreSQL 16 under the real CHECK constraints in one
+statement. Boundary rows (score 300/900, age 18/100, income 0.01 and 9,999,999,999.99, 254-character
+email, 200-character name) insert the same way. With email lowercasing removed (a mutation probe),
+that test fails with `users_email_check`. Commands in `PROGRESS.md` T16.

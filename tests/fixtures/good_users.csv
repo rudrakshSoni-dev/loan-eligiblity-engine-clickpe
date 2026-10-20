@@ -1,0 +1,6 @@
+user_id,name,email,monthly_income,credit_score,employment_status,age
+00000000-0000-4000-8000-000000000001,Asha Rao,asha.rao@example.invalid,25000,650,Salaried,22
+00000000-0000-4000-8000-000000000002,Vikram Shah,vikram.shah@example.invalid,150000,800,Self-Employed,50
+00000000-0000-4000-8000-000000000003,Meera Iyer,meera.iyer@example.invalid,87000,725,Business,35
+00000000-0000-4000-8000-000000000004,Kabir Das,kabir.das@example.invalid,42000,690,Salaried,28
+00000000-0000-4000-8000-000000000005,Nisha Gupta,nisha.gupta@example.invalid,64000,755,Business,41

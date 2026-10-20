@@ -1,0 +1,12 @@
+user_id,name,email,monthly_income,credit_score,employment_status,age
+00000000-0000-4000-8000-000000000021,Missing Age,missing.age@example.invalid,30000,700,Salaried,
+not-a-uuid,Bad Id,bad.id@example.invalid,30000,700,Salaried,30
+00000000-0000-4000-8000-000000000023,Bad Email,not-an-email,30000,700,Salaried,30
+00000000-0000-4000-8000-000000000024,Bad Income,bad.income@example.invalid,"25,000",700,Salaried,30
+00000000-0000-4000-8000-000000000025,Low Score,low.score@example.invalid,30000,250,Salaried,30
+00000000-0000-4000-8000-000000000026,Old,old@example.invalid,30000,700,Salaried,101
+00000000-0000-4000-8000-000000000027,Unknown Job,unknown.job@example.invalid,30000,700,Student,30
+00000000-0000-4000-8000-000000000028,Short Row,short.row@example.invalid,30000,700
+00000000-0000-4000-8000-000000000029,Many Bad,many.bad@example.invalid,-5,abc,Retired,17
+00000000-0000-4000-8000-000000000030,"Bad"Quote,bad.quote@example.invalid,30000,700,Salaried,30
+00000000-0000-4000-8000-000000000031,Fine Row,fine.row@example.invalid,30000,700,Salaried,30

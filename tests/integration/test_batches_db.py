@@ -1,20 +1,16 @@
 """lambdas/shared/batches.py on real PostgreSQL 16: transitions, ledger, exactly-once completion.
 
-Needs a superuser connection to a throwaway server, as in test_migrate_db.py:
-    TEST_DB_HOST=localhost TEST_DB_PORT=55432 TEST_DB_USER=postgres TEST_DB_PASSWORD=... pytest
-Each test gets a freshly migrated database that is dropped afterwards.
+Each test gets a freshly migrated database from the `connect_db` fixture in conftest.py.
 """
 
 import os
 import threading
 import uuid
-from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 
-from db.migrate import DbSettings, connect, load_migrations, migrate
 from lambdas.shared.batches import (
     BatchStateError,
     BatchStatus,
@@ -27,8 +23,7 @@ from lambdas.shared.batches import (
     transition,
     try_complete,
 )
-from lambdas.shared.config import DbConfig
-from lambdas.shared.db import open_connection, transaction
+from lambdas.shared.db import transaction
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
@@ -36,40 +31,6 @@ RACE_TRIALS = 25
 RACE_CHUNKS = 6
 THREAD_TIMEOUT_SECONDS = 30
 BLOCKED_CLAIM_WAIT_SECONDS = 0.5
-
-
-def settings(database: str) -> DbSettings:
-    return DbSettings(
-        host=os.environ["TEST_DB_HOST"],
-        port=int(os.environ.get("TEST_DB_PORT", "5432")),
-        database=database,
-        user=os.environ.get("TEST_DB_USER", "postgres"),
-        password=os.environ.get("TEST_DB_PASSWORD", ""),
-        sslrootcert=None,
-    )
-
-
-@pytest.fixture
-def connect_db() -> Iterator[Callable[[], Any]]:
-    """Yield a factory of connections to a fresh, migrated database; close them all at the end."""
-    name = f"batches_test_{uuid.uuid4().hex[:12]}"
-    admin = connect(settings("postgres"))
-    admin.run(f'CREATE DATABASE "{name}"')
-    s = settings(name)
-    config = DbConfig(s.host, s.port, name, s.user, s.password, ca_bundle=None)
-    opened: list[Any] = []
-
-    def factory() -> Any:
-        conn = open_connection(config)
-        opened.append(conn)
-        return conn
-
-    migrate(factory(), load_migrations())
-    yield factory
-    for conn in opened:
-        conn.close()
-    admin.run(f'DROP DATABASE "{name}" WITH (FORCE)')
-    admin.close()
 
 
 def batch_row(conn: Any, batch_id: uuid.UUID) -> list[Any]:
