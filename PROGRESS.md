@@ -24,7 +24,7 @@
 | T20 | P0 | batch-status Lambda | DONE | 2026-10-21 | GET ?batch_id= → counters, first 5 rejects, match/notified counts, latest funnel (NULL = not measured); 400/404/405/503; 5 DB tests on PG16; shared coverage 100% |
 | T21 | P1 | DLQ handling + alarm | TODO | |  |
 | T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
-| T23 | P0 | docker-compose | TODO | |  |
+| T23 | P0 | docker-compose | DONE | 2026-10-21 | n8n 2.44.4 healthy on EC2; editor only via SSM tunnel (200), public IP times out; webhook allowlist 200 inside / 403 outside; owner account + 2FA still to be created in browser |
 | T24 | P0 | n8n credentials | TODO | |  |
 | T25 | P1 | Workflow E — global error handler | TODO | |  |
 | T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | |  |
@@ -568,3 +568,24 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why open the RDS security group after the deploy, in a separate command? A: The Lambda security group is created by the stack, and the RDS group was created before it in T11, so neither can reference the other at creation time. The rule references the Lambda SG by ID, not a CIDR, so only these functions can reach 5432. Folding the rule into the stack is possible but would make the stack edit a group it does not own.
   - Q: The Lambdas use the RDS master user. Is that acceptable? A: It is a documented shortcut, not a hidden one. The connection is private, TLS-verified and limited to the Lambda SG, but a compromised function could alter any table. The fix is a role with only the privileges the loader needs; it is listed for T45.
   - Q: How do you know exactly-once completion held on the real system? A: Each batch shows `chunks_done` equal to `total_chunks` and `processed`, queues drained with an empty DLQ, and the re-upload logged `unchanged` for every row. The concurrent-finisher guarantee itself was tested against PostgreSQL in T14 (25 × 2 trials); the real deployment ran at most 2 chunks at once, so it does not stress it further. T37 does.
+
+### T23 — docker-compose (2026-10-21)
+- Files: `n8n/docker-compose.yml`, `n8n/.env.example`, `infra/n8n.md`. On EC2 only: `/opt/clickpe/n8n/.env` (mode 600, generated encryption key, never displayed).
+- Built: n8n `2.44.4` pinned, `n8n_data` volume, `WEBHOOK_URL` on the private IP, Asia/Kolkata, pruning, public API/diagnostics off, `N8N_BLOCK_ENV_ACCESS_IN_NODE=true`, system AWS credentials enabled, restart policy, healthcheck. SG `clickpe-n8n-sg` gained 5678 from the Lambda SG only (`sgr-05583458c0968e07c`).
+- Evidence (full output in `infra/n8n.md`):
+  - `docker compose ps` → `Up 2 minutes (healthy)`; `/healthz` → 200; `.env` → `600 root`.
+  - `aws ssm start-session` port forward → `http://localhost:15678/` 200, `{"status":"ok"}`.
+  - Laptop → `3.26.22.50:5678` → timeout (curl exit 28).
+  - Probe workflow: allowlist `172.31.0.0/16` → 200; allowlist `10.255.0.0/16` → 403; after unpublish → 404.
+  - SG `IpPermissions` → one rule: 5678 from `sg-0ad4c9a31f3b8f7cc`, 0 CIDR ranges.
+  - Secrets scan on the two repo files → no matches. No Python touched, so ruff/mypy/pytest were not re-run.
+- Temporary resource: probe workflow `t23probe0001` left unpublished in n8n; delete it in the editor.
+- Not verified: owner account + 2FA (browser step for the user, before T24); the allowlist is checked from the instance's own private IP, not yet from a Lambda (T19).
+- Decision: `$env` access blocked (container env holds the encryption key), so non-secret config goes in an `app_config` table.
+- Rubric: Cloud (n8n with no inbound internet ports, SG-referenced webhook access, IP allowlist proven), n8n (platform ready for A/B/C/E).
+- Explain it back:
+  - Built: a pinned, health-checked n8n container on the EC2 box, reachable by Lambda on the private IP and by humans only through an SSM tunnel.
+  - Why this over the obvious alternative (expose 5678 with a CIDR rule or tunnel): SSM needs no open port and no extra service, and the SG stays at zero internet rules.
+  - Q: Why block `$env` in nodes? A: The container env holds `N8N_ENCRYPTION_KEY`; any Code node could read it. Config that is not secret lives in a DB table.
+  - Q: How do you know the IP allowlist works? A: Two Webhook nodes differing only in the allowlist returned 200 and 403 to the same caller.
+  - Q: Why a plain-HTTP editor? A: It is only reachable through the encrypted SSM tunnel to localhost, so `N8N_SECURE_COOKIE=false` is needed and the exposure is nil.
