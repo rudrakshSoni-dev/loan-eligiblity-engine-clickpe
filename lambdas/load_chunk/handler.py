@@ -3,13 +3,15 @@
 Runs inside the VPC because it writes to RDS. S3 is read through the Gateway Endpoint and the
 Lambda service delivers the SQS messages, so no other AWS API is called. Per message:
     start_loading → ranged S3 read + validation → one transaction (claim chunk, COPY, upsert,
-    rejects, finish chunk) → completion check after the commit.
+    rejects, finish chunk) → completion check after the commit → POST to n8n by the one winner.
 
 A message is acknowledged when its chunk loaded, was a duplicate delivery, belongs to a batch that
 is no longer loading, or can never load (control message, broken split, data the database
 refuses); in the last case the batch is marked failed. Database, network and S3 trouble is
 returned in `batchItemFailures`, so SQS retries only that message and moves it to ingest-dlq after
-5 receives. Configuration is read on the first invocation, not at import.
+5 receives. A failed n8n POST is logged and the message still acknowledged: a redelivery could not
+win the completion again, so retrying it would never re-send. Configuration is read on the first
+invocation, not at import.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from lambdas.shared.config import LoadChunkConfig, load_chunk_config, log_level
 from lambdas.shared.db import Connection, Database, server_error, transaction
 from lambdas.shared.loading import store_rejects, upsert_users, validate_chunk
 from lambdas.shared.logging import configure_logging, log_event, timed
+from lambdas.shared.notify import Sender, notify_batch_processed, send_request
 from lambdas.shared.validation import HeaderError, ValidationResult
 
 logger = logging.getLogger("load_chunk")
@@ -60,6 +63,7 @@ class Runtime:
     config: LoadChunkConfig
     database: Database
     s3: S3RangeReader
+    send: Sender
 
 
 @cache
@@ -70,6 +74,7 @@ def runtime() -> Runtime:
         config=config,
         database=Database(config.db),
         s3=new_s3_reader(os.environ["AWS_REGION"]),
+        send=send_request,
     )
 
 
@@ -139,8 +144,27 @@ def load(app: Runtime, message: ChunkMessage) -> None:
         log_event(logger, "row_count_mismatch", level=logging.WARNING, **mismatch)
     with timed(logger, "chunk_loaded", **ids) as fields:
         fields.update(load_in_transaction(conn, message, result))
-    if try_complete(conn, message.batch_id):
-        log_event(logger, "batch_processed", batch_id=str(message.batch_id))
+    complete_batch(app, conn, message)
+
+
+def complete_batch(app: Runtime, conn: Connection, message: ChunkMessage) -> None:
+    """Finish the batch if every chunk is in; only the one caller that wins announces it to n8n."""
+    batch_id, chunk_id = str(message.batch_id), message.chunk_no
+    if not try_complete(conn, message.batch_id):
+        log_event(logger, "completion_checked", won=False, batch_id=batch_id, chunk_id=chunk_id)
+        return
+    log_event(logger, "batch_processed", batch_id=batch_id, chunk_id=chunk_id)
+    result = notify_batch_processed(app.config.webhook, message.batch_id, app.send)
+    log_event(
+        logger,
+        "webhook_sent" if result.delivered else "webhook_failed",
+        level=logging.INFO if result.delivered else logging.ERROR,
+        batch_id=batch_id,
+        chunk_id=chunk_id,
+        attempts=result.attempts,
+        status=result.status,
+        error=result.error,
+    )
 
 
 def load_in_transaction(

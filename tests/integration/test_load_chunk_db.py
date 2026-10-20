@@ -20,6 +20,7 @@ from lambdas.shared.config import DbConfig, LoadChunkConfig, WebhookConfig
 from lambdas.shared.db import Database
 from lambdas.shared.validation import UserRow, ValidationResult
 from tests.chunk_helpers import BUCKET, FakeS3, line_chunks
+from tests.webhook_helpers import RecordingSender
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
@@ -34,7 +35,9 @@ class Pipeline:
     def __init__(self, connect_db: Callable[[], Any], monkeypatch: pytest.MonkeyPatch) -> None:
         self.db = connect_db()
         self.s3 = FakeS3()
-        app = module.Runtime(CONFIG, Database(UNUSED_DB_CONFIG, lambda _c: connect_db()), self.s3)
+        self.sender = RecordingSender()
+        database = Database(UNUSED_DB_CONFIG, lambda _c: connect_db())
+        app = module.Runtime(CONFIG, database, self.s3, self.sender)
         monkeypatch.setattr(module, "runtime", lambda: app)
 
     def upload(self, data: bytes, rows_per_chunk: int) -> list[ChunkMessage]:
@@ -111,8 +114,9 @@ def test_redelivered_chunk_is_a_no_op(pipeline: Pipeline, caplog: pytest.LogCapt
     assert pipeline.batch(chunks[0].batch_id)[:5] == ["processed", 3, 3, 5, 0]
     assert pipeline.scalar("SELECT count(*) FROM chunk_loads") == 3
     assert [e["duplicate"] for e in loaded_events(caplog)] == [False, True, False, False]
-    assert stages(caplog)[-2:] == ["batch_processed", "chunk_skipped"]
+    assert stages(caplog)[-3:] == ["batch_processed", "webhook_sent", "chunk_skipped"]
     assert len(pipeline.s3.reads) == 4
+    assert pipeline.sender.batch_ids() == [str(chunks[0].batch_id)]
 
 
 def test_malformed_rows_are_reported_with_file_line_numbers_and_good_rows_load(

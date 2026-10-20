@@ -21,6 +21,7 @@ from lambdas.shared.batches import create_batch, upload_key
 from lambdas.shared.config import DbConfig, LoadChunkConfig, SplitCsvConfig, WebhookConfig
 from lambdas.shared.db import Database
 from lambdas.split_csv import handler as split_module
+from tests.webhook_helpers import RecordingSender
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
@@ -49,7 +50,8 @@ class Pipeline:
             UNUSED_DB_CONFIG, BUCKET, WebhookConfig("http://n8n.invalid/", "s")
         )
         database = Database(UNUSED_DB_CONFIG, lambda _c: connect_db())
-        load_app = load_module.Runtime(load_config, database, self.s3)
+        self.sender = RecordingSender()
+        load_app = load_module.Runtime(load_config, database, self.s3, self.sender)
         monkeypatch.setattr(split_module, "runtime", lambda: split_app)
         monkeypatch.setattr(load_module, "runtime", lambda: load_app)
 
@@ -151,6 +153,7 @@ def test_out_of_order_and_duplicate_deliveries_complete_exactly_once(
     )
     stored = pipeline.db.run("SELECT line_no FROM rejected_rows ORDER BY line_no")
     assert [line for (line,) in stored] == list(range(2, 2 + rows_rejected))
+    assert pipeline.sender.batch_ids() == [str(batch_id)]
 
 
 def test_bad_header_fails_the_batch_through_the_queue(
@@ -164,3 +167,4 @@ def test_bad_header_fails_the_batch_through_the_queue(
     status, *_, error = pipeline.batch(batch_id)
     assert status == "failed"
     assert error == "split failed: missing columns: age; repeated columns: email"
+    assert pipeline.sender.requests == []

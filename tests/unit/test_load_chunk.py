@@ -1,5 +1,6 @@
 """load-chunk handler outcomes: which messages are acknowledged, retried, or fail their batch."""
 
+import logging
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -18,8 +19,10 @@ from lambdas.shared.chunks import (
 )
 from lambdas.shared.config import ConfigError, DbConfig, LoadChunkConfig, WebhookConfig
 from lambdas.shared.db import Database
+from lambdas.shared.notify import send_request
 from lambdas.shared.validation import REQUIRED_COLUMNS, HeaderError
 from tests.chunk_helpers import BUCKET, FakeS3
+from tests.webhook_helpers import RecordingSender
 
 BATCH = uuid.UUID("00000000-0000-4000-8000-0000000000cc")
 DB_CONFIG = DbConfig("db", 5432, "loans", "user", "pw", ca_bundle=None)
@@ -62,7 +65,8 @@ def install(
     conn: FailConnection | None = None,
 ) -> FailConnection:
     conn = conn or FailConnection()
-    app = module.Runtime(CONFIG, Database(DB_CONFIG, connector=lambda _c: conn), FakeS3())
+    database = Database(DB_CONFIG, connector=lambda _c: conn)
+    app = module.Runtime(CONFIG, database, FakeS3(), RecordingSender())
     monkeypatch.setattr(module, "runtime", lambda: app)
     monkeypatch.setattr(module, "load", load)
     return conn
@@ -198,4 +202,66 @@ def test_runtime_is_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert first is module.runtime()
     assert first.config.bucket == BUCKET
+    assert first.send is send_request
     module.runtime.cache_clear()
+
+
+NOTIFY_CONFIG = LoadChunkConfig(
+    DB_CONFIG, BUCKET, WebhookConfig("http://n8n:5678/webhook/x", "never-logged-secret")
+)
+
+
+class CompletionConnection:
+    def __init__(self, wins: bool) -> None:
+        self.wins = wins
+
+    def run(self, sql: str, **params: Any) -> list[list[Any]]:
+        assert sql.startswith("UPDATE upload_batches SET status = 'processed'")
+        return [[params["id"]]] if self.wins else []
+
+
+def complete(
+    wins: bool, sender: RecordingSender, caplog: pytest.LogCaptureFixture
+) -> list[dict[str, Any]]:
+    caplog.set_level(logging.INFO)
+    app = module.Runtime(NOTIFY_CONFIG, Database(DB_CONFIG), FakeS3(), sender)
+    module.complete_batch(app, CompletionConnection(wins), CHUNK)
+    return [getattr(r, "event_fields", {}) | {"level": r.levelname} for r in caplog.records]
+
+
+def test_the_completion_winner_posts_the_batch_to_n8n_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sender = RecordingSender()
+
+    events = complete(True, sender, caplog)
+
+    assert sender.batch_ids() == [str(BATCH)]
+    assert [e["stage"] for e in events] == ["batch_processed", "webhook_sent"]
+    assert events[1]["status"] == 200
+    assert events[1]["attempts"] == 1
+
+
+def test_a_caller_that_loses_the_completion_posts_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sender = RecordingSender()
+
+    events = complete(False, sender, caplog)
+
+    assert sender.requests == []
+    assert [(e["stage"], e["won"]) for e in events] == [("completion_checked", False)]
+
+
+def test_a_refused_webhook_is_logged_as_an_error_and_does_not_raise(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sender = RecordingSender(statuses=[404])
+
+    events = complete(True, sender, caplog)
+
+    assert len(sender.requests) == 1
+    assert events[-1]["stage"] == "webhook_failed"
+    assert events[-1]["level"] == "ERROR"
+    assert events[-1]["status"] == 404
+    assert "never-logged-secret" not in str(events)

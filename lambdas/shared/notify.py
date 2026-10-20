@@ -1,0 +1,83 @@
+"""Tell n8n that a batch finished loading: one POST of {"batch_id"} with the shared secret header.
+
+Called only by the load-chunk invocation whose conditional loading → processed UPDATE returned a
+row, so each batch is announced once. Delivery is bounded (5 s per attempt, 3 attempts) and never
+raises: a failure is returned to the caller, which logs it and leaves the batch `processed` for
+scripts/retrigger_batch.sh. Only network errors, timeouts, 429 and 5xx are retried; any other
+status (403 allowlist, 401 secret, 404 workflow not published) cannot improve within seconds.
+Uses the standard library, so the Lambda package gains no dependency.
+"""
+
+from __future__ import annotations
+
+import http.client
+import json
+import time
+import urllib.error
+import urllib.request
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from lambdas.shared.config import WebhookConfig
+
+SECRET_HEADER = "X-Webhook-Secret"
+TIMEOUT_SECONDS = 5.0
+RETRY_DELAYS_SECONDS = (0.5, 1.0)
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+Sender = Callable[[urllib.request.Request, float], int]
+
+
+@dataclass(frozen=True)
+class NotifyResult:
+    delivered: bool
+    attempts: int
+    status: int | None
+    error: str | None
+
+
+def build_request(webhook: WebhookConfig, batch_id: uuid.UUID) -> urllib.request.Request:
+    return urllib.request.Request(
+        webhook.url,
+        data=json.dumps({"batch_id": str(batch_id)}).encode(),
+        headers={"Content-Type": "application/json", SECRET_HEADER: webhook.secret},
+        method="POST",
+    )
+
+
+def send_request(request: urllib.request.Request, timeout: float) -> int:
+    """POST and return the HTTP status; an error status is returned, not raised."""
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code)
+
+
+def notify_batch_processed(
+    webhook: WebhookConfig,
+    batch_id: uuid.UUID,
+    send: Sender = send_request,
+    sleep: Callable[[float], None] = time.sleep,
+    timeout: float = TIMEOUT_SECONDS,
+) -> NotifyResult:
+    """POST the batch id to n8n, retrying transient failures; True in `delivered` on any 2xx."""
+    request = build_request(webhook, batch_id)
+    status: int | None = None
+    error: str | None = None
+    attempts = 0
+    for delay in (0.0, *RETRY_DELAYS_SECONDS):
+        if delay:
+            sleep(delay)
+        attempts += 1
+        try:
+            status, error = send(request, timeout), None
+        except (OSError, http.client.HTTPException) as failure:
+            status, error = None, f"{type(failure).__name__}: {failure}"
+            continue
+        if 200 <= status < 300:
+            return NotifyResult(True, attempts, status, None)
+        if status not in RETRYABLE_STATUSES:
+            break
+    return NotifyResult(False, attempts, status, error)
