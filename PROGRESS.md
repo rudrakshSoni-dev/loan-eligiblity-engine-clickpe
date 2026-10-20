@@ -16,7 +16,7 @@
 | T12 | P0 | EC2 for n8n | DONE | 2026-10-21 | `t4g.small` `i-02ffa9d08e8403a4a`, SG with no inbound rules, SSM session works, Docker 25.0.14 + Compose v2.29.7, 2 GB swap |
 | T13 | P0 | Migrate RDS | DONE | 2026-10-21 | 11 tables on RDS via EC2; re-run applies 0 migrations, seeds 0; 5 seed products flagged |
 | T14 | P0 | Shared modules | DONE | 2026-10-21 | config/db/batches/logging; 25 × 2 race trials → exactly 1 completion each; mutation probe → 6 winners; shared coverage 97.89% |
-| T15 | P0 | get-upload-url | TODO | |  |
+| T15 | P0 | get-upload-url | DONE | 2026-10-21 | Presigned POST verified on real S3: valid file 204; 22 MB file 400 EntityTooLarge; wrong type / key 403. Found and fixed global-endpoint 307 redirect |
 | T16 | P0 | Validation module ⚖️ | TODO | |  |
 | T17 | P1 | split-csv Lambda (outside VPC) ⚖️ | TODO | |  |
 | T18 | P0 | load-chunk Lambda (inside VPC) | TODO | |  |
@@ -400,3 +400,34 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Two chunks commit at the same moment and both run `try_complete`. Why can't both trigger n8n? A: Both UPDATEs target the same batch row. The first takes the row lock and sets `processed`; the second waits, then Postgres re-checks its WHERE against the committed row, `status = 'loading'` is now false, and it gets no row back. 25 aligned trials gave exactly one winner each; removing the guard gave 6.
   - Q: Can both last chunks miss completion and leave the batch stuck in `loading`? A: Not after commit. Each check starts after its own commit, so whichever check starts later sees both ledger rows. If a Lambda dies between commit and check, SQS redelivers the message, `claim_chunk` returns False, and `try_complete` still runs (tested).
   - Q: Why reuse one connection instead of a pool or RDS Proxy? A: A Lambda instance handles one request at a time, so a pool adds nothing; caching the connection skips the TLS + SCRAM handshake on warm starts. With `MaximumConcurrency 3` plus two Function URL Lambdas, connections stay far below RDS's `max_connections` of 79. RDS Proxy is the production upgrade (paid; it would also need an interface-endpoint-free design check).
+
+### T15 — get-upload-url (2026-10-21)
+- Files: `lambdas/shared/uploads.py` (new), `lambdas/get_upload_url/handler.py` (stub replaced), `tests/unit/test_uploads.py`, `tests/unit/test_get_upload_url.py` (new), `scripts/check_package.py` (`lambdas.shared.uploads` added), `pyproject.toml` + `uv.lock` (`boto3` dev dependency only, the Lambda runtime provides it; mypy override), `docs/decisions.md` (upload section)
+- Choices:
+  - `uploads.presigned_upload` is a pure function over a small `S3PostSigner` protocol, so the policy is unit-tested by decoding a real signature. The handler only parses the event, calls `create_batch` and `presigned_upload`, and formats JSON.
+  - The handler builds config, `Database` and the S3 client on the first invocation (`functools.cache`), not at import. `scripts/check_package.py` imports every handler with no env and no site-packages, so an import-time `ConfigError` or a top-level `import boto3` would fail the packaging check. boto3 is imported inside `new_s3_client`.
+  - Only POST is served (405 otherwise, nothing touched). A database error returns 503 `{"error": "database unavailable"}` and resets the cached connection; no signed upload is returned in that case.
+  - The response includes every form field S3 needs. When the role's temporary credentials sign the policy, boto3 adds `x-amz-security-token` to `fields`, so T40 must send every returned field, in order, before the file.
+- Bug found by verification: the `url` boto3 returned was `https://<bucket>.s3.amazonaws.com/` even with SigV4. `curl -F -w '%{http_code} -> %{redirect_url}'` against that host for the Sydney bucket → `307 -> https://clickpe-t15-tmp-376834080732.s3-ap-southeast-2.amazonaws.com/`. A browser does not follow that on a cross-origin form post. Fixed by pinning `endpoint_url=https://s3.<region>.amazonaws.com` and virtual-hosted addressing; the unit test `test_url_is_the_regional_bucket_endpoint` caught it first (an intermediate attempt without `addressing_style` gave a path-style URL).
+- Evidence (handler run locally against a throwaway `postgres:16` migrated with `db.migrate`, and a temporary bucket `clickpe-t15-tmp-376834080732` in ap-southeast-2; the handler output was posted with `curl -F`):
+  - Handler → `200`, url `https://clickpe-t15-tmp-376834080732.s3.ap-southeast-2.amazonaws.com/`, fields `Content-Type, key, policy, x-amz-algorithm, x-amz-credential, x-amz-date, x-amz-signature`, `max_upload_bytes 20971520`, `expires_in_seconds 300`
+  - `SELECT id, s3_key, status, total_chunks FROM upload_batches` → `edb1b536-… | uploads/edb1b536-….csv | pending | (null)`
+  - A. valid 158-byte fixture → `HTTP 204`; `head-object` → `ContentType text/csv`, `ContentLength 158`
+  - B. 22,020,096-byte file → `HTTP 400`, `<Code>EntityTooLarge</Code>`, `<ProposedSize>20973881</ProposedSize><MaxSizeAllowed>20971520</MaxSizeAllowed>`
+  - C. `Content-Type=text/plain` → `HTTP 403`, `Policy Condition failed: ["eq", "$Content-Type", "text/csv"]`
+  - D. `key=uploads/other.csv` → `HTTP 403`, `Policy Condition failed: ["eq", "$key", "uploads/edb1b536-….csv"]`
+  - Bucket listing after A–D → only the one 158-byte object. Global host check above → `307`.
+  - Temporary resources: the bucket (emptied, then `delete-bucket`; `head-bucket` → `404 Not Found`), the container `t15-pg` (removed) and the scratch password and ticket files were deleted.
+  - `make check` → `All checks passed!`, `43 files already formatted`, `Success: no issues found in 31 source files`, `70 passed, 15 skipped` (the 15 are DB integration tests, no DB configured in this run), `Required test coverage of 80.0% reached. Total coverage: 99.34%` (`uploads.py` 100%)
+  - `make package` → `{"stage": "package_imports_ok", "count": 10, "failures": {}}`
+  - Secrets scan on the touched files → only fake test values (`example-secret`, `pw`) and variable names.
+- Not verified here: the Lambda running in the VPC against RDS and the Function URL with CORS. Those run for the first time in T22; the browser POST with the UI origin in T40.
+- Still open (from T13): `serverless.yml` uses `dbName: loans`, `dbUser: loans_app`, but RDS has database `clickpe`, user `clickpe`. Must be aligned before T22, or `getUploadUrl` fails its first connection.
+- Rubric: Cloud Architecture (presigned POST with S3-enforced key, type, size and expiry; regional endpoint), Backend (thin handler over a tested pure function, fail-fast lazy config, structured logs).
+- Explain it back:
+  - Built: the endpoint that starts an upload. It records a `pending` batch, then returns a short-lived signed form that lets the browser send exactly one CSV, at most 20 MB, straight to S3 under a key tied to that batch.
+  - Why this approach over the obvious alternative (a presigned PUT or sending the file through the Lambda): a PUT has no documented size enforcement, and a Function URL or API Gateway body is capped at 6–10 MB. A POST policy makes S3 itself refuse a wrong key, type or size, so the Lambda never sees the bytes. The curl runs show each refusal.
+  - Q: Anyone can call a public Function URL. What stops someone from filling the bucket or the batches table? A: Each call yields a policy limited to one key, 20 MB and 5 minutes, and the bucket expires uploads after 7 days. It does not stop someone from creating many `pending` rows; that needs throttling (API Gateway usage plans or WAF), which is listed as the documented production upgrade rather than built.
+  - Q: Why does the batch row exist before the file does, and what if the user never uploads? A: `split-csv` runs outside the VPC and cannot write to RDS, so the row has to exist first for `load-chunk` to find. An abandoned upload leaves a harmless `pending` row with no S3 object, since S3 never fires an event.
+  - Q: Why return the whole `fields` map instead of fixed fields? A: The set depends on the credentials. Role credentials add `x-amz-security-token`; with a different signer the list differs. The client sends whatever came back, so the policy and the form cannot drift apart.
+

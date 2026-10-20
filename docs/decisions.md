@@ -79,7 +79,16 @@ and sends the file as `multipart/form-data` straight to S3. The signed policy pi
   The 10,000-row sample is 993,191 bytes (measured), so the 100k benchmark file (~10 MB, estimate)
   would not fit.
 
-**To verify in T15.** An over-limit file is rejected by S3; the error is pasted as evidence.
+**Regional endpoint (measured in T15).** `generate_presigned_post` returns the global
+`https://<bucket>.s3.amazonaws.com/` unless the client has an `endpoint_url`. A POST to that host
+for the Sydney test bucket returned `HTTP 307` to `<bucket>.s3-ap-southeast-2.amazonaws.com`. A
+browser will not follow a redirect on a cross-origin form post, so `new_s3_client` pins
+`https://s3.<region>.amazonaws.com` with SigV4 and virtual-hosted addressing.
+
+**Verified in T15.** Against a real S3 bucket with the handler's output and `curl -F`: a valid file
+returned `204`; a 22,020,096-byte file returned `400 EntityTooLarge` (`MaxSizeAllowed 20971520`);
+a wrong `Content-Type` and a changed `key` each returned `403` with the failed policy condition.
+Evidence in `PROGRESS.md` T15.
 
 ## Ingestion fan-out: S3 → split-csv → SQS → load-chunk
 

@@ -11,6 +11,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "boto3>=1.43.116",
     "mypy>=1.13",
     "pytest>=8.3",
     "pytest-cov>=6.0",
@@ -53,7 +54,7 @@ warn_unreachable = true
 files = ["lambdas", "db", "scripts", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["pg8000", "pg8000.*"]
+module = ["pg8000", "pg8000.*", "boto3", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

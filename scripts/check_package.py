@@ -23,6 +23,7 @@ RUNTIME_MODULES = (
     "lambdas.shared.db",
     "lambdas.shared.batches",
     "lambdas.shared.logging",
+    "lambdas.shared.uploads",
 )
 
 REQUIRED_FILES = ("lambdas/shared/rds-global-bundle.pem",)
