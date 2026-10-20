@@ -50,7 +50,7 @@ python_version = "3.12"
 # Strict everywhere, not only lambdas/shared: CLAUDE.md §4 requires full type hints in all code.
 strict = true
 warn_unreachable = true
-files = ["lambdas", "db", "tests"]
+files = ["lambdas", "db", "scripts", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["pg8000", "pg8000.*"]

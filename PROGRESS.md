@@ -11,7 +11,7 @@
 | T07 | P0 | Decisions doc ⚖️ | DONE | 2026-10-20 | Research-revised; approved by user. 13 plan changes (concurrency, ledger, presigned POST, SSM-only n8n, strict LLM schema, reason-keyed cohorts) |
 | T08 | P0 | Schema ⚖️ | DONE | 2026-10-20 | 10 tables, 21 self-asserting constraint checks; all 10,000 sample rows pass the CHECKs |
 | T09 | P0 | Migrations + seed | DONE | 2026-10-20 | Checksummed ledger + advisory lock; re-run applies 0 migrations, changes 0 seed rows; 5 seed products flagged |
-| T10 | P0 | serverless.yml base ⚖️ | TODO | |  |
+| T10 | P0 | serverless.yml base ⚖️ | DONE | 2026-10-21 | Serverless v3; `sls package` + `validate-template` + `cfn-lint` clean; no `*` action on `*` resource; config moved to repo root. Opus review fixed a pg8000 import crash (`slim`) and silent `splitCsv` failures |
 | T11 | P0 | RDS | TODO | |  |
 | T12 | P0 | EC2 for n8n | TODO | |  |
 | T13 | P0 | Migrate RDS | TODO | |  |
@@ -248,3 +248,67 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: What happens if someone edits `schema.sql` after it was applied to RDS? A: The stored SHA-256 no longer matches, so `migrate.py` refuses and changes nothing. Schema changes must be a new migration file (e.g. T25's `n8n_errors`), which keeps RDS and the repo provably in sync.
   - Q: Why did `schema.sql` lose its `BEGIN`/`COMMIT`? A: The runner applies a file and inserts its ledger row in one transaction. An inner `COMMIT` would commit the schema before the ledger row, so a crash between them would leave tables with no record and the next run would fail on `CREATE TABLE`. The integration test shows a failing migration rolls back all of it.
   - Q: Could the seed overwrite a real crawled product or cause fake matches to look real? A: No. The upsert's `WHERE p.is_seed` means it only rewrites seed rows (tested), and every seed row is marked `source='seed'`, `is_seed=true`, "Seed ·" in its name and "SEED DATA." in its criteria, so any email, UI or query can show or filter it.
+
+### T10 — serverless.yml base (2026-10-21)
+- Plan approved by the user ("go"): Serverless v3; placeholder SSM values for the DB host and n8n URL until T11/T12.
+- Files: `serverless.yml` (new, repo root), `package.json` + `package-lock.json` (serverless 3.40.0, serverless-python-requirements 6.1.2), `infra/requirements-lambda.txt` (runtime deps exported from `uv.lock`), `lambdas/{get_upload_url,split_csv,load_chunk,batch_status}/handler.py` (501 stubs, replaced in T15/T17/T18/T20), `Makefile` (`make package`, `npm ci` in `make install`), `docs/decisions.md` (new section 20 "Infrastructure as code"; IAM section: ENI `*` explained)
+- Deviation from CLAUDE.md §3: `serverless.yml` is at the repo root, not `infra/`. Serverless v3 rejects a config outside the working directory and ignores a symlink (its config lookup checks for a regular file), and it cannot package `../lambdas`. Both attempts' errors are in this session's output.
+- Built:
+  - Provider: python3.12, arm64, `ap-southeast-2`, profile `clickpe`, 14-day log retention, no reserved concurrency anywhere.
+  - S3 `clickpe-loan-uploads-<account>-<stage>`: all four public-access blocks, SSE-S3, CORS POST from the UI origin only (`--ui-origin`, default `http://localhost:8000`), `uploads/` expire after 7 days, TLS-only bucket policy, `ObjectCreated` on `uploads/*.csv` → `splitCsv` (permission scoped by `SourceAccount` + `SourceArn`).
+  - SQS `ingest` (visibility 720 s = 6 × the 120 s `loadChunk` timeout, SSE) → `ingest-dlq` after 5 receives, 14-day retention.
+  - `loadChunk` ESM: `BatchSize 1`, `ScalingConfig.MaximumConcurrency 3`, `ReportBatchItemFailures`.
+  - Network: S3 Gateway Endpoint on the default VPC main route table. Lambda SG egress only to 5432 and 5678 inside the VPC CIDR and 443 to the S3 prefix list `pl-6ca54005`. `splitCsv` runs outside the VPC; the other three run inside.
+  - One IAM role per function with per-function statements: logs on its own log group only; `s3:PutObject`/`GetObject` on `uploads/*` only; SQS send or receive on the one queue.
+  - Function URLs (`getUploadUrl` POST, `batchStatus` GET), CORS to the UI origin, `lambda:InvokeFunctionUrl` plus `lambda:InvokeFunction` with `InvokedViaFunctionUrl: true`.
+  - SSM: `/clickpe/db/host` (String, placeholder), `/clickpe/n8n/webhook_url` (String, placeholder), `/clickpe/db/password` and `/clickpe/n8n/webhook_secret` (SecureString, `openssl rand`, never displayed). All created with `--no-overwrite`, version 1.
+- Bugs found by verification, then fixed: (1) `get_upload_url`-style keys became `GetUnderscoreuploadUnderscoreurlLambdaFunction` logical IDs, so the hand-written `!Ref`s dangled; keys are now camelCase. (2) `aws cloudformation validate-template` → `Circular dependency between resources: [... UploadBucket, SplitCsvS3InvokePermission, SplitCsvLambdaFunction, SplitCsvRole ...]`; roles and env now use the deterministic bucket name instead of `!GetAtt UploadBucket.Arn`.
+- Evidence:
+  - `npx serverless package` → `✔ Service packaged (1s)`; zip 372,300 bytes containing `lambdas/`, `pg8000`, `scramp`, `asn1crypto`, `dateutil`, `six` (arm64 requirements cache)
+  - Only warning: `at 'provider.runtime': must be equal to one of the allowed values [... python3.11 ...]`. The v3 schema predates 3.12; the template carries `python3.12` unchanged.
+  - `aws cloudformation validate-template --template-body file://.serverless/cloudformation-template-update-stack.json` → valid (`The AWS CloudFormation template for this Serverless application`)
+  - `uvx cfn-lint --regions ap-southeast-2` → exit 0; 4 × `W3005` (redundant DependsOn generated by the framework), no errors
+  - Script over the template: `dangling refs: []`. Functions: python3.12 / arm64 / `ReservedConcurrentExecutions None`. ESM `{"BatchSize": 1, "FunctionResponseTypes": ["ReportBatchItemFailures"], "ScalingConfig": {"MaximumConcurrency": 3}}`
+  - IAM review (script flags every `*` resource or `*`/`service:*` action): no wildcard actions. The only `Resource: "*"` is `ec2:Create/Describe/DeleteNetworkInterface` on the 3 VPC roles (required for VPC Lambdas; see decisions.md → IAM)
+  - `git check-ignore -v .serverless/… node_modules` → both ignored (the packaged template contains resolved SecureString values)
+  - Secrets scan: only `${ssm:/…}` references in `serverless.yml`
+- Not verified yet: an actual `sls deploy`. The stack is deployed in T22, after RDS (T11) and EC2 (T12) exist. `validate-template` and `cfn-lint` check schema and references, not runtime behaviour.
+- Quality gates (`make check`): `All checks passed!`, `28 files already formatted`, `Success: no issues found in 18 source files`, `15 passed, 5 skipped`, coverage floor reached
+- SSM commands (for the README; replace placeholders in T11/T12 with `--overwrite`):
+  ```bash
+  aws ssm put-parameter --profile clickpe --name /clickpe/db/host --type String --value <rds-endpoint> --overwrite
+  aws ssm put-parameter --profile clickpe --name /clickpe/db/password --type SecureString --value "$(openssl rand -hex 24)" --no-overwrite
+  aws ssm put-parameter --profile clickpe --name /clickpe/n8n/webhook_url --type String --value http://<ec2-private-ip>:5678/webhook/match-batch --overwrite
+  aws ssm put-parameter --profile clickpe --name /clickpe/n8n/webhook_secret --type SecureString --value "$(openssl rand -hex 32)" --no-overwrite
+  ```
+- Rubric: Cloud Architecture (presigned-POST-ready bucket, S3 → SQS → Lambda with DLQ and concurrency cap, Gateway Endpoint instead of NAT/interface endpoints, least-privilege per-function IAM, Function URL permissions, all in one IaC file).
+- Explain it back:
+  - Built: the whole AWS skeleton as code. A private, TLS-only upload bucket that triggers a splitter, a queue with a DLQ feeding a loader capped at 3 concurrent runs, a free S3 endpoint for VPC Lambdas, a locked-down security group, and one minimal role per function. It packages and validates; it deploys in T22.
+  - Why this approach over the obvious alternative (framework defaults: one shared role, the `s3:` event with `existing: true`, `AWSLambdaVPCAccessExecutionRole`): defaults give every function every other function's permissions, add a custom-resource Lambda with its own role to wire S3 events, and grant `logs:*` on `*`. Hand-written roles and a bucket-level notification keep each grant visible and minimal at the cost of ~150 lines of YAML.
+  - Q: Why does the visibility timeout say 720 and not 120? A: If a loader takes the full 120 s and the message becomes visible again too early, a second loader would process the same chunk in parallel. AWS recommends at least 6× the function timeout for SQS event sources, so 720 s. The chunk ledger makes a duplicate harmless anyway, but this avoids the wasted work and the extra receive counts that could push a healthy chunk to the DLQ.
+  - Q: How do VPC Lambdas reach S3 without a NAT Gateway? A: A Gateway Endpoint adds a route for S3's prefix list to the VPC route table. It is free, and the security group allows 443 only to that prefix list. SQS is never called from inside the VPC: the Lambda service polls the queue for `loadChunk`, and `splitCsv`, which sends messages, runs outside the VPC.
+  - Q: Your Function URLs are `AuthType NONE`. Isn't `Principal: "*"` on `lambda:InvokeFunction` dangerous? A: That permission carries `InvokedViaFunctionUrl: true`, so it allows only invocations that arrive through the URL, not direct `Invoke` API calls. The URLs themselves are public by design (the browser has no AWS credentials). The mitigations are CORS restricted to the UI origin, the S3 POST policy's size and key limits, and the documented API Gateway upgrade path.
+
+#### T10 review — `serverless.yml` re-checked on Opus (2026-10-21)
+- Requested by the user after T10: the model-picker preset for T10 is `opus @ high` and the task had been built on Sonnet.
+- Files: `serverless.yml`, `scripts/check_package.py` (new), `Makefile` (`package` runs the import check), `pyproject.toml` (mypy covers `scripts/`), `docs/decisions.md`
+- Fixed:
+  1. **Critical: the packaged zip could not import pg8000.** `slim: true` removed every `dist-info` folder (`unzip -l … | grep -c dist-info` → `0`), and `scramp/__init__.py:12` does `__version__ = version("scramp")`. A system `python3` importing from the extracted zip → `importlib.metadata.PackageNotFoundError: No package metadata was found for scramp`. `getUploadUrl`, `loadChunk` and `batchStatus` would all have crashed at cold start, first visible in T22. Fix: `slim: false` plus `npx serverless requirements cleanCache` (the plugin had reused the slim build).
+  2. **New guard, `scripts/check_package.py`.** It extracts the zip and imports `pg8000.native` and all 4 handlers in `python -I -S` with only the zip on `sys.path`. Its first version used `-I` only and wrongly passed on the broken zip, because the venv's site-packages supplied `scramp`'s metadata. With `-S`, the old zip → `{"stage": "package_imports_failed", … "pg8000.native": "importlib.metadata.PackageNotFoundError: No package metadata was found for scramp"}` (exit 1). New zip → `{"stage": "package_imports_ok", "count": 5, "failures": {}}`, 838,217 bytes, with `METADATA` for asn1crypto, pg8000, python_dateutil, scramp, six.
+  3. **`splitCsv` failures were silent.** An async S3 invoke that kept failing was dropped after 2 retries and the batch stayed `pending`. Added `maximumRetryAttempts: 2`, `maximumEventAge: 3600` and an on-failure destination, queue `split-failures` (14-day retention, SSE). `SplitCsvRole` may `sqs:SendMessage` to it. Template: `SplitCsvLambdaEvConf` → `{"DestinationConfig": {"OnFailure": {"Destination": "arn:aws:sqs:ap-southeast-2:376834080732:clickpe-loan-engine-dev-split-failures"}}, "MaximumEventAgeInSeconds": 3600, "MaximumRetryAttempts": 2}`.
+  4. **The upload size cap was defined only for `splitCsv`.** `getUploadUrl` needs the same value for the POST policy's `content-length-range` (T15). Moved to `custom.maxUploadBytes`, used by both (template shows `20971520` on each).
+  5. **Documented the second copy of the secrets.** The packaged/deployed CloudFormation template holds the SecureString values as literals (decisions.md → Secrets).
+- Checked and found correct (live account, 2026-10-21):
+  - No S3 endpoint exists yet in `vpc-0cddb8b4387b5bbdc` (`describe-vpc-endpoints` → empty), so the Gateway Endpoint will not collide.
+  - The main route table `rtb-00f1e10252170f96a` has only the `Main` association, so all 3 default subnets use it implicitly and the endpoint route reaches every Lambda subnet.
+  - Lambda account concurrency is still 10.
+  - The remaining items also hold: visibility 720 = 6 × 120 with DLQ retention (14 d) longer than source (4 d); ESM IAM; log ARNs match the generated log-group names; the SG egress list replaces AWS's default allow-all; DNS to the VPC resolver is not filtered by security groups; the Function URL `InvokedViaFunctionUrl` permission.
+- Accepted, not changed (low; for README Limitations):
+  - VPC, subnet and route-table IDs are hard-coded in `custom`. Correct for this account, but another account must edit 5 values.
+  - The Gateway Endpoint keeps the default full-access policy, because the main route table is shared with the EC2 host.
+  - `provider.profile: clickpe` is fixed, which suits a single developer.
+- Evidence after the fixes: `make package` → `✔ Service packaged`, `package_imports_ok`; `validate-template` → valid; `cfn-lint` → exit 0, 4 × `W3005` only; `make check` → `All checks passed!`, `29 files already formatted`, `Success: no issues found in 19 source files`, `15 passed, 5 skipped`, coverage floor reached.
+- Explain it back:
+  - Q: Why didn't `validate-template` or `cfn-lint` catch the pg8000 crash? A: They check the CloudFormation template, not the code inside the zip. Only importing the packaged code in a clean interpreter shows it, which is why that check is now part of `make package`.
+  - Q: Why a separate `split-failures` queue instead of reusing `ingest-dlq`? A: The two hold different things. `ingest-dlq` holds chunk messages that can be redriven back into `ingest`. `split-failures` holds Lambda's async-failure records (the S3 event plus an error), and redriving those into `ingest` would feed `loadChunk` a message it cannot parse.
+  - Q: Why did the import check first pass on a broken zip? A: `-I` only drops env vars and the user site. The venv's own site-packages was still on the path, and `importlib.metadata` found `scramp`'s metadata there. `-S` removes site-packages entirely, so the zip is the only source, as in Lambda. The check was confirmed to fail on the old zip before being trusted.

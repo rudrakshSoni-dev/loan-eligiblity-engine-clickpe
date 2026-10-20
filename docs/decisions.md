@@ -31,6 +31,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 17. [LLM provider: Groq](#llm-provider-groq)
 18. [Matching and the Optimization Treasure Hunt](#matching-and-the-optimization-treasure-hunt)
 19. [Crawl targets](#crawl-targets)
+20. [Infrastructure as code: Serverless Framework v3](#infrastructure-as-code-serverless-framework-v3)
 
 ---
 
@@ -373,6 +374,13 @@ recommends Secrets Manager over environment variables for database credentials
 Anyone with `lambda:GetFunctionConfiguration` (and decrypt) can read the values, and rotation needs a
 redeploy. Secrets Manager with rotation is the production option.
 
+**Second copy (measured, T10 review).** `${ssm:…}` is resolved by the framework, so the packaged
+CloudFormation template holds the SecureString values as literals (48- and 64-character strings in
+`.serverless/cloudformation-template-update-stack.json`). That copy is gitignored locally. After a deploy it
+also sits in the deployment bucket (SSE, TLS-only policy) and in the stack's template, which anyone
+with `cloudformation:GetTemplate` can read. The same production fix applies: Secrets Manager, with the
+function reading the secret at runtime.
+
 ## IAM and the SES credential
 
 **Choice.** One role per Lambda, scoped to specific ARNs:
@@ -380,9 +388,19 @@ redeploy. Secrets Manager with rotation is the production option.
 | Function | Permissions beyond logs |
 |---|---|
 | `get-upload-url` | `s3:PutObject` on `uploads/*`; VPC ENI permissions |
-| `split-csv` | `s3:GetObject` on `uploads/*`; `sqs:SendMessage` on `ingest-queue` |
+| `split-csv` | `s3:GetObject` on `uploads/*`; `sqs:SendMessage` on `ingest-queue` and `split-failures` (async on-failure destination) |
 | `load-chunk` | `s3:GetObject` on `uploads/*`; SQS receive/delete/get-attributes on `ingest-queue`; VPC ENI permissions |
 | `batch-status` | VPC ENI permissions |
+
+Roles are plain CloudFormation in `serverless.yml`, not the framework's shared role, so each function
+gets only its own row. Log permissions cover only the function's own log group (`CreateLogStream`,
+`PutLogEvents`; the group itself is created by the stack). The one `Resource: "*"` statement is the
+three ENI actions every VPC-attached Lambda needs (`ec2:CreateNetworkInterface`,
+`DescribeNetworkInterfaces`, `DeleteNetworkInterface`). Describe actions cannot be scoped to a resource,
+and AWS's own `AWSLambdaVPCAccessExecutionRole` uses `*` for all three
+([Lambda VPC permissions](https://docs.aws.amazon.com/lambda/latest/dg/configuring-vpc.html#configuring-vpc-permissions)).
+The inline version still drops that managed policy's `logs:*`-on-`*` grant. `split-csv` runs outside
+the VPC and has no EC2 permissions.
 
 For n8n → SES, the first choice is the EC2 instance role: n8n's **AWS (Assume Role)** credential with
 "Use System Credentials" (`N8N_AWS_SYSTEM_CREDENTIALS_ACCESS_ENABLED=true`) assumes one SES-only role,
@@ -555,3 +573,52 @@ removed, never the full HTML; pages carry dates such as "Oct 2026" that would ch
 
 **Why these thresholds help the demo (estimate).** ₹25k/₹30k income floors and 700/750 score floors
 fall inside the sample's ranges, so the funnel will have a real borderline band.
+
+## Infrastructure as code: Serverless Framework v3
+
+**Choice.** Serverless Framework 3.40.0 with `serverless-python-requirements` 6.1.2, pinned in
+`package.json` / `package-lock.json`. All resources are in one `serverless.yml`: the four functions, the S3
+bucket, both queues, the event source mapping, the S3 Gateway Endpoint, the Lambda security group and
+the per-function roles.
+
+**Rejected.**
+- *Serverless Framework v4.* It requires a Serverless account login, and a paid licence for
+  organisations above a revenue threshold. v3 needs neither.
+- *AWS SAM / CDK.* Both are valid. The task brief and plan name the Serverless Framework, and v3's
+  `url:` and `sqs: maximumConcurrency` cover what this stack needs in a few lines.
+
+**Facts found while building (measured, T10).**
+- v3 refuses a config file outside the working directory, and it ignores a symlinked
+  `serverless.yml`, because it checks for a regular file. The packaged code (`lambdas/`) must sit
+  below the config. So `serverless.yml` lives at the repo root, not in `infra/` as first planned;
+  `infra/` holds the Lambda requirements file and the EC2 material.
+- v3's schema does not list `python3.12`, so `sls package` prints a validation warning. The value is
+  passed to CloudFormation unchanged, and `cfn-lint` accepts it. `configValidationMode: error` is
+  therefore not set.
+- Function keys are camelCase (`loadChunk`) because v3 turns `_` into `Underscore` in logical IDs
+  (`LoadUnderscorechunkLambdaFunction`), which breaks hand-written `!Ref`s.
+- The S3 → `splitCsv` notification is declared on the bucket itself. Roles and environment variables
+  use the deterministic bucket name, `clickpe-loan-uploads-<account>-<stage>`, instead of `!GetAtt`.
+  Otherwise bucket → notification → function → role → bucket is a cycle, which CloudFormation's
+  `validate-template` reported.
+- Function URLs get two permissions: the framework's `lambda:InvokeFunctionUrl`, plus an explicit
+  `lambda:InvokeFunction` with `InvokedViaFunctionUrl: true`. The second is required for Function URLs
+  created since October 2025, and its condition stops it from allowing a direct `Invoke` call.
+
+- `slim: true` (the plugin's size optimisation) strips every `*.dist-info` folder, and `scramp`
+  (pg8000's SCRAM auth library) calls `importlib.metadata.version("scramp")` at import. The packaged
+  zip failed `import pg8000` with `PackageNotFoundError: No package metadata was found for scramp`, so every
+  RDS-facing Lambda would have crashed at cold start. `validate-template` and `cfn-lint` cannot see
+  this. `slim` is off (zip 372 KB → 838 KB), and `make package` now runs `scripts/check_package.py`, which
+  imports pg8000 and every handler from the extracted zip in an interpreter with no site-packages
+  (`-I -S`).
+- `splitCsv` is invoked asynchronously by S3. After Lambda's retries, a failed event used to be dropped
+  silently, leaving the batch `pending` forever. `maximumRetryAttempts: 2`, `maximumEventAge: 3600` and an
+  on-failure destination, the `split-failures` queue (kept apart from `ingest-dlq` because its records
+  are Lambda invocation records, not chunk messages, and must never be redriven into `ingest`), make
+  that failure visible. T21 adds the alarm.
+
+**SSM parameters and placeholders.** `${ssm:…}` is resolved at package time, so all four parameters
+must exist before `sls package`. `/clickpe/db/host` and `/clickpe/n8n/webhook_url` hold placeholders
+until the RDS endpoint (T11) and the EC2 private IP (T12) exist. The two SecureStrings were generated
+with `openssl rand` and never displayed.

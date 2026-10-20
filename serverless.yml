@@ -1,0 +1,402 @@
+service: clickpe-loan-engine
+frameworkVersion: "3"
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  accountId: ${aws:accountId}
+  uiOrigin: ${opt:ui-origin, 'http://localhost:8000'}
+  uploadBucket: clickpe-loan-uploads-${self:custom.accountId}-${sls:stage}
+  vpcId: vpc-0cddb8b4387b5bbdc
+  vpcCidr: 172.31.0.0/16
+  subnetIds:
+    - subnet-04a43c129719297db
+    - subnet-049a812f86eb26015
+    - subnet-09695ef5d76d947ed
+  mainRouteTableId: rtb-00f1e10252170f96a
+  s3PrefixListId: pl-6ca54005
+  loadChunkTimeout: 120
+  loadChunkConcurrency: 3
+  maxUploadBytes: "20971520"
+  dbName: loans
+  dbUser: loans_app
+  logGroupPrefix: arn:aws:logs:${aws:region}:${self:custom.accountId}:log-group:/aws/lambda/${self:service}-${sls:stage}
+  pythonRequirements:
+    fileName: infra/requirements-lambda.txt
+    dockerizePip: false
+    slim: false
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  region: ap-southeast-2
+  profile: clickpe
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 14
+  deploymentMethod: direct
+  environment:
+    LOG_LEVEL: INFO
+
+package:
+  individually: false
+  patterns:
+    - "!**"
+    - lambdas/**
+    - "!lambdas/**/__pycache__/**"
+
+functions:
+  getUploadUrl:
+    handler: lambdas/get_upload_url/handler.handler
+    description: Creates a batch and returns a presigned S3 POST for the CSV upload
+    role: !GetAtt GetUploadUrlRole.Arn
+    vpc: &lambdaVpc
+      securityGroupIds:
+        - !Ref LambdaSecurityGroup
+      subnetIds: ${self:custom.subnetIds}
+    environment:
+      UPLOAD_BUCKET: ${self:custom.uploadBucket}
+      MAX_UPLOAD_BYTES: ${self:custom.maxUploadBytes}
+      DB_HOST: ${ssm:/clickpe/db/host}
+      DB_PORT: "5432"
+      DB_NAME: ${self:custom.dbName}
+      DB_USER: ${self:custom.dbUser}
+      DB_PASSWORD: ${ssm:/clickpe/db/password}
+    url:
+      cors:
+        allowedOrigins:
+          - ${self:custom.uiOrigin}
+        allowedMethods:
+          - POST
+        allowedHeaders:
+          - content-type
+        maxAge: 3600
+
+  splitCsv:
+    handler: lambdas/split_csv/handler.handler
+    description: Scans an uploaded CSV and queues one message per chunk (outside the VPC, never touches RDS)
+    role: !GetAtt SplitCsvRole.Arn
+    memorySize: 512
+    timeout: 300
+    maximumRetryAttempts: 2
+    maximumEventAge: 3600
+    destinations:
+      onFailure: arn:aws:sqs:${aws:region}:${self:custom.accountId}:${self:service}-${sls:stage}-split-failures
+    environment:
+      INGEST_QUEUE_URL: !Ref IngestQueue
+      MAX_UPLOAD_BYTES: ${self:custom.maxUploadBytes}
+      CHUNK_ROWS: "5000"
+
+  loadChunk:
+    handler: lambdas/load_chunk/handler.handler
+    description: Validates one chunk, COPYs it to staging, upserts users, triggers n8n when the last chunk lands
+    role: !GetAtt LoadChunkRole.Arn
+    memorySize: 512
+    timeout: ${self:custom.loadChunkTimeout}
+    vpc: *lambdaVpc
+    environment:
+      UPLOAD_BUCKET: ${self:custom.uploadBucket}
+      DB_HOST: ${ssm:/clickpe/db/host}
+      DB_PORT: "5432"
+      DB_NAME: ${self:custom.dbName}
+      DB_USER: ${self:custom.dbUser}
+      DB_PASSWORD: ${ssm:/clickpe/db/password}
+      N8N_WEBHOOK_URL: ${ssm:/clickpe/n8n/webhook_url}
+      N8N_WEBHOOK_SECRET: ${ssm:/clickpe/n8n/webhook_secret}
+    events:
+      - sqs:
+          arn: !GetAtt IngestQueue.Arn
+          batchSize: 1
+          maximumConcurrency: ${self:custom.loadChunkConcurrency}
+          functionResponseType: ReportBatchItemFailures
+
+  batchStatus:
+    handler: lambdas/batch_status/handler.handler
+    description: Returns batch progress, rejects and the matching funnel for the UI poller
+    role: !GetAtt BatchStatusRole.Arn
+    vpc: *lambdaVpc
+    environment:
+      DB_HOST: ${ssm:/clickpe/db/host}
+      DB_PORT: "5432"
+      DB_NAME: ${self:custom.dbName}
+      DB_USER: ${self:custom.dbUser}
+      DB_PASSWORD: ${ssm:/clickpe/db/password}
+    url:
+      cors:
+        allowedOrigins:
+          - ${self:custom.uiOrigin}
+        allowedMethods:
+          - GET
+        allowedHeaders:
+          - content-type
+        maxAge: 3600
+
+resources:
+  Resources:
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: SplitCsvS3InvokePermission
+      Properties:
+        BucketName: ${self:custom.uploadBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - ${self:custom.uiOrigin}
+              AllowedMethods:
+                - POST
+              AllowedHeaders:
+                - "*"
+              ExposedHeaders:
+                - ETag
+              MaxAge: 3600
+        LifecycleConfiguration:
+          Rules:
+            - Id: expire-uploads-after-7-days
+              Status: Enabled
+              Prefix: uploads/
+              ExpirationInDays: 7
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 1
+        NotificationConfiguration:
+          LambdaConfigurations:
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt SplitCsvLambdaFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: uploads/
+                    - Name: suffix
+                      Value: .csv
+
+    UploadBucketTlsOnlyPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref UploadBucket
+        PolicyDocument:
+          Statement:
+            - Sid: DenyInsecureTransport
+              Effect: Deny
+              Principal: "*"
+              Action: s3:*
+              Resource:
+                - !GetAtt UploadBucket.Arn
+                - !Sub "${UploadBucket.Arn}/*"
+              Condition:
+                Bool:
+                  aws:SecureTransport: "false"
+
+    SplitCsvS3InvokePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref SplitCsvLambdaFunction
+        Action: lambda:InvokeFunction
+        Principal: s3.amazonaws.com
+        SourceAccount: ${self:custom.accountId}
+        SourceArn: arn:aws:s3:::${self:custom.uploadBucket}
+
+    IngestDlq:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-ingest-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    SplitFailuresQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-split-failures
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    IngestQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-ingest
+        VisibilityTimeout: 720
+        MessageRetentionPeriod: 345600
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt IngestDlq.Arn
+          maxReceiveCount: 5
+
+    S3GatewayEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcId: ${self:custom.vpcId}
+        VpcEndpointType: Gateway
+        ServiceName: com.amazonaws.${aws:region}.s3
+        RouteTableIds:
+          - ${self:custom.mainRouteTableId}
+
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: VPC-attached Lambdas; egress to RDS, n8n and S3 only
+        VpcId: ${self:custom.vpcId}
+        SecurityGroupEgress:
+          - Description: PostgreSQL to RDS
+            IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: ${self:custom.vpcCidr}
+          - Description: n8n webhook
+            IpProtocol: tcp
+            FromPort: 5678
+            ToPort: 5678
+            CidrIp: ${self:custom.vpcCidr}
+          - Description: S3 through the gateway endpoint
+            IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            DestinationPrefixListId: ${self:custom.s3PrefixListId}
+
+    GetUploadUrlRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-get-upload-url
+        AssumeRolePolicyDocument: &lambdaTrust
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: get-upload-url
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: ${self:custom.logGroupPrefix}-getUploadUrl:*
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+
+    SplitCsvRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-split-csv
+        AssumeRolePolicyDocument: *lambdaTrust
+        Policies:
+          - PolicyName: split-csv
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: ${self:custom.logGroupPrefix}-splitCsv:*
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+                - Effect: Allow
+                  Action: sqs:SendMessage
+                  Resource:
+                    - !GetAtt IngestQueue.Arn
+                    - !GetAtt SplitFailuresQueue.Arn
+
+    LoadChunkRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-load-chunk
+        AssumeRolePolicyDocument: *lambdaTrust
+        Policies:
+          - PolicyName: load-chunk
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: ${self:custom.logGroupPrefix}-loadChunk:*
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+                - Effect: Allow
+                  Action:
+                    - sqs:ReceiveMessage
+                    - sqs:DeleteMessage
+                    - sqs:GetQueueAttributes
+                  Resource: !GetAtt IngestQueue.Arn
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+
+    BatchStatusRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${sls:stage}-batch-status
+        AssumeRolePolicyDocument: *lambdaTrust
+        Policies:
+          - PolicyName: batch-status
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: ${self:custom.logGroupPrefix}-batchStatus:*
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+
+    GetUploadUrlFunctionUrlInvokePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref GetUploadUrlLambdaFunction
+        Action: lambda:InvokeFunction
+        Principal: "*"
+        InvokedViaFunctionUrl: true
+
+    BatchStatusFunctionUrlInvokePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref BatchStatusLambdaFunction
+        Action: lambda:InvokeFunction
+        Principal: "*"
+        InvokedViaFunctionUrl: true
+
+  Outputs:
+    LambdaSecurityGroupId:
+      Value: !Ref LambdaSecurityGroup
+      Export:
+        Name: ${self:service}-${sls:stage}-lambda-sg
+    UploadBucketName:
+      Value: !Ref UploadBucket
+    IngestQueueUrl:
+      Value: !Ref IngestQueue
+    IngestDlqUrl:
+      Value: !Ref IngestDlq
+    SplitFailuresQueueUrl:
+      Value: !Ref SplitFailuresQueue
