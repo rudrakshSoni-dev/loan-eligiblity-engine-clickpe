@@ -159,8 +159,8 @@ implemented".
 
 ## Chunking: exact record byte offsets
 
-**Choice.** `split-csv` streams the file once with a quote-aware CSV scan and records the exact byte
-offsets of record boundaries. Each message carries
+**Choice.** `split-csv` reads the file once and records the exact byte offsets of record boundaries.
+Each message carries
 `{batch_id, s3_key, etag, chunk_no, total_chunks, start_byte, end_byte, first_line_no, row_count, columns}`,
 where `columns` is the header in file order (a byte-range chunk has no header row; added in T16).
 `start_byte` is inclusive and `end_byte` exclusive, like a Python slice; `load-chunk` issues
@@ -174,11 +174,52 @@ chunks split from the first file could read byte ranges of the second. **Measure
 past the end → `InvalidRange`, and the two ranged reads of the sample reassemble the 993,191-byte file
 exactly.
 
-**Rejected.** "Guess a range, then realign to the next newline." It breaks on quoted fields that
+**How boundaries are found (T17).** With the parser load-chunk already uses, not a separate scanner.
+`csv.reader` (strict) reads the universal-newline lines of the decoded file, the same way
+`validation.read_records` reads a chunk, and the bytes of the lines each record consumed are summed
+(`surrogateescape` decoding makes `len(line.encode(...))` the exact byte count even for invalid UTF-8).
+A cut can therefore fall only where load-chunk's own parse of the whole file would end a record, and
+`first_line_no` uses the same physical-line count, so reject line numbers match the file. Chunks hold
+5,000 records; blank lines stay with the chunk before them and a chunk starts only at a record, so no
+chunk is empty. Tested property, on every fixture and on a seeded random file with quoted CRLFs,
+blank lines and doubled quotes at chunk sizes 1, 7, 50 and 1,000: the header plus the chunks
+reassemble the file byte for byte, and validating chunk by chunk gives the same valid rows and the
+same `(line_no, reason)` rejects as validating the file as one chunk.
+
+**Rejected: a byte scanner that flips "inside quotes" on every `"`.** It is the usual quote-aware
+scan, but Python's csv treats a `"` in the middle of an unquoted field as a literal. For
+`…,ab"c,"u1⏎@x",…` the toggle scanner believes the quoted field ends at `,"` and cuts at the
+newline inside the real quoted field, turning one record into two rejects. A unit test covers this
+input (`test_literal_quote_inside_unquoted_field_is_not_a_cut_point`).
+
+**Rejected: "guess a range, then realign to the next newline."** It breaks on quoted fields that
 contain newlines, which CSV allows
 ([ItemReader CSV rules](https://docs.aws.amazon.com/step-functions/latest/dg/input-output-itemreader.html)).
-The scan also handles a UTF-8 BOM, CRLF, a trailing empty line and multi-byte characters at a
-boundary. This is an engineering choice, not a cited AWS pattern.
+This is an engineering choice, not a cited AWS pattern.
+
+**Whole-object read instead of streaming (T17, user-approved).** The upload cap is 20 MB, enforced by
+the POST policy and re-checked by `split-csv` from the event's `object.size` before reading and from
+the bytes after reading. So one `GetObject` (with `IfMatch` = the event's ETag) and an in-memory
+parse are simpler than carrying parser state across stream blocks. **Measured (laptop, Ryzen 5 7530U,
+3 runs):** planning a 20,855,611-byte, 210,000-row file (the sample repeated 21×) into 42 chunks takes
+1.28–1.36 s, peak Python allocation 104.3 MB (`tracemalloc`). `split-csv` has 512 MB and 300 s.
+**Estimate:** the arm64 Lambda at 512 MB has a fraction of one vCPU, so expect several times the
+laptop time; the deployed duration is recorded in T22. Streaming is the upgrade if the cap is raised
+past what fits in memory.
+
+**Failures `split-csv` reports itself.** Empty file, over the cap, no header, bad header (missing or
+repeated columns, not CSV, not UTF-8), header but no data rows, and an object deleted before the
+split each become one `{batch_id, error}` control message. A header-only file needs this most:
+it would give zero chunks, and the batch would otherwise stay `pending` forever. A key that is not
+exactly `upload_key(batch_id)` (lower-case canonical UUID) is only logged, because load-chunk would
+refuse its messages and there is no batch to fail. An object replaced since the event
+(`PreconditionFailed`) is skipped, because the newer upload has its own event. S3 and SQS errors
+propagate: Lambda retries the asynchronous invocation twice, then sends the event to
+`split-failures`.
+
+**Sending.** `SendMessageBatch` in groups of 10 (the SQS maximum); entries SQS reports as failed are
+sent once more, and anything still unsent raises so the whole invocation is retried. Re-sent chunks
+are harmless because the ledger ignores duplicates.
 
 **`split-csv` never touches RDS.** It runs outside the VPC (it must send to SQS without an
 endpoint), so `total_chunks`, the `pending → loading` transition, and any header/size error travel in
