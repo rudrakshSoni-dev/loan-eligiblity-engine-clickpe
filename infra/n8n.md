@@ -52,3 +52,37 @@ t23-allow after unpublish                                                     ->
 ```
 
 The probe workflow remains in the n8n database, inactive; delete it in the editor after the owner account exists.
+
+## Batch-processed webhook (T19)
+
+`load-chunk` POSTs `{"batch_id"}` with `X-Webhook-Secret` to `http://172.31.26.164:5678/webhook/match-batch`
+(SSM `/clickpe/n8n/webhook_url`, resolved at deploy). Workflow B (T32) must be published on exactly this
+path and start by moving the batch `processed → matching`, refusing when that UPDATE returns no row.
+
+Re-send a batch whose POST failed (n8n down, workflow not published):
+
+```bash
+scripts/retrigger_batch.sh <batch_id>
+```
+
+The script refuses unless `batchStatus` says `processed`, then runs `curl` on this instance through SSM Run
+Command. The instance role reads `/clickpe/n8n/webhook_secret` and pipes the header to `curl -H @-`, so the
+secret is not in the command parameters or SSM history.
+
+Verification receiver used in T19 (`t19stubrecv1`, imported with the CLI, now unpublished): Webhook on
+`match-batch` with the VPC CIDR allowlist → SHA-256 of the `X-Webhook-Secret` header → respond 200 if it
+equals the hash of the SSM secret (computed on the instance), else 401.
+
+```
+right secret from the instance          -> 200 {"secret_ok":true}
+wrong secret / no header                 -> 401 {"secret_ok":false}
+127.0.0.1 (outside the allowlist)        -> 403
+after unpublish + restart                -> 404
+```
+
+`t23probe0001` and `t19stubrecv1` stay in the n8n database, inactive; delete both in the editor once the
+owner account exists. Their saved executions contain the request headers, including the secret; they are
+pruned after 168 h.
+
+Note: `/healthz` answers 200 before published webhooks are registered. Wait for
+`Finished building workflow dependency index` in `docker logs n8n` after a restart before calling a webhook.

@@ -34,6 +34,8 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 20. [Infrastructure as code: Serverless Framework v3](#infrastructure-as-code-serverless-framework-v3)
 21. [Row validation: strict on meaning, lenient on format](#row-validation-strict-on-meaning-lenient-on-format)
 22. [Chunk loader: outcomes, limits and sizing](#chunk-loader-outcomes-limits-and-sizing)
+23. [First deployment (T22): measured results and one shortcut](#first-deployment-t22-measured-results-and-one-shortcut)
+24. [Completion trigger: one POST from the winner](#completion-trigger-one-post-from-the-winner)
 
 ---
 
@@ -785,7 +787,7 @@ validation is CPU-bound Python; a chunk's bytes, text and parsed rows use a few 
 in `user_id` order, so two chunks that share ids wait for each other instead of deadlocking. If a
 deadlock happened anyway, its SQLSTATE `40P01` is in the retried class.
 
-**Not in T18.** The POST to n8n when `try_complete` wins is T19; T18 logs `batch_processed` at that point.
+**Not in T18.** The POST to n8n when `try_complete` wins was added in T19; see [Completion trigger](#completion-trigger-one-post-from-the-winner).
 
 ## First deployment (T22): measured results and one shortcut
 
@@ -815,3 +817,59 @@ security group to the Lambda SG, but the role can do more than the loader needs.
 **RDS ingress.** The Lambda security group is created by the stack, so the RDS group rule is added after the
 first deploy, by SG reference only:
 `aws ec2 authorize-security-group-ingress --group-id sg-0f0ca5e2b7cb5e1c3 --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,UserIdGroupPairs=[{GroupId=<LambdaSecurityGroupId output>}]"`.
+
+## Completion trigger: one POST from the winner
+
+**Choice (T19).** After its commit, the `load-chunk` invocation whose `try_complete` UPDATE returns a row
+POSTs `{"batch_id": "<uuid>"}` with an `X-Webhook-Secret` header to n8n at
+`http://172.31.26.164:5678/webhook/match-batch` (SSM `/clickpe/n8n/webhook_url`). Every other caller logs
+`completion_checked` with `won: false` and posts nothing. The client is the standard library's `urllib`, so
+the package gains no dependency (`lambdas/shared/notify.py`).
+
+**Retry policy.** 5 s timeout per attempt, 3 attempts, 0.5 s and 1 s back-off; worst case ≈ 16.5 s inside the
+120 s Lambda timeout. Retried: connection errors, timeouts, 429 and 5xx. Not retried: any other status
+(401 wrong secret, 403 outside the IP allowlist, 404 workflow not published), because none of them can
+change within seconds.
+
+**A failed POST is logged, not handed back to SQS.** The message is acknowledged and the batch stays
+`processed`; the Lambda logs `webhook_failed` at ERROR with the attempts, last status and error. Returning
+the message to SQS would not help: the redelivery finds the batch no longer `loading`, skips it, and can
+never win the completion again. Recovery is `scripts/retrigger_batch.sh <batch_id>`. It checks through the
+`batchStatus` Function URL that the batch is `processed`, then re-POSTs from the n8n instance with SSM Run
+Command. The instance reads the secret from SSM with its own role and passes it to `curl` on stdin, so the
+secret is never in command parameters, SSM command history or a process argument list.
+
+**Duplicates are expected downstream.** A retry after a timeout delivers twice if n8n received the first
+POST but its answer was lost, and the retrigger script can be run twice. Workflow B (T32) must start with
+the conditional `processed → matching` UPDATE and stop when it gets no row back (layer 4 of
+[Webhook security](#webhook-security-four-layers)).
+
+**Known gap.** If the Lambda dies after `try_complete` commits but before the POST, the batch stays
+`processed` with no trigger, and no redelivery can send it. It is visible as a `processed` batch with no
+`pipeline_runs` row, and the retrigger script fixes it.
+
+**Rejected: a transactional outbox** (a `notify_pending` row written with the completion, plus a scheduled
+sweeper). It closes the gap above automatically, but adds a table and a schedule for a window of a few
+milliseconds per batch. Listed as the production upgrade. **Rejected: retrying through SQS**, for the reason
+above.
+
+**Measured (T19).** Local, PostgreSQL 16 + a real HTTP receiver: 10 batches × 5 chunks, every chunk
+delivered twice, 10 concurrent workers per batch behind a barrier → 100 chunk deliveries, 90 losing
+completion checks, exactly 10 POSTs. With the completion guard weakened to
+`status IN ('loading', 'processed')`, the same test sees 2–4 POSTs per batch. Live, deployed stack with a
+temporary n8n receiver at `match-batch` (IP allowlist + SHA-256 check of the secret header, 401 on
+mismatch):
+
+| Upload | Chunks | Completion checks lost | Winner chunk | Webhook | n8n executions |
+|---|---|---|---|---|---|
+| `good_users.csv` | 1 | 0 | 0 | HTTP 200, 1 attempt | 1 |
+| sample × 3 (30,000 rows) | 6 | 5 | 5 | HTTP 200, 1 attempt | 1 |
+| same file | 6 | 5 | 0 | HTTP 200, 1 attempt | 1 |
+| same file | 6 | 5 | 1 | HTTP 200, 1 attempt | 1 |
+| `good_users.csv`, n8n stopped | 1 | 0 | 0 | 3 attempts, `Connection refused`, `webhook_failed`; batch `processed`, queue empty | 0 |
+| retrigger of that batch after restart | | | | HTTP 200 | 1 |
+
+**Open item for T32/T45.** n8n saves the Webhook node's output, which includes the request headers, so
+`X-Webhook-Secret` lands in execution data on the n8n volume (the same instance and trust boundary as the
+encryption key; pruned after 168 h). A Header Auth credential does not change this. T32 decides how
+Workflow B avoids keeping it.
