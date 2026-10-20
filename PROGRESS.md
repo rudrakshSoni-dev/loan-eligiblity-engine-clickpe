@@ -12,8 +12,8 @@
 | T08 | P0 | Schema ⚖️ | DONE | 2026-10-20 | 10 tables, 21 self-asserting constraint checks; all 10,000 sample rows pass the CHECKs |
 | T09 | P0 | Migrations + seed | DONE | 2026-10-20 | Checksummed ledger + advisory lock; re-run applies 0 migrations, changes 0 seed rows; 5 seed products flagged |
 | T10 | P0 | serverless.yml base ⚖️ | DONE | 2026-10-21 | Serverless v3; `sls package` + `validate-template` + `cfn-lint` clean; no `*` action on `*` resource; config moved to repo root. Opus review fixed a pg8000 import crash (`slim`) and silent `splitCsv` failures |
-| T11 | P0 | RDS | IN PROGRESS | 2026-10-21 | Instance up, private (no route from internet), endpoint in SSM; force_ssl / sslmode=disable / max_connections checks run from EC2 in T12 |
-| T12 | P0 | EC2 for n8n | TODO | |  |
+| T11 | P0 | RDS | DONE | 2026-10-21 | Private PG 16.9; from EC2: verify-full TLSv1.3 OK, sslmode=disable rejected, rds.force_ssl=1, max_connections=79 |
+| T12 | P0 | EC2 for n8n | DONE | 2026-10-21 | `t4g.small` `i-02ffa9d08e8403a4a`, SG with no inbound rules, SSM session works, Docker 25.0.14 + Compose v2.29.7, 2 GB swap |
 | T13 | P0 | Migrate RDS | TODO | |  |
 | T14 | P0 | Shared modules | TODO | |  |
 | T15 | P0 | get-upload-url | TODO | |  |
@@ -313,7 +313,7 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why a separate `split-failures` queue instead of reusing `ingest-dlq`? A: The two hold different things. `ingest-dlq` holds chunk messages that can be redriven back into `ingest`. `split-failures` holds Lambda's async-failure records (the S3 event plus an error), and redriving those into `ingest` would feed `loadChunk` a message it cannot parse.
   - Q: Why did the import check first pass on a broken zip? A: `-I` only drops env vars and the user site. The venv's own site-packages was still on the path, and `importlib.metadata` found `scramp`'s metadata there. `-S` removes site-packages entirely, so the zip is the only source, as in Lambda. The check was confirmed to fail on the old zip before being trusted.
 
-### T11 — RDS (2026-10-21) — IN PROGRESS
+### T11 — RDS (2026-10-21)
 - Files: infra/rds.md (new: settings table, exact commands, privacy proof)
 - AWS resources: SG `clickpe-rds-sg` (`sg-0f0ca5e2b7cb5e1c3`, no inbound rules), subnet group `clickpe-db-subnets`, instance `clickpe-db`; SSM `/clickpe/db/host` set (version 2)
 - Incident: first run left `$SG` empty (group already existed), so `create-db-instance` fell into CLI help; the AWS pager also hid output. Fixed with `AWS_PAGER=""` and the literal SG ID; noted in `infra/rds.md`.
@@ -321,10 +321,31 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - `describe-db-instances` → class `db.t4g.micro`, engine 16.9, gp3 20 GB, encrypted, `MultiAZ false`, `PubliclyAccessible false`, `DeletionProtection true`, backups 1 day, parameter group `default.postgres16`, SG `sg-0f0ca5e2b7cb5e1c3`
   - `getent hosts <endpoint>` from laptop → `172.31.32.255` (private); TCP 5432 → `No route to host`
   - `describe-security-groups` → `IpPermissions: []`
-- Pending (needs a client in the VPC, done in T12): `SHOW rds.force_ssl` = on, `sslmode=disable` rejected, `SHOW max_connections`; 5432 ingress from the n8n SG (T12) and Lambda SG (after `sls deploy`).
+- Completed in T12 from the EC2 host: `verify-full` connection on TLSv1.3, `sslmode=disable` rejected, `rds.force_ssl` = 1, `max_connections` = 79 (see the T12 entry). Still pending: 5432 ingress from the Lambda SG, added after `sls deploy` (T22).
 - Quality gates: no Python touched. Secrets scan: endpoint is not a secret; password only read from SSM inside a command substitution.
 - Rubric: Cloud Architecture (private RDS, SG-reference-only ingress, encrypted storage)
 - Explain it back:
   - Q: How do you prove the database is private, not just firewalled? A: Public DNS returns only the private VPC address, so the internet has no route to it at all; the SG would be a second layer.
   - Q: Why open 5432 by security-group reference instead of the VPC CIDR? A: Only ENIs carrying the Lambda or n8n SG can connect; anything else launched in the VPC cannot, and IPs can change.
   - Q: Why not Multi-AZ or a bigger class? A: Demo scale and cost; COPY plus the MaximumConcurrency 3 cap keeps load low. Multi-AZ is the documented production upgrade.
+
+### T12 — EC2 for n8n (2026-10-21)
+- Files: `infra/ec2/setup.sh` (new), `infra/ec2.md` (new), `docs/rubric-evidence.md`, `PROGRESS.md`
+- AWS resources: SG `clickpe-n8n-sg` (`sg-0fd3ef0dd40c9f8e3`, no inbound rules), role `clickpe-n8n-ec2-role` + instance profile `clickpe-n8n-ec2-profile` (`AmazonSSMManagedInstanceCore`), instance `i-02ffa9d08e8403a4a` (`t4g.small`, AMI `ami-0fd1d82a0cfcbc33c`, private IP `172.31.26.164`), ingress rule on `clickpe-rds-sg` 5432 from the n8n SG. The temporary `clickpe-cloudshell-tmp` SG used for an earlier check was revoked and deleted.
+- Evidence:
+  - `aws ssm describe-instance-information` → `i-02ffa9d08e8403a4a  Online` with `IpPermissions: []` on the n8n SG
+  - `aws ssm start-session` opened an interactive shell as `ssm-user` on the instance
+  - Run Command of `infra/ec2/setup.sh` → `Success`, `Docker version 25.0.14, build 0bab007`, `Docker Compose version v2.29.7`, `/swapfile file 2G`
+  - From the instance, `psql … sslmode=verify-full sslrootcert=/opt/clickpe/global-bundle.pem` → `max_connections` 79; `pg_stat_ssl` → `ssl t`, `TLSv1.3`, `TLS_AES_256_GCM_SHA384`
+  - `psql … sslmode=disable` → `FATAL: no pg_hba.conf entry for host "172.31.26.164", user "clickpe", database "clickpe", no encryption`
+  - `aws rds describe-db-parameters --db-parameter-group-name default.postgres16` → `rds.force_ssl  1  system`
+- Corrections made during the task: (1) `SHOW rds.force_ssl` returns `unrecognized configuration parameter` because it is an RDS parameter-group setting; the value was read through the RDS API and the `pg_hba` rejection proves enforcement. (2) The instance profile's creation output showed `"Roles": []` because it is printed before the role is attached; the launch with the profile succeeded and SSM registered the instance, which shows the role is attached. (3) The laptop had `PGPORT=5433` set; the in-VPC command now sets `port=5432` explicitly.
+- Quality gates: no Python touched, `setup.sh` is shell only. Secrets scan: the DB password was read from SSM into the shell's memory with `read -rs` and was never written to a file or command parameter.
+- Not done yet: 5678 ingress from the Lambda SG (the SG exists only after `sls deploy`, T22) and the SES-only role (T24).
+- Rubric: Cloud Architecture (no-NAT VPC design, n8n with zero inbound ports reached through SSM, IMDSv2, SG-reference-only RDS ingress).
+- Explain it back:
+  - Built: an n8n host with no way in from the internet. SSM Session Manager is the only admin path, outbound goes through the free Internet Gateway, and the host reaches RDS over the private network using verified TLS.
+  - Why this approach over the obvious alternative (a public IP with SSH or an open 5678 locked to my IP): an IP allowlist breaks when the laptop's IP changes and still exposes a port. SSM needs no inbound rule at all, authenticates through IAM, and keeps the editor off the internet. The cost is a plugin on the laptop and a port forward.
+  - Q: How do you know unencrypted database access is blocked? A: A `sslmode=disable` connection from the instance is rejected by `pg_hba` with "no encryption", and the RDS parameter `rds.force_ssl` is 1.
+  - Q: Why hop limit 2 on the instance metadata service? A: n8n will run in a Docker container, which adds a network hop. With the default limit of 1 the container cannot reach the instance role for the SES credentials in T24. IMDSv2 stays required, so the token requirement still blocks simple SSRF-style access.
+  - Q: The instance has a public IP, so is it exposed? A: The IP is only for outbound traffic. The security group has no inbound rules, so nothing can connect to it. Using a private subnet instead would need a NAT Gateway, which costs about $32 a month and is excluded by the cost rules.
