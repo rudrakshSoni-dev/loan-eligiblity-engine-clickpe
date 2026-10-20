@@ -27,6 +27,7 @@ RUNTIME_MODULES = (
     "lambdas.shared.validation",
     "lambdas.shared.chunks",
     "lambdas.shared.loading",
+    "lambdas.shared.status",
 )
 
 REQUIRED_FILES = ("lambdas/shared/rds-global-bundle.pem",)

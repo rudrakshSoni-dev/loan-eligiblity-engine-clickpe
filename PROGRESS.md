@@ -21,7 +21,7 @@
 | T17 | P1 | split-csv Lambda (outside VPC) ⚖️ | TODO | |  |
 | T18 | P0 | load-chunk Lambda (inside VPC) | DONE | 2026-10-21 | 10,000 rows in 2 chunks → 10,000 users; identical re-upload 0 inserted / 0 updated; redelivery no-op; ranged GET + IfMatch checked on real S3; shared coverage 100% with DB |
 | T19 | P0 | Completion → n8n trigger | TODO | |  |
-| T20 | P0 | batch-status Lambda | TODO | |  |
+| T20 | P0 | batch-status Lambda | DONE | 2026-10-21 | GET ?batch_id= → counters, first 5 rejects, match/notified counts, latest funnel (NULL = not measured); 400/404/405/503; 5 DB tests on PG16; shared coverage 100% |
 | T21 | P1 | DLQ handling + alarm | TODO | |  |
 | T22 | P0 | Deploy + smoke test | TODO | |  |
 | T23 | P0 | docker-compose | TODO | |  |
@@ -492,3 +492,25 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Someone uploads a second file to the same key while the first is still loading. What happens? A: Every ranged read sends the ETag from the S3 event as `IfMatch`. S3 answers `PreconditionFailed` for the replaced object, the batch is marked failed with that reason, and the remaining chunks are skipped. Measured on real S3 and tested.
   - Q: Which errors fail the batch and which are retried? A: Problems that can never succeed on retry fail the batch at once: a split error, a replaced or short object, missing columns, or data the database refuses (SQLSTATE classes 22 and 23). Network, connection, deadlock and throttling errors go back to SQS in `batchItemFailures` for that message only, and after 5 receives the message moves to the DLQ.
 
+### T20 — batch-status Lambda (2026-10-21)
+- Files: `lambdas/shared/status.py` (new: four read-only queries and the response document), `lambdas/batch_status/handler.py` (stub replaced), `scripts/check_package.py` (+`lambdas.shared.status`), `tests/unit/test_batch_status.py`, `tests/integration/test_batch_status_db.py` (new).
+- Choices:
+  - Response: `batch_id, status, error, total_chunks, chunks_done, rows_ok, rows_rejected, first_rejects[{line_no, reason}] (5), matches, notified, funnel, created_at, updated_at`.
+  - `funnel` is the latest `pipeline_runs` row for the batch (`ORDER BY id DESC LIMIT 1`), or `null` before Workflow B starts. Counters not yet measured stay `null` rather than becoming 0, so the UI can tell "not measured" from a measured zero.
+  - Errors: non-GET 405, missing or non-UUID `batch_id` 400 (no query sent), unknown batch 404, database error 503 with the connection dropped. `cache-control: no-store` because the UI polls.
+  - Read-only, autocommit, indexed lookups only (`upload_batches` pk, `rejected_rows` pk, `matches_batch_id_idx`, `pipeline_runs_batch_id_idx`). `serverless.yml` needed no change: the function, role, VPC, GET-only CORS and Function URL permission were already in place from T10.
+- Evidence (throwaway `postgres:16` container `t20-pg` on 127.0.0.1:55433, password in a mode-600 scratch file; container and file removed afterwards, `docker ps -a --filter name=t20-pg -q | wc -l` → 0):
+  - `pytest tests/unit/test_batch_status.py tests/integration/test_batch_status_db.py` → 20 passed (15 unit incl. parametrized cases, 5 integration).
+  - Integration cases: a loaded batch (3 ok / 8 rejected) returns only the first 5 rejects in line order and `funnel: null`; 3 matches with 1 notified count `3 / 1`; two `pipeline_runs` rows → the later one (`total_pairs 300`, `stage2_clear null`, `stage_ms {"stage1": 42}`) is returned; another batch's runs and rejects do not leak; a failed batch exposes its `error`; unknown id → `None`; the handler over a real connection returns 200 with `processed`, 3, 8.
+  - Full suite with the DB: `253 passed in 29.77s`, `status.py 29 stmts, 100%`, `Total coverage: 100.00%`.
+- Quality gates (`make check`, no DB): `All checks passed!`, `57 files already formatted`, `Success: no issues found in 45 source files`, `219 passed, 34 skipped`, `Required test coverage of 80.0% reached. Total coverage: 99.74%`.
+- `make package` → `✔ Service packaged`, `{"stage": "package_imports_ok", "count": 14, "failures": {}}`.
+- Secrets scan on touched files → only variable names (`DB_PASSWORD`) and fake test values (`pw`). No comments in new code.
+- Not verified here: the deployed Function URL, CORS from the browser, and the Lambda reaching RDS from inside the VPC. These run for the first time in T22; the "correct JSON for a real batch" check on the deployed stack is repeated in the T22 smoke test.
+- Rubric: Backend & Code Quality (typed, read-only status module with 100% coverage and DB-backed tests), Cloud (Function URL poller inside the VPC), Docs (the funnel in the response feeds the UI in T40).
+- Explain it back:
+  - Built: a GET endpoint the browser polls with a `batch_id`. It returns where the batch is in its lifecycle, chunk and row counters, the first 5 reject reasons, how many matches and notified emails exist, and the latest matching funnel.
+  - Why this approach over the obvious alternative (one big JOIN across batches, rejects, matches and runs): a join multiplies rows (rejects × matches × runs) and would need de-duplicating. Four small indexed queries are simpler to read and test, and the cost is trivial at one poll every few seconds.
+  - Q: Why return `null` for funnel counters instead of 0? A: The schema leaves a counter NULL until its stage has run, so 0 means a measured zero. Passing NULL through lets the UI show "pending" for stages that have not run instead of claiming nothing matched.
+  - Q: Anyone with the URL can call it. Is that a problem? A: It is read-only and the id is a random UUID, so batches cannot be enumerated, and it returns counts and line-level reject reasons, not user data. It is documented as a public Function URL with those mitigations; API Gateway auth is the production upgrade.
+  - Q: What if the database connection died while the Lambda was frozen? A: `Database.connection()` checks the connection with `SELECT 1` and reconnects; if a query still fails, the handler resets the cached connection and returns 503, so the next poll starts clean.
