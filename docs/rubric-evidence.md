@@ -18,6 +18,7 @@ Sophistication, robustness, efficiency, creative nodes, Optimization Treasure Hu
 | ✅ | Data shape analysis: 9,869 distinct (income, score, age, employment) tuples in 10,000 users, and 1,028–5,528 raw-band cohorts per product, so the design keys cohorts by borderline reason and caches verdicts instead | `docs/data-notes.md`, `docs/decisions.md` → "Matching and the Optimization Treasure Hunt" | T01, T07 |
 | ✅ | Treasure Hunt strategy: LLM at ingest gated by content hash, SQL + rules first, skip-LLM rule, reason-keyed cohorts, `cohort_verdicts` cache, budget guard; counterfactual 30,000 calls = 30 days of quota | `docs/decisions.md` | T07 |
 | ✅ | Crawl targets probed live (HTTP status, robots.txt, criteria present in static HTML) | `docs/decisions.md` → "Crawl targets" | T07 |
+| ✅ | Crawl targets re-verified from the n8n EC2 IP: 3 lenders + 1 spare, redirects to `bank.in` found, robots.txt parsed per path, verbatim criteria snippets, rate/score gaps recorded, Kotak rejected with reason | `docs/decisions.md` → "Crawl targets"; `PROGRESS.md` T27 | T27 |
 | ✅ | Funnel and cost tables in the schema: `pipeline_runs` (per-stage counts, NULL until measured), `cohort_verdicts` (cache keyed by product content hash), `llm_calls` (per-call token ledger) | `db/schema.sql` | T08 |
 | ⬜ | Global error workflow (Workflow E) | `n8n/workflows/` | T25 |
 | ⬜ | Reusable LLM Gateway sub-workflow | `n8n/workflows/` | T26 |

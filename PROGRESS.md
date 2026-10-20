@@ -28,7 +28,7 @@
 | T24 | P0 | n8n credentials | DONE | 2026-10-21 | 4 credentials; Postgres (verified TLS via mounted RDS CA) and AWS Assume Role (system credentials, SES-only role, no static keys) tests green |
 | T25 | P1 | Workflow E — global error handler | TODO | |  |
 | T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | |  |
-| T27 | P0 | Crawl targets ⚖️ | TODO | |  |
+| T27 | P0 | Crawl targets ⚖️ | DONE | 2026-10-21 | ICICI, HDFC, IDFC FIRST primary + BankBazaar spare; criteria in static HTML from the EC2 IP; robots allow all 4 paths; banks moved to `bank.in` (301) |
 | T28 | P0 | Workflow A: fetch + extract | TODO | |  |
 | T29 | P1 | Workflow A: change detection | TODO | |  |
 | T30 | P0 | Workflow A: structuring via LLM Gateway | TODO | |  |
@@ -641,3 +641,23 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why did the first Postgres test fail, and why not just ignore it? A: Node did not trust the Amazon RDS CA. Ignoring it would still encrypt but would accept any certificate; adding the CA proves we are talking to our RDS.
   - Q: What can the SES role do if the n8n box is compromised? A: Send mail from or to three verified test addresses only, and the SES sandbox adds a second limit (verified recipients, 200 per day).
   - Q: The form demanded an External ID. Is that a security control? A: No. Our trust policy has no condition on it, so it is ignored; the real control is that only the instance role can assume the role.
+
+### T27 — Crawl targets (2026-10-21)
+- Files: docs/decisions.md ("Crawl targets" rewritten with measured results)
+- Evidence (probe run on the n8n instance `i-02ffa9d08e8403a4a` via SSM Run Command, so it is the IP n8n will crawl from; temp files deleted afterwards):
+  - First GET of the old `.com` URLs: ICICI/Kotak/IDFC `301`, HDFC `301` (167 B). With redirects followed: ICICI 200 / 1,242,503 B, HDFC 200 / 1,096,086 B, BankBazaar 200 / 219,149 B, Kotak 200 / 820,923 B, IDFC FIRST 200 / 2,667,536 B.
+  - `urllib.robotparser` on each host's robots.txt (all 200): target path allowed for `*` on ICICI, HDFC (`www.hdfc.bank.in`), BankBazaar, IDFC FIRST.
+  - ICICI: "Minimum monthly income of ₹30,000 and total of 2 years of work experience for salaried individuals"; "A credit score of 700 and above is preferred".
+  - HDFC: "Age: 21 to 60 years"; "Minimum monthly net income of ₹25,000".
+  - IDFC FIRST: "Your age should be between 21 to 60 years"; "CIBIL Score: You should have a CIBIL Score of 710 or above"; "9.99% p.a.".
+  - BankBazaar table: "Age limit 21 - 68 years", "Minimum Net Monthly Income Rs.5,000 and above", "CIBIL score of 750 or more", "Maximum EMI Up to 65% of Income".
+  - Kotak page: rate "Starting at 10.99% p.a." but no income/age/score criteria, so rejected.
+- Quality gates: no Python touched.
+- Open items for T28/T30: ICICI and HDFC print no interest rate in the criteria text (rate fields stay NULL, lower `parse_confidence`); HDFC publishes no score floor. Selectors are first guesses from raw HTML and are confirmed in T28.
+- Rubric: n8n Workflow Design (crawl targets, change-detection scope).
+- Explain it back:
+  - Built: a live, measured choice of crawl targets, probed from the same IP the workflow will use, with robots.txt checked by a parser and verbatim criteria snippets per page.
+  - Why this over the obvious alternative (reuse the laptop probe from 2026-10-20): the banks have since moved to `bank.in` redirects and a laptop IP can be treated differently from an AWS IP, so only a probe from EC2 proves the workflow will get the same HTML.
+  - Q: Why not crawl all five candidates? A: Kotak has no criteria in static HTML and BankBazaar is an aggregator, not a lender's product; three real lenders give distinct thresholds (₹25k/₹30k income, 700/710 score) without extra maintenance.
+  - Q: What if a site blocks the EC2 IP or changes its layout? A: The site list is config-driven, each site has its own error branch (T31) so the others still update, and BankBazaar is a ready spare.
+  - Q: Why extract text lines instead of relying on CSS classes? A: The sites use generated class names that can change; anchoring on income/age/score/rate wording survives redesigns and also gives a stable text to hash for change detection.

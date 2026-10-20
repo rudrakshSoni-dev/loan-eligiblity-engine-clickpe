@@ -627,27 +627,54 @@ engine's actual call count is reported only from a measured run (T36/T37).
 
 ## Crawl targets
 
-**Choice (measured, live probe 2026-10-20 with a desktop browser User-Agent).** Three pages that serve
-eligibility criteria in static HTML to a plain GET; T27 confirms them:
+**Choice (measured in T27, 2026-10-21, from the n8n EC2 instance's own IP over SSM, desktop browser User-Agent, redirects followed).**
+Three primary targets plus one spare. Each serves its criteria text in static HTML to a plain GET, and
+`urllib.robotparser` reports the path as allowed for `*`.
 
-| Target | HTTP | robots.txt | Criteria in static HTML |
+| Role | Page (final URL after redirects) | HTML bytes | Criteria text in static HTML (verbatim) |
 |---|---|---|---|
-| [ICICI eligibility](https://www.icicibank.com/personal-banking/loans/personal-loan/eligibility) | 200 | Allows | Age 18–58, ₹30,000 minimum monthly income, "credit score of 700 and above is preferred"; rates from 9.99% |
-| [HDFC eligibility](https://www.hdfcbank.com/personal/borrow/popular-loans/personal-loan/eligibility) | 200 | Returned 403, so unverified | ₹25,000 income; main page 9.99%–24% |
-| [BankBazaar eligibility](https://www.bankbazaar.com/personal-loan-eligibility.html) | 200 | Allows the path | "CIBIL score of 750 or more", "EMI up to 65% of income" |
+| Primary | [ICICI](https://www.icici.bank.in/personal-banking/loans/personal-loan/eligibility) | 1,242,503 | "Minimum monthly income of ₹30,000 and total of 2 years of work experience for salaried individuals"; "A credit score of 700 and above is preferred"; "Minimum 18 years for salaried applicants and 23 years for self-employed" |
+| Primary | [HDFC](https://www.hdfc.bank.in/personal-loan/eligibility-criteria) | 1,096,086 | "Age: 21 to 60 years"; "Minimum monthly net income of ₹25,000"; employees of private limited companies and public sector undertakings |
+| Primary | [IDFC FIRST](https://www.idfcfirst.bank.in/personal-banking/loans/personal-loan) | 2,667,536 | "Age: Your age should be between 21 to 60 years"; "CIBIL Score: You should have a CIBIL Score of 710 or above"; "Salaried or Self-Employed"; "rates starting from 9.99% p.a." |
+| Spare | [BankBazaar](https://www.bankbazaar.com/personal-loan-eligibility.html) | 219,149 | Table: "Age limit 21 - 68 years", "Minimum Net Monthly Income Rs.5,000 and above", "CIBIL score of 750 or more", "Maximum EMI Up to 65% of Income" |
 
-Swaps: [Kotak](https://www.kotak.com/en/personal-banking/loans/personal-loan.html) and
-[IDFC FIRST](https://www.idfcfirstbank.com/personal-banking/loans/personal-loan), if HDFC blocks the
-EC2 IP or its robots stance stays unverifiable.
+**Facts found while probing.**
+- Every bank moved to a `bank.in` domain and 301-redirects the old `.com` URL (ICICI, HDFC, Kotak,
+  IDFC FIRST). The crawler must follow redirects and the site list stores the final URL.
+- robots.txt, read from the EC2 IP: ICICI, HDFC (`www.hdfc.bank.in`, which resolves the earlier
+  403-unverified note), BankBazaar and IDFC FIRST all return 200 and allow the target path for `*`.
+  The only HDFC rule for `*` is `Disallow: /homeloans-cug`.
+- Interest rates are not in the criteria text of ICICI or HDFC. ICICI only embeds `minInterest 9.99`,
+  `maxInterest 17` in a calculator JSON blob, which is too brittle to select. HDFC's page has no rate
+  text. IDFC FIRST and Kotak print "9.99% p.a." / "10.99%" in prose. Products without a rate keep
+  `interest_rate_min/max` NULL and a lower `parse_confidence` in T30; that is the honest input to
+  Stage 2's borderline rule, not something to guess.
+- Credit score floors are only on ICICI ("700 and above is preferred") and IDFC FIRST (710) here.
+  HDFC publishes none, so its `min_credit_score` stays NULL (unconstrained).
 
-**Rejected.** Bajaj Finserv, Paisabazaar and Axis: their static HTML was mostly navigation text, so
-criteria would need a headless browser.
+**Selectors (T28 refines them against the live DOM).**
+- ICICI: `li > span.step-bullet` (the key-criteria list).
+- HDFC: `li > span.description` under the eligibility block.
+- IDFC FIRST: `li` items whose text starts with "Age:", "CIBIL Score:" or "Occupation:".
+- BankBazaar: `table tr`, label in the first `td p`, value in the second.
+Because class names on these sites are generated and can change, extraction is text-anchored (keep
+lines containing income, age, score, employment, rate) rather than depending on one class.
+
+**Rejected.**
+- Kotak: the personal-loan page (820,923 bytes) has the rate ("Starting at 10.99% p.a.") and the
+  amount but no income, age or score criteria in static HTML, so it adds nothing for matching.
+- Bajaj Finserv, Paisabazaar and Axis: their static HTML was mostly navigation text, so criteria
+  would need a headless browser (earlier probe).
+- Using BankBazaar as a primary target: it is an aggregator whose generic floor (₹5,000) is not a
+  lender's product; kept as the spare and as a cross-check of the 750 score and 65% EMI figures.
 
 **Change detection.** Hash only the extracted, normalised criteria text with month/year strings
-removed, never the full HTML; pages carry dates such as "Oct 2026" that would change the hash daily.
+removed (for example "in Oct'26" on IDFC FIRST), never the full HTML; pages carry dates that would
+change the hash daily. Page sizes of 1-2.7 MB mean only the extracted lines are stored or hashed.
 
-**Why these thresholds help the demo (estimate).** ₹25k/₹30k income floors and 700/750 score floors
-fall inside the sample's ranges, so the funnel will have a real borderline band.
+**Why these thresholds help the demo (estimate).** ₹25k/₹30k income floors and 700/710 score floors
+fall inside the sample's ranges (income 25k-150k, score 650-800), so the funnel will have a real
+borderline band.
 
 ## Infrastructure as code: Serverless Framework v3
 
