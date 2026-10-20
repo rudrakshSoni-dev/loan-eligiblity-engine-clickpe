@@ -12,7 +12,7 @@
 | T08 | P0 | Schema ⚖️ | DONE | 2026-10-20 | 10 tables, 21 self-asserting constraint checks; all 10,000 sample rows pass the CHECKs |
 | T09 | P0 | Migrations + seed | DONE | 2026-10-20 | Checksummed ledger + advisory lock; re-run applies 0 migrations, changes 0 seed rows; 5 seed products flagged |
 | T10 | P0 | serverless.yml base ⚖️ | DONE | 2026-10-21 | Serverless v3; `sls package` + `validate-template` + `cfn-lint` clean; no `*` action on `*` resource; config moved to repo root. Opus review fixed a pg8000 import crash (`slim`) and silent `splitCsv` failures |
-| T11 | P0 | RDS | TODO | |  |
+| T11 | P0 | RDS | IN PROGRESS | 2026-10-21 | Instance up, private (no route from internet), endpoint in SSM; force_ssl / sslmode=disable / max_connections checks run from EC2 in T12 |
 | T12 | P0 | EC2 for n8n | TODO | |  |
 | T13 | P0 | Migrate RDS | TODO | |  |
 | T14 | P0 | Shared modules | TODO | |  |
@@ -312,3 +312,19 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why didn't `validate-template` or `cfn-lint` catch the pg8000 crash? A: They check the CloudFormation template, not the code inside the zip. Only importing the packaged code in a clean interpreter shows it, which is why that check is now part of `make package`.
   - Q: Why a separate `split-failures` queue instead of reusing `ingest-dlq`? A: The two hold different things. `ingest-dlq` holds chunk messages that can be redriven back into `ingest`. `split-failures` holds Lambda's async-failure records (the S3 event plus an error), and redriving those into `ingest` would feed `loadChunk` a message it cannot parse.
   - Q: Why did the import check first pass on a broken zip? A: `-I` only drops env vars and the user site. The venv's own site-packages was still on the path, and `importlib.metadata` found `scramp`'s metadata there. `-S` removes site-packages entirely, so the zip is the only source, as in Lambda. The check was confirmed to fail on the old zip before being trusted.
+
+### T11 — RDS (2026-10-21) — IN PROGRESS
+- Files: infra/rds.md (new: settings table, exact commands, privacy proof)
+- AWS resources: SG `clickpe-rds-sg` (`sg-0f0ca5e2b7cb5e1c3`, no inbound rules), subnet group `clickpe-db-subnets`, instance `clickpe-db`; SSM `/clickpe/db/host` set (version 2)
+- Incident: first run left `$SG` empty (group already existed), so `create-db-instance` fell into CLI help; the AWS pager also hid output. Fixed with `AWS_PAGER=""` and the literal SG ID; noted in `infra/rds.md`.
+- Evidence:
+  - `describe-db-instances` → class `db.t4g.micro`, engine 16.9, gp3 20 GB, encrypted, `MultiAZ false`, `PubliclyAccessible false`, `DeletionProtection true`, backups 1 day, parameter group `default.postgres16`, SG `sg-0f0ca5e2b7cb5e1c3`
+  - `getent hosts <endpoint>` from laptop → `172.31.32.255` (private); TCP 5432 → `No route to host`
+  - `describe-security-groups` → `IpPermissions: []`
+- Pending (needs a client in the VPC, done in T12): `SHOW rds.force_ssl` = on, `sslmode=disable` rejected, `SHOW max_connections`; 5432 ingress from the n8n SG (T12) and Lambda SG (after `sls deploy`).
+- Quality gates: no Python touched. Secrets scan: endpoint is not a secret; password only read from SSM inside a command substitution.
+- Rubric: Cloud Architecture (private RDS, SG-reference-only ingress, encrypted storage)
+- Explain it back:
+  - Q: How do you prove the database is private, not just firewalled? A: Public DNS returns only the private VPC address, so the internet has no route to it at all; the SG would be a second layer.
+  - Q: Why open 5432 by security-group reference instead of the VPC CIDR? A: Only ENIs carrying the Lambda or n8n SG can connect; anything else launched in the VPC cannot, and IPs can change.
+  - Q: Why not Multi-AZ or a bigger class? A: Demo scale and cost; COPY plus the MaximumConcurrency 3 cap keeps load low. Multi-AZ is the documented production upgrade.
