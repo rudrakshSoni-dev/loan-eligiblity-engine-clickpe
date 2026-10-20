@@ -15,7 +15,9 @@ Sophistication, robustness, efficiency, creative nodes, Optimization Treasure Hu
 | Status | Evidence | Where | Task |
 |---|---|---|---|
 | ✅ | Measured Groq free-tier limits (30 RPM, 1K RPD, 8K TPM) and the arithmetic showing per-pair LLM calls are infeasible (10,000 × 5 = 50,000 calls vs 1,000/day) | `docs/decisions.md` → "LLM provider: Groq"; `PROGRESS.md` T04 | T04 |
-| ✅ | Data shape analysis: 3 employment values and coarse income/score/age steps give few cohorts, so cohort batching can cut LLM calls | `docs/data-notes.md` → "Implications" | T01 |
+| ✅ | Data shape analysis: 9,869 distinct (income, score, age, employment) tuples in 10,000 users, and 1,028–5,528 raw-band cohorts per product, so the design keys cohorts by borderline reason and caches verdicts instead | `docs/data-notes.md`, `docs/decisions.md` → "Matching and the Optimization Treasure Hunt" | T01, T07 |
+| ✅ | Treasure Hunt strategy: LLM at ingest gated by content hash, SQL + rules first, skip-LLM rule, reason-keyed cohorts, `cohort_verdicts` cache, budget guard; counterfactual 30,000 calls = 30 days of quota | `docs/decisions.md` | T07 |
+| ✅ | Crawl targets probed live (HTTP status, robots.txt, criteria present in static HTML) | `docs/decisions.md` → "Crawl targets" | T07 |
 | ⬜ | Global error workflow (Workflow E) | `n8n/workflows/` | T25 |
 | ⬜ | Reusable LLM Gateway sub-workflow | `n8n/workflows/` | T26 |
 | ⬜ | Crawl + change detection + structuring (Workflow A) | `n8n/workflows/` | T27–T31 |
@@ -32,7 +34,8 @@ Serverless quality, secure n8n ↔ AWS integration, scalable ingestion.
 | ✅ | SES kept in sandbox; only 3 verified test identities can receive mail (AWS-side safety net) | `PROGRESS.md` T03 | T03 |
 | ✅ | Region decision recorded with the SCP evidence and the production target (`ap-south-1`) | `PROGRESS.md` T03 | T03 |
 | ✅ | Secrets never in the repo: `.env` gitignored, `.env.example` holds placeholders only | `.gitignore`, `.env.example` | T04, T05 |
-| ⬜ | `serverless.yml`: presigned upload, S3 → SQS → Lambda fan-out, DLQ, least-privilege IAM | `infra/serverless.yml` | T10, T15, T17–T21 |
+| ✅ | Every architecture decision documented with the rejected alternative and a cited reason, incl. measured account constraint (Lambda concurrency 10 → reserved concurrency impossible → SQS `MaximumConcurrency`) and Step Functions as a considered runner-up | `docs/decisions.md` | T07 |
+| ⬜ | `serverless.yml`: presigned POST upload, S3 → SQS → Lambda fan-out, DLQ, least-privilege IAM | `infra/serverless.yml` | T10, T15, T17–T21 |
 | ⬜ | Private RDS, no-NAT VPC design, n8n on EC2 in the same VPC | `infra/`, `docs/decisions.md` | T11–T12 |
 | ⬜ | Webhook secret on Lambda → n8n calls | `lambdas/`, `n8n/workflows/` | T19, T32 |
 
@@ -55,7 +58,7 @@ Diagram, README, video.
 
 | Status | Evidence | Where | Task |
 |---|---|---|---|
-| 🟡 | Design decisions doc started (LLM provider section) | `docs/decisions.md` | T04, T07 |
+| ✅ | Design decisions doc: 19 sections, each with choice / rejected / why, every claim labelled cited / measured / estimate; approved | `docs/decisions.md` | T04, T07 |
 | ⬜ | Mermaid architecture diagram matching deployed reality | `docs/architecture.md`, `README.md` | T48 |
 | ⬜ | README with copy-pasteable setup and measured design decisions | `README.md` | T49 |
 | ⬜ | Video script and recording | `docs/video-script.md` | T50–T52 |

@@ -16,19 +16,19 @@ Observed on 2026-10-20. File: 993,191 bytes, UTF-8, comma-delimited, header row 
 
 ## Implications
 
-**T07 schema**
+**T08 schema**
 - `users.user_id`: `uuid` primary key (not serial).
 - `email` must NOT be unique and must not be the upsert key. Upsert on `user_id` only.
 - `monthly_income`: `numeric(12,2)` is fine (data is whole numbers). `credit_score`, `age`: `int`, with CHECK ranges looser than observed (e.g. score 300–900, age 18–100), so valid future uploads are not rejected.
 - `employment_status`: `text`, validated in code against the 3 observed values (a CHECK constraint is optional; new statuses should be a deliberate change).
 
-**T15 validation**
+**T16 validation**
 - Required columns: all 7. Reject rows with a missing/blank value, a non-UUID `user_id`, a non-numeric income/score/age, or an unknown `employment_status`.
 - Strip whitespace; match `employment_status` exactly (consider case-insensitive normalisation).
 - The sample has zero bad rows, so `/tests/` needs synthetic bad-row CSVs of its own.
 
 **Matching (Workflow B)**
-- Only 3 employment values, ~126 income levels, 31 score levels and 29 ages: users cluster heavily, which makes cohort bucketing in Stage 3 very effective.
+- Only 3 employment values, ~126 income levels, 31 score levels and 29 ages, yet the combinations are nearly all distinct: 9,869 distinct (income, score, age, employment) tuples across 10,000 users (T07 analysis). Raw-value cohorts therefore do not shrink the LLM workload; Stage 3 cohorts are keyed by the *reason* a pair is borderline instead (see `decisions.md` → Treasure Hunt).
 - Duplicate emails matter for Workflow C: do not group or dedupe notifications by email, only by `user_id`. Per CLAUDE.md §0.5, no mail goes to these addresses anyway; they are only quoted as "intended for" in the body.
 
 ## Housekeeping

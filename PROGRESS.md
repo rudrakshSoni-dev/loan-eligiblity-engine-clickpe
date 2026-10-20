@@ -8,7 +8,7 @@
 | T04 | P0 | Groq key | DONE | 2026-10-20 | gpt-oss-120b chosen (20b fallback); 30 RPM / 1K RPD / 8K TPM / 200K TPD |
 | T05 | P0 | Repo skeleton | DONE | 2026-10-20 | Layout per CLAUDE.md §3; task IDs renumbered to match CLAUDE.md §6 |
 | T06 | P0 | Quality tooling | DONE | 2026-10-20 | `make check` = ruff lint + format, mypy strict, pytest + 80% coverage floor on `lambdas/shared` |
-| T07 | P0 | Decisions doc ⚖️ | TODO | |  |
+| T07 | P0 | Decisions doc ⚖️ | DONE | 2026-10-20 | Research-revised; approved by user. 13 plan changes (concurrency, ledger, presigned POST, SSM-only n8n, strict LLM schema, reason-keyed cohorts) |
 | T08 | P0 | Schema ⚖️ | TODO | |  |
 | T09 | P0 | Migrations + seed | TODO | |  |
 | T10 | P0 | serverless.yml base ⚖️ | TODO | |  |
@@ -158,3 +158,37 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why mypy strict everywhere instead of only on `lambdas/shared`? A: Handlers are thin, but they still parse events and pass data to `shared/`. A missing hint at that boundary is where type bugs get in, so it is cheaper to require hints everywhere from day one than to add them later.
   - Q: The coverage report says 100% with 0 statements. Isn't that meaningless? A: Yes, for now. The floor is wired up so that from T14 on, any shared module added without tests fails `make check`. The negative probe shows it failing at 0%.
   - Q: Why is there a test that only imports packages? A: It catches broken layout (a missing `__init__.py`, a renamed folder) that would otherwise only appear when serverless packages a Lambda. It also stops pytest from exiting with code 5 ("no tests collected") on the skeleton.
+
+### T07 — Decisions doc (2026-10-20)
+- Verify: user approved `docs/decisions.md` on 2026-10-20.
+- Files: `docs/decisions.md` (rewritten: 19 sections, each choice / rejected / why, every claim labelled cited / measured / estimate), `docs/data-notes.md` (stale task IDs T07→T08, T15→T16; cohort claim corrected), `docs/rubric-evidence.md`, `CLAUDE.md` §2, §4 and task text T08, T10–T12, T14, T15, T17–T19, T23, T24, T26, T27, T34, T35, T45 (CLAUDE.md is gitignored, so these edits are local only)
+- Method: four parallel research investigations (ingestion, network/security, database, n8n/LLM) against AWS / n8n / Groq / PostgreSQL docs; synthesis at `reports/Loan engine architecture decisions.md` (untracked, not for commit).
+- Evidence:
+  - `aws lambda get-account-settings --profile clickpe` → `"ConcurrentExecutions": 10`, `"UnreservedConcurrentExecutions": 10`
+  - `uname -m` → `x86_64` (dev machine; Lambdas are arm64)
+  - Cohort analysis of `data/users.csv`: 9,869 distinct (income, score, age, employment) tuples; raw-band cohorts 5,528 / 1,028 / 265 depending on band width
+  - Crawl probe: ICICI, HDFC, BankBazaar eligibility pages return criteria to a plain GET (HDFC robots.txt → 403)
+  - Secrets scan: only prose and placeholder matches; no `AKIA…` or `gsk_…` key patterns
+  - `make check` → `All checks passed!`, `19 files already formatted`, `Success: no issues found in 9 source files`, `5 passed`, coverage floor reached (no Python touched)
+- Plan changes applied (were wrong or weaker in the original §2):
+  1. Reserved concurrency 5 → SQS ESM `MaximumConcurrency: 3` (reserved concurrency is impossible at account limit 10).
+  2. DLQ `maxReceiveCount` 3 → 5; visibility timeout ≥ 6× loader timeout.
+  3. Atomic `chunks_done` counter → `chunk_loads` ledger + conditional `loading→processed` UPDATE (counter double-counts on SQS redelivery).
+  4. Presigned PUT → presigned POST with `content-length-range` (PUT has no documented size enforcement).
+  5. Chunk messages carry exact quote-aware byte offsets; `split-csv` never touches RDS (bookkeeping travels in messages).
+  6. Upsert adds `DISTINCT ON (user_id)` and `IS DISTINCT FROM`.
+  7. pg8000 TLS verified against the RDS CA bundle; `rds.force_ssl` is already the PG16 default (verify, don't set).
+  8. n8n editor via SSM port forward, no inbound internet ports; owner account + 2FA (basic auth removed in n8n 1.0); exact 2.x tag; explicit `N8N_BLOCK_ENV_ACCESS_IN_NODE`.
+  9. Webhook: SG + IP allowlist + header secret + idempotent Workflow B.
+  10. SES via EC2 instance role (Assume Role credential) first, IAM user fallback.
+  11. Groq JSON mode → strict Structured Outputs; explicit 429 branch; `cohort_verdicts` cache; `llm_calls` ledger; budget guard.
+  12. Cohort key → (product, borderline reason, triggering-feature band, employment).
+  13. Step Functions Inline Map documented as the considered runner-up; Distributed Map ItemReader rejected.
+- Correction to earlier logs: the T01 "users fall into few cohorts" answer is superseded by the measured 9,869 distinct tuples.
+- Rubric: Docs (decisions with rejected alternatives and citations), Cloud (account-constraint-driven concurrency design, no-NAT network table, layered webhook security), n8n (Treasure Hunt strategy with measured cohort counts and counterfactual).
+- Explain it back:
+  - Built: a decisions document where every architecture choice names what was rejected and why, backed by a cited source or a measurement from this account, and a corrected plan in CLAUDE.md.
+  - Why research-driven revision over the obvious "write up the plan as is": four details in the plan would have failed at deploy or under review (reserved concurrency, PUT size limit, counter double-count, raw-band cohorts exceeding the LLM budget). Finding them now costs minutes; finding them in T18 or T35 costs hours.
+  - Q: Why not reserved concurrency to protect RDS? A: AWS lets you reserve only up to unreserved concurrency minus 100, and this account's limit is 10, so it cannot be set. The SQS event source mapping's `MaximumConcurrency: 3` caps pollers instead, which also avoids throttled messages drifting to the DLQ.
+  - Q: How do you guarantee exactly one n8n trigger when chunks finish at the same time or SQS redelivers? A: Each chunk writes a ledger row keyed by (batch_id, chunk_no) in its own transaction, so a redelivery is a no-op. After commit, a conditional UPDATE moves the batch from `loading` to `processed` only when the ledger count equals total_chunks; Postgres row locking lets exactly one caller get a row back, and only that caller calls n8n.
+  - Q: Why SQS instead of Step Functions, which gives a single finalize step for free? A: Both are correct; SQS already matches the task plan, needs no new plugin or ASL, and keeps every VPC Lambda free of AWS API calls. Step Functions is documented as the runner-up and would be chosen only with spare time after the SQS path passes the smoke test, mainly for its execution graph in the video.
