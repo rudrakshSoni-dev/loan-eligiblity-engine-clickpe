@@ -19,7 +19,13 @@ RUNTIME_MODULES = (
     "lambdas.split_csv.handler",
     "lambdas.load_chunk.handler",
     "lambdas.batch_status.handler",
+    "lambdas.shared.config",
+    "lambdas.shared.db",
+    "lambdas.shared.batches",
+    "lambdas.shared.logging",
 )
+
+REQUIRED_FILES = ("lambdas/shared/rds-global-bundle.pem",)
 
 logger = logging.getLogger("check_package")
 
@@ -48,6 +54,13 @@ def main(zip_path: str) -> int:
         with zipfile.ZipFile(zip_path) as archive:
             archive.extractall(tmp)
         failures = import_failures(Path(tmp), RUNTIME_MODULES)
+        failures.update(
+            {
+                name: "missing from package"
+                for name in REQUIRED_FILES
+                if not (Path(tmp) / name).is_file()
+            }
+        )
     stage = "package_imports_failed" if failures else "package_imports_ok"
     logger.info(json.dumps({"stage": stage, "count": len(RUNTIME_MODULES), "failures": failures}))
     return 1 if failures else 0
