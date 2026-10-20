@@ -44,7 +44,7 @@ Correct ingestion, clean, modular, commented code.
 |---|---|---|---|
 | ✅ | Column profile and validation rules derived from the real CSV | `docs/data-notes.md` | T01 |
 | ✅ | Modular layout: one package per Lambda plus a pure `shared/` package | `lambdas/` | T05 |
-| ⬜ | Lint, format, type-check and test gates (`make check`) | `pyproject.toml`, `Makefile` | T06 |
+| ✅ | One-command quality gates: ruff lint (incl. no `print`, no bare/blind `except`, module docstrings) + format, mypy strict on all code, pytest with an 80% branch-coverage floor on `lambdas/shared`; a negative probe shows each gate failing | `pyproject.toml`, `Makefile`, `uv.lock`; `PROGRESS.md` T06 | T06 |
 | ⬜ | Schema with CHECK constraints, migrations, seed data flagged `is_seed` | `db/` | T08–T09 |
 | ⬜ | Validation with reject report; COPY bulk load; idempotent upsert | `lambdas/shared/`, `lambdas/load_chunk/` | T16–T18 |
 | ⬜ | Tests with coverage ≥ 80% on shared + validation | `tests/` | T44 |

@@ -7,7 +7,7 @@
 | T03 | P0 | SES identities | DONE | 2026-10-20 | 3 identities verified in ap-southeast-2; region changed from ap-south-1 (account is SCP region-locked) |
 | T04 | P0 | Groq key | DONE | 2026-10-20 | gpt-oss-120b chosen (20b fallback); 30 RPM / 1K RPD / 8K TPM / 200K TPD |
 | T05 | P0 | Repo skeleton | DONE | 2026-10-20 | Layout per CLAUDE.md §3; task IDs renumbered to match CLAUDE.md §6 |
-| T06 | P0 | Quality tooling | TODO | |  |
+| T06 | P0 | Quality tooling | DONE | 2026-10-20 | `make check` = ruff lint + format, mypy strict, pytest + 80% coverage floor on `lambdas/shared` |
 | T07 | P0 | Decisions doc ⚖️ | TODO | |  |
 | T08 | P0 | Schema ⚖️ | TODO | |  |
 | T09 | P0 | Migrations + seed | TODO | |  |
@@ -131,3 +131,30 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why `.gitkeep` files and docstring `__init__.py` files instead of empty folders? A: Git does not track empty directories, so without them a fresh clone would not show the layout. Real packages get an `__init__.py` with a docstring so mypy and pytest resolve imports like `lambdas.shared.config`.
   - Q: Why is `.env.example` committed while `.env` is ignored by two patterns (`.env`, `.env.*`)? A: The example documents every variable a developer needs, with placeholders only. The wildcard also catches `.env.local` or `.env.prod`, and the `!.env.example` exception keeps the template tracked.
   - Q: Why gitignore the whole `data/` folder? A: The sample CSV holds emails and income data, and the synthetic 100k files are large. Neither belongs in git history, and once a file is committed, deleting it later does not remove it from history.
+
+### T06 — Quality tooling (2026-10-20)
+- Files: `pyproject.toml` (ruff, mypy, pytest, coverage config; uv dev group), `Makefile` (`install`, `check`, `lint`, `format-check`, `typecheck`, `test`, `fmt`), `uv.lock`, `.python-version` (3.12), `tests/unit/test_layout.py`
+- Choices:
+  - uv manages the dev env; `uv.lock` is committed so every machine gets the same tool versions (ruff 0.17.1, pytest 9.1.1, pytest-cov 7.1.0).
+  - ruff rules go beyond the defaults to enforce CLAUDE.md §4 mechanically: `T20` (no `print`), `BLE` + `E722` (no blind/bare `except`), `D100`/`D104` (module and package docstrings), plus `I`, `UP`, `B`, `SIM`, `N`, `RUF`.
+  - mypy `strict = true` on all code, not just `lambdas/shared`, because §4 requires full type hints everywhere. `files = ["lambdas", "tests"]`; `db` is added in T09 when `db/migrate.py` exists (mypy errors on a directory with no `.py` files).
+  - Coverage measures `lambdas/shared` with branch coverage and `fail_under = 80`.
+  - `tests/unit/test_layout.py` imports every Lambda package and checks its docstring. It is a real guard for the layout, and it gives pytest at least one test (pytest exits 5 when nothing is collected, which would fail `make check`).
+- Evidence:
+  - `make check` →
+    - `ruff check .` → `All checks passed!`
+    - `ruff format --check .` → `14 files already formatted`
+    - `mypy` → `Success: no issues found in 9 source files`
+    - `pytest --cov` → `5 passed in 0.12s`, `Required test coverage of 80.0% reached. Total coverage: 100.00%` (0 statements so far; the floor starts to bite in T14)
+  - Negative probe (temporary `lambdas/shared/probe_tmp.py` with an untyped function, `print` and bare `except`, deleted after) →
+    - ruff: `D100 Missing docstring`, `T201 print found`, `E722 Do not use bare except`
+    - mypy: `error: Function is missing a type annotation [no-untyped-def]`
+    - pytest: `FAIL Required test coverage of 80.0% not reached. Total coverage: 0.00%`
+  - Secrets scan: matches only prose, variable names and `<placeholder>` values.
+- Rubric: Backend & Code Quality (lint/format/type/test gates, coverage floor).
+- Explain it back:
+  - Built: one command, `make check`, that runs lint, format check, strict type check and tests with a coverage floor. Every later task must pass it before it is marked DONE.
+  - Why this approach over the obvious alternative (flake8 + black + isort): ruff does all three in one fast tool with one config block. The custom rule set turns the code standards in CLAUDE.md §4 into failing checks instead of review comments.
+  - Q: Why mypy strict everywhere instead of only on `lambdas/shared`? A: Handlers are thin, but they still parse events and pass data to `shared/`. A missing hint at that boundary is where type bugs get in, so it is cheaper to require hints everywhere from day one than to add them later.
+  - Q: The coverage report says 100% with 0 statements. Isn't that meaningless? A: Yes, for now. The floor is wired up so that from T14 on, any shared module added without tests fails `make check`. The negative probe shows it failing at 0%.
+  - Q: Why is there a test that only imports packages? A: It catches broken layout (a missing `__init__.py`, a renamed folder) that would otherwise only appear when serverless packages a Lambda. It also stops pytest from exiting with code 5 ("no tests collected") on the skeleton.

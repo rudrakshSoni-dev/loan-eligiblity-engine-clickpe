@@ -1,0 +1,66 @@
+[project]
+name = "loan-eligibility-engine"
+version = "0.1.0"
+description = "Ingest user CSVs on AWS, discover loan products and match users to them with n8n."
+readme = "README.md"
+# Matches the Lambda runtime (python3.12, arm64) so local checks see the same language.
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+# Not an installable package: Lambdas are zipped by serverless, tests import from the repo root.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # import sorting
+    "N",       # naming
+    "UP",      # modern syntax for the target version
+    "B",       # bugbear: likely bugs
+    "SIM",     # simplifications
+    "RUF",     # ruff-specific
+    "BLE",     # no blind `except Exception`
+    "T20",     # no print(); CLAUDE.md §4 requires structured logging
+    "D100",    # every module has a docstring
+    "D104",    # every package has a docstring
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+# Strict everywhere, not only lambdas/shared: CLAUDE.md §4 requires full type hints in all code.
+strict = true
+warn_unreachable = true
+# `db` joins this list in T09 when db/migrate.py exists; mypy errors on a directory with no .py files.
+files = ["lambdas", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+
+[tool.coverage.run]
+source = ["lambdas/shared"]
+branch = true
+
+[tool.coverage.report]
+# CLAUDE.md §4: coverage >= 80% on shared modules (validation lives there too).
+fail_under = 80
+show_missing = true
+skip_empty = true
