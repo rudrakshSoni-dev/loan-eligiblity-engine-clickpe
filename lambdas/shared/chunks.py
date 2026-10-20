@@ -8,19 +8,25 @@ was split, S3 refuses the read instead of returning bytes from a different file.
 
 A split that cannot produce chunks (bad header, oversize file) sends one control message with
 `batch_id` and `error` instead, and load-chunk marks the batch failed.
+
+`send_messages` is split-csv's side: SendMessageBatch in groups of 10 (the SQS maximum), with one
+resend of the entries SQS reports as failed. Anything still unsent raises, so the S3 invocation is
+retried as a whole; chunks already sent arrive twice and the chunk ledger ignores the copies.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from lambdas.shared.batches import upload_key
 
 PERMANENT_S3_ERROR_CODES = frozenset({"NoSuchKey", "PreconditionFailed", "InvalidRange"})
+SQS_BATCH_LIMIT = 10
+SEND_ATTEMPTS = 2
 
 
 class MessageError(ValueError):
@@ -33,6 +39,10 @@ class ChunkRejectedError(Exception):
 
 class ChunkUnavailableError(Exception):
     """S3 could not serve the chunk right now; the message should be retried."""
+
+
+class SendError(Exception):
+    """SQS kept refusing some messages; the split must be retried."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +81,15 @@ class S3RangeReader(Protocol):
         Key: str,  # noqa: N803
         Range: str,  # noqa: N803
         IfMatch: str,  # noqa: N803
+    ) -> dict[str, Any]: ...
+
+
+class MessageSender(Protocol):
+    def send_message_batch(
+        self,
+        *,
+        QueueUrl: str,  # noqa: N803
+        Entries: list[dict[str, str]],  # noqa: N803
     ) -> dict[str, Any]: ...
 
 
@@ -193,3 +212,34 @@ def read_chunk(s3: S3RangeReader, bucket: str, message: ChunkMessage) -> bytes:
             f"chunk {message.chunk_no} is {len(data)} bytes, message says {message.size}"
         )
     return data
+
+
+def send_messages(
+    sqs: MessageSender, queue_url: str, messages: Sequence[ChunkMessage | SplitFailure]
+) -> int:
+    """Queue every message; return how many were sent, or raise SendError naming what failed."""
+    bodies = [encode_message(message) for message in messages]
+    for first in range(0, len(bodies), SQS_BATCH_LIMIT):
+        group = bodies[first : first + SQS_BATCH_LIMIT]
+        send_group(sqs, queue_url, {str(first + i): body for i, body in enumerate(group)})
+    return len(bodies)
+
+
+def send_group(sqs: MessageSender, queue_url: str, pending: dict[str, str]) -> None:
+    errors: list[str] = []
+    for _ in range(SEND_ATTEMPTS):
+        entries = [{"Id": entry_id, "MessageBody": body} for entry_id, body in pending.items()]
+        response = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+        failed = response.get("Failed", [])
+        errors = [f"{f.get('Id')}: {f.get('Code')}" for f in failed]
+        pending = {f["Id"]: pending[f["Id"]] for f in failed}
+        if not pending:
+            return
+    raise SendError(f"SQS refused {len(pending)} message(s): {', '.join(errors)}")
+
+
+def new_sqs_client(region: str) -> MessageSender:
+    import boto3
+
+    client: MessageSender = boto3.client("sqs", region_name=region)
+    return client

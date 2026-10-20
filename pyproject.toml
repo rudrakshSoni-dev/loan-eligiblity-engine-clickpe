@@ -12,6 +12,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "boto3>=1.43.116",
+    "moto[s3,sqs]>=5",
     "mypy>=1.13",
     "pytest>=8.3",
     "pytest-cov>=6.0",
