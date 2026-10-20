@@ -10,6 +10,7 @@ Stack lives in `/opt/clickpe/n8n` on `i-02ffa9d08e8403a4a`. Files: `n8n/docker-c
 | `N8N_BLOCK_ENV_ACCESS_IN_NODE` | `true` | The container env holds the encryption key, so Code nodes must not read `$env`; non-secret config (`DRY_RUN`, `TEST_INBOX_ALIASES`, `MAX_EMAILS_PER_RUN`) comes from an `app_config` table row |
 | `N8N_SECURE_COOKIE` | `false` | Editor is plain HTTP through the SSM tunnel on `localhost`; nothing else can reach it |
 | `N8N_AWS_SYSTEM_CREDENTIALS_ACCESS_ENABLED` | `true` | Lets the AWS credential use the EC2 instance role (T24) |
+| `NODE_EXTRA_CA_CERTS` | `/certs/rds-global-bundle.pem` (host `/opt/clickpe/global-bundle.pem`, mounted read-only) | n8n's Postgres credential has no CA field, so the container trusts the RDS CA instead; chain and hostname are verified (T24) |
 | Hardening | public API, diagnostics, version notifications, personalization off; execution data pruned after 168 h | |
 | Restart / health | `unless-stopped`; `wget /healthz` every 30 s | |
 | Inbound | `clickpe-n8n-sg`: 5678 from the Lambda SG `sg-0ad4c9a31f3b8f7cc` only (rule `sgr-05583458c0968e07c`), no CIDR rules | Webhook callers only; editor is SSM-only |
@@ -86,3 +87,18 @@ pruned after 168 h.
 
 Note: `/healthz` answers 200 before published webhooks are registered. Wait for
 `Finished building workflow dependency index` in `docker logs n8n` after a restart before calling a webhook.
+
+## Credentials (T24)
+
+Created in the editor by name; workflows reference only these names. Screenshots with values masked are in `docs/screenshots/t24-*.png`.
+
+| Name | Type | Settings | Test |
+|---|---|---|---|
+| `rds-postgres` | Postgres | RDS endpoint from SSM `/clickpe/db/host`, database and user `clickpe`, SSL Require, Ignore SSL Issues off | "Connection tested successfully" |
+| `aws-ses-assume-role` | AWS (Assume Role) | `ap-southeast-2`, Use System Credentials on, role `clickpe-n8n-ses-role`, external ID `clickpe-n8n` (the form requires one; the trust policy does not check it) | "Connection tested successfully" |
+| `webhook-secret` | Header Auth | `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` | not testable until T32 |
+| `groq-api` | Header Auth | `Authorization: Bearer <key>` | first call in T26 |
+
+SES role chain: instance role `clickpe-n8n-ec2-role` (inline policy `assume-n8n-ses-role`, `sts:AssumeRole` on one ARN) assumes `clickpe-n8n-ses-role` (trust: that instance role only; policy `ses-send-test-identities`: `ses:SendEmail` and `ses:SendRawEmail` on the three verified identities). Policy documents are in `infra/iam/`. From the instance, `aws sts assume-role` returned `assumed-role/clickpe-n8n-ses-role/t24check`. No static keys exist.
+
+First attempt on `rds-postgres` failed with `self-signed certificate in certificate chain` (the RDS CA is not in Node's trust store); the fix was the `NODE_EXTRA_CA_CERTS` mount above, not the Ignore SSL Issues toggle.

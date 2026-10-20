@@ -19,12 +19,14 @@ services:
       N8N_PERSONALIZATION_ENABLED: "false"
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
       N8N_AWS_SYSTEM_CREDENTIALS_ACCESS_ENABLED: "true"
+      NODE_EXTRA_CA_CERTS: /certs/rds-global-bundle.pem
       EXECUTIONS_DATA_PRUNE: "true"
       EXECUTIONS_DATA_MAX_AGE: "168"
       EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
       EXECUTIONS_DATA_SAVE_ON_ERROR: all
     volumes:
       - n8n_data:/home/node/.n8n
+      - /opt/clickpe/global-bundle.pem:/certs/rds-global-bundle.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:5678/healthz || exit 1"]
       interval: 30s

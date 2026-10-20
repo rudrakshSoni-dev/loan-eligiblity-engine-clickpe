@@ -1,0 +1,1 @@
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ses:SendEmail","ses:SendRawEmail"],"Resource":["arn:aws:ses:ap-southeast-2:376834080732:identity/mrrssoni12@gmail.com","arn:aws:ses:ap-southeast-2:376834080732:identity/mrrssoni12+one@gmail.com","arn:aws:ses:ap-southeast-2:376834080732:identity/mrrssoni12+two@gmail.com"]}]}

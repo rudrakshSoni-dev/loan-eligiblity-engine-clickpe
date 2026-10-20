@@ -25,7 +25,7 @@
 | T21 | P1 | DLQ handling + alarm | TODO | |  |
 | T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
 | T23 | P0 | docker-compose | DONE | 2026-10-21 | n8n 2.44.4 healthy on EC2; editor only via SSM tunnel (200), public IP times out; webhook allowlist 200 inside / 403 outside; owner account + 2FA still to be created in browser |
-| T24 | P0 | n8n credentials | TODO | |  |
+| T24 | P0 | n8n credentials | DONE | 2026-10-21 | 4 credentials; Postgres (verified TLS via mounted RDS CA) and AWS Assume Role (system credentials, SES-only role, no static keys) tests green |
 | T25 | P1 | Workflow E — global error handler | TODO | |  |
 | T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | |  |
 | T27 | P0 | Crawl targets ⚖️ | TODO | |  |
@@ -624,3 +624,20 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Six chunks finish within milliseconds of each other. How many POSTs reach n8n? A: One. Each chunk runs the conditional `loading → processed` UPDATE after its own commit; Postgres lets only one of them change the row, and only that caller posts. Live: three 6-chunk batches each logged 5 lost checks and 1 `webhook_sent`, and n8n recorded one execution per batch.
   - Q: n8n is restarting when the last chunk lands. What happens to the batch? A: The Lambda tries three times over about 1.5 s, logs `webhook_failed` at ERROR and acknowledges the message, so nothing lands in the DLQ. The batch stays `processed`. `scripts/retrigger_batch.sh <batch_id>` re-sends it once n8n is back. Shown live with n8n stopped: 3 refused attempts, then HTTP 200 from the retrigger.
   - Q: Could the retry or the retrigger make n8n match the same batch twice? A: Both can deliver a second POST, by design. That is why Workflow B's first step is the conditional `processed → matching` UPDATE: the second execution gets no row back and stops. The trigger is at-least-once and the consumer is idempotent; that is built in T32.
+
+### T24 — n8n credentials (2026-10-21)
+- Files: `n8n/docker-compose.yml` (`NODE_EXTRA_CA_CERTS` + read-only CA mount), `infra/iam/{n8n-ses-trust,n8n-ses-send,n8n-ec2-assume-ses}.json` (new), `infra/n8n.md` (credentials section), `docs/screenshots/t24-{rds-postgres-test-ok,aws-ses-assume-role-test-ok,webhook-secret-credential,groq-api-credential}.png`. AWS: role `clickpe-n8n-ses-role`, inline policy `assume-n8n-ses-role` on `clickpe-n8n-ec2-role`. n8n container recreated.
+- Evidence:
+  - `aws sts assume-role` from the instance (SSM Run Command) → `assumed-role/clickpe-n8n-ses-role/t24check`, status `Success`.
+  - `rds-postgres` first test → `self-signed certificate in certificate chain`; after mounting the CA (`/opt/clickpe/global-bundle.pem` sha256 prefix `90a6f1a7978a1b1b` = repo copy; `docker exec n8n ls -l /certs/rds-global-bundle.pem` → 174,560 B; container `Up 45 seconds (healthy)`) the error moved to `password authentication failed for user "postgres"` (wrong default user), then `Connection tested successfully` with user `clickpe`.
+  - `aws-ses-assume-role` → `Connection tested successfully` (screenshot).
+  - `webhook-secret` and `groq-api` saved with masked values (screenshots).
+- Not verified: owner-account 2FA (done by the user in the browser; no evidence captured); an actual SES send through the assumed role (T39); `groq-api` against Groq from n8n (T26); `webhook-secret` against Workflow B (T32). No Python touched, so ruff/mypy/pytest were not re-run. Secrets values were copied to the clipboard by command and never printed.
+- Side effects / open: probe workflows `t23probe0001` and `t19stubrecv1` still in n8n, to delete in the editor. SES role needed no static keys, so the IAM-user fallback was not used.
+- Rubric: Cloud (SES access with no long-lived keys, least-privilege role limited to 3 identities, verified-TLS DB access from n8n), n8n (credentials named and ready for A/B/C/E).
+- Explain it back:
+  - Built: the four named n8n credentials, an SES-only IAM role reachable only from the n8n instance role, and a mounted RDS CA so n8n verifies the database certificate.
+  - Why this over the obvious alternative (turn on "Ignore SSL Issues", or create an IAM user with access keys): the toggle encrypts but does not verify the server, and access keys would sit in n8n's database indefinitely. A mounted CA keeps full verification, and role chaining leaves nothing long-lived to leak or rotate.
+  - Q: Why did the first Postgres test fail, and why not just ignore it? A: Node did not trust the Amazon RDS CA. Ignoring it would still encrypt but would accept any certificate; adding the CA proves we are talking to our RDS.
+  - Q: What can the SES role do if the n8n box is compromised? A: Send mail from or to three verified test addresses only, and the SES sandbox adds a second limit (verified recipients, 200 per day).
+  - Q: The form demanded an External ID. Is that a security control? A: No. Our trust policy has no condition on it, so it is ignored; the real control is that only the instance role can assume the role.
