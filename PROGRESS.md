@@ -10,7 +10,7 @@
 | T06 | P0 | Quality tooling | DONE | 2026-10-20 | `make check` = ruff lint + format, mypy strict, pytest + 80% coverage floor on `lambdas/shared` |
 | T07 | P0 | Decisions doc ⚖️ | DONE | 2026-10-20 | Research-revised; approved by user. 13 plan changes (concurrency, ledger, presigned POST, SSM-only n8n, strict LLM schema, reason-keyed cohorts) |
 | T08 | P0 | Schema ⚖️ | DONE | 2026-10-20 | 10 tables, 21 self-asserting constraint checks; all 10,000 sample rows pass the CHECKs |
-| T09 | P0 | Migrations + seed | TODO | |  |
+| T09 | P0 | Migrations + seed | DONE | 2026-10-20 | Checksummed ledger + advisory lock; re-run applies 0 migrations, changes 0 seed rows; 5 seed products flagged |
 | T10 | P0 | serverless.yml base ⚖️ | TODO | |  |
 | T11 | P0 | RDS | TODO | |  |
 | T12 | P0 | EC2 for n8n | TODO | |  |
@@ -221,3 +221,30 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why isn't `email` unique? A: In the sample 7,368 rows share an email with another user (each address is used 2–5 times). Only `user_id` is unique, so it is the primary key and the upsert key.
   - Q: How does the schema make SQS redelivery safe? A: `chunk_loads` has primary key `(batch_id, chunk_no)`. A redelivered chunk's `INSERT … ON CONFLICT DO NOTHING RETURNING` gets no row back, so the Lambda acknowledges and exits without loading anything twice. The test script shows this.
   - Q: How does a product change invalidate cached LLM verdicts without a purge job? A: `cohort_verdicts` is keyed by `(cohort_key, product_content_hash)`. When Workflow A sees new criteria text, the product gets a new hash, so lookups for it miss and the old rows are simply never read again.
+
+### T09 — Migrations + seed (2026-10-20)
+- Files: `db/migrate.py` (new), `db/__init__.py` (new), `db/seed_products.sql` (new), `db/schema.sql` (own `BEGIN`/`COMMIT` removed, header updated), `tests/unit/test_migrate.py` (new), `tests/integration/__init__.py` + `tests/integration/test_migrate_db.py` (new), `pyproject.toml` (`pg8000` dependency; `db` added to mypy; pg8000 untyped-import override), `uv.lock`, `.env.example` (`DB_SSLROOTCERT`)
+- Choices:
+  - Ledger table `schema_migrations(version, checksum, applied_at)`. Migrations are an explicit, append-only tuple in `migrate.py`, not a glob, so order is visible in code review.
+  - One transaction per run, under `pg_advisory_xact_lock`: every pending file and its ledger row commit together or not at all, and two concurrent runners apply in turn. Because of this, `schema.sql` no longer carries its own `BEGIN`/`COMMIT` (an inner COMMIT would end the transaction before the ledger row). To apply it by hand, use `psql -1`.
+  - Drift guard: the SHA-256 of each applied file is stored. An edited applied file, or a database with versions the code doesn't know, is refused with no changes.
+  - Seed: 5 products, labeled three ways (`source='seed'`, `is_seed=true`, "Seed ·" name prefix, plus "SEED DATA." at the start of the criteria text). Thresholds sit inside the sample's ranges. One product has an uncaptured free-text criterion (business vintage) for Stage 2's borderline path. One `INSERT … ON CONFLICT DO UPDATE … WHERE p.is_seed AND (…) IS DISTINCT FROM (…)`, so a re-run changes 0 rows and can never rewrite a crawled product. `content_hash` is computed in SQL (SHA-256 hex, same format as Workflow A).
+  - Driver: pg8000 (same as the Lambdas). `DB_SSLROOTCERT` → `ssl.create_default_context(cafile=…)` (verifies chain and hostname). Without it the connection is plain, which RDS refuses (`rds.force_ssl`), so there is no silent unencrypted path. The TLS path runs for the first time in T13.
+  - Seed products are `active = true`, so matching works before any crawl. Whether to deactivate them once real products exist is decided in T31.
+- Evidence (throwaway `postgres:16` container, `PostgreSQL 16.15`, removed afterwards):
+  - Run 1, `uv run python -m db.migrate --seed` → `{"stage": "migration_applied", "version": "0001_schema", "duration_ms": 29}`, `{"stage": "migrations_done", "applied": ["0001_schema"], "count": 1}`, `{"stage": "seed_done", "count": 5}`, exit 0
+  - Run 2, same command → `{"stage": "migrations_done", "applied": [], "count": 0}`, `{"stage": "seed_done", "count": 0}`, exit 0
+  - `SELECT … FROM loan_products` → 5 rows, all `source = seed`, `is_seed = t`, names `Seed · Salaried Personal Loan`, `Seed · Self-Employed Personal Loan`, `Seed · Premium Personal Loan`, `Seed · Starter Personal Loan`, `Seed · Business Loan Lite`
+  - `schema_migrations` → `0001_schema | c1883e8530f1… | 2026-10-20 18:29:47+00`
+  - `psql -v ON_ERROR_STOP=1 < tests/sql/schema_constraints.sql` on the migrated DB → exit 0, all T08 checks `ok` (regression check after removing `BEGIN`/`COMMIT`)
+  - Missing env → `{"stage": "failed", "error": "missing environment variables: DB_HOST, …"}`, exit 1
+  - `TEST_DB_HOST=127.0.0.1 … pytest tests -q` → `20 passed` (incl. 5 integration: re-run no-op, seed flagged and hashed, seed never rewrites a non-seed row, edited migration refused, failed migration rolls back everything)
+- Quality gates (`make check`, no DB configured, so the 5 integration tests skip): `All checks passed!`, `24 files already formatted`, `Success: no issues found in 14 source files`, `15 passed, 5 skipped`, coverage floor reached (`lambdas/shared` still empty; floor bites in T14)
+- Secrets scan: only variable names (`DB_PASSWORD`, `password=`) and the `TEST_DB_PASSWORD=...` usage example.
+- Rubric: Backend & Code Quality (idempotent checksummed migrations, atomic apply, drift refusal, DB-backed tests), Docs/honesty (seed data labeled in four places).
+- Explain it back:
+  - Built: a migration runner that applies each schema file exactly once and records it with a checksum, plus 5 clearly labeled seed products, so every later environment (local, RDS in T13) is built by one command that is safe to repeat.
+  - Why this approach over the obvious alternative (run `psql -f schema.sql` once, or use Alembic): a bare psql run fails or half-applies the second time, and nothing records what was applied. Alembic adds SQLAlchemy and a models layer the project doesn't use. ~150 lines of runner with a ledger, a lock and a checksum give the same guarantees for plain SQL files.
+  - Q: What happens if someone edits `schema.sql` after it was applied to RDS? A: The stored SHA-256 no longer matches, so `migrate.py` refuses and changes nothing. Schema changes must be a new migration file (e.g. T25's `n8n_errors`), which keeps RDS and the repo provably in sync.
+  - Q: Why did `schema.sql` lose its `BEGIN`/`COMMIT`? A: The runner applies a file and inserts its ledger row in one transaction. An inner `COMMIT` would commit the schema before the ledger row, so a crash between them would leave tables with no record and the next run would fail on `CREATE TABLE`. The integration test shows a failing migration rolls back all of it.
+  - Q: Could the seed overwrite a real crawled product or cause fake matches to look real? A: No. The upsert's `WHERE p.is_seed` means it only rewrites seed rows (tested), and every seed row is marked `source='seed'`, `is_seed=true`, "Seed ·" in its name and "SEED DATA." in its criteria, so any email, UI or query can show or filter it.

@@ -50,7 +50,7 @@ Correct ingestion, clean, modular, commented code.
 | ✅ | Modular layout: one package per Lambda plus a pure `shared/` package | `lambdas/` | T05 |
 | ✅ | One-command quality gates: ruff lint (incl. no `print`, no bare/blind `except`, module docstrings) + format, mypy strict on all code, pytest with an 80% branch-coverage floor on `lambdas/shared`; a negative probe shows each gate failing | `pyproject.toml`, `Makefile`, `uv.lock`; `PROGRESS.md` T06 | T06 |
 | ✅ | Schema: 10 tables, CHECK constraints derived from the sample (score, age, income, canonical employment, normalised email, product min ≤ max), `chunk_loads` idempotency ledger, `updated_at` trigger; 21 self-asserting constraint checks pass and all 10,000 sample rows pass the CHECKs | `db/schema.sql`, `tests/sql/schema_constraints.sql`; `PROGRESS.md` T08 | T08 |
-| ⬜ | Migrations (idempotent), seed data flagged `is_seed` | `db/` | T09 |
+| ✅ | Migration runner: checksummed `schema_migrations` ledger, all pending files + ledger rows in one transaction under an advisory lock, edited-after-apply files refused; second run applies 0 migrations. Seed: 5 products labeled `source='seed'` / `is_seed` / "Seed ·" / "SEED DATA.", upsert that changes 0 rows on re-run and never rewrites a non-seed row; 5 integration tests against PostgreSQL 16 | `db/migrate.py`, `db/seed_products.sql`, `tests/unit/test_migrate.py`, `tests/integration/test_migrate_db.py`; `PROGRESS.md` T09 | T09 |
 | ⬜ | Validation with reject report; COPY bulk load; idempotent upsert | `lambdas/shared/`, `lambdas/load_chunk/` | T16–T18 |
 | ⬜ | Tests with coverage ≥ 80% on shared + validation | `tests/` | T44 |
 

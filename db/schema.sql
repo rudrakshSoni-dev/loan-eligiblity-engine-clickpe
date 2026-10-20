@@ -1,7 +1,10 @@
 -- Loan Eligibility Engine — database schema (PostgreSQL 16).
 --
--- Applied once inside a single transaction: either every object is created or
--- none is. Re-run safety (a migrations ledger) lives in db/migrate.py, not here.
+-- Migration 0001. Applied by db/migrate.py, which wraps this file and its
+-- schema_migrations ledger row in one transaction: either every object is
+-- created and recorded, or nothing is. The file has no BEGIN/COMMIT of its own,
+-- because an inner COMMIT would end that transaction before the ledger row is
+-- written. To apply it by hand, use `psql -1` (single transaction).
 --
 -- Conventions
 --   * Status columns are text + CHECK, not ENUM: adding a value is a one-line
@@ -11,8 +14,6 @@
 --     so valid future uploads are not rejected; exact rules live in validation code.
 --   * A NULL product criterion means "unconstrained" (Stage 1 relies on this).
 --   * updated_at is maintained by one trigger, so no write path can forget it.
-
-BEGIN;
 
 CREATE FUNCTION set_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -209,5 +210,3 @@ CREATE INDEX matches_batch_id_idx      ON matches (batch_id);                   
 CREATE INDEX loan_products_active_idx  ON loan_products (active);
 CREATE INDEX pipeline_runs_batch_id_idx ON pipeline_runs (batch_id);
 CREATE INDEX llm_calls_batch_id_idx    ON llm_calls (batch_id);
-
-COMMIT;
