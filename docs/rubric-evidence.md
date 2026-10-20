@@ -40,6 +40,7 @@ Serverless quality, secure n8n ↔ AWS integration, scalable ingestion.
 | ⬜ | Presigned POST handler, splitter, loader, deploy + smoke test | `lambdas/`, `scripts/smoke_test.sh` | T15, T17–T22 |
 | ✅ | Private RDS: `db.t4g.micro` PG 16.9, not publicly accessible, encrypted gp3, single-AZ, deletion protection, SG with no CIDR ingress; public DNS resolves only to a private IP and a laptop gets `No route to host`; endpoint in SSM. From EC2: `verify-full` connection on TLSv1.3, `sslmode=disable` rejected by `pg_hba` ("no encryption"), `rds.force_ssl = 1` in `default.postgres16`, `max_connections` = 79 | `infra/rds.md`; `PROGRESS.md` T11 | T11 |
 | ✅ | No-NAT VPC design: n8n on `t4g.small` in the default VPC's public subnet (outbound via the free Internet Gateway), SG with zero inbound rules, access only through SSM Session Manager, IMDSv2 required, encrypted gp3, instance role limited to `AmazonSSMManagedInstanceCore`; RDS 5432 open to the n8n SG by reference only | `infra/ec2/setup.sh`, `infra/ec2.md`; `PROGRESS.md` T12 | T12 |
+| ✅ | Schema and seed applied to the private RDS instance from inside the VPC over verified TLS: 11 tables, re-run applies 0 migrations and 0 seed rows, 5 seed products flagged `is_seed` | `infra/ec2/migrate.sh`; `PROGRESS.md` T13 | T13 |
 | ⬜ | Webhook secret on Lambda → n8n calls | `lambdas/`, `n8n/workflows/` | T19, T32 |
 
 ## Backend & Code Quality (30 pts)

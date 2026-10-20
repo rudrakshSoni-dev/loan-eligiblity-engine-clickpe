@@ -14,7 +14,7 @@
 | T10 | P0 | serverless.yml base ⚖️ | DONE | 2026-10-21 | Serverless v3; `sls package` + `validate-template` + `cfn-lint` clean; no `*` action on `*` resource; config moved to repo root. Opus review fixed a pg8000 import crash (`slim`) and silent `splitCsv` failures |
 | T11 | P0 | RDS | DONE | 2026-10-21 | Private PG 16.9; from EC2: verify-full TLSv1.3 OK, sslmode=disable rejected, rds.force_ssl=1, max_connections=79 |
 | T12 | P0 | EC2 for n8n | DONE | 2026-10-21 | `t4g.small` `i-02ffa9d08e8403a4a`, SG with no inbound rules, SSM session works, Docker 25.0.14 + Compose v2.29.7, 2 GB swap |
-| T13 | P0 | Migrate RDS | TODO | |  |
+| T13 | P0 | Migrate RDS | DONE | 2026-10-21 | 11 tables on RDS via EC2; re-run applies 0 migrations, seeds 0; 5 seed products flagged |
 | T14 | P0 | Shared modules | TODO | |  |
 | T15 | P0 | get-upload-url | TODO | |  |
 | T16 | P0 | Validation module ⚖️ | TODO | |  |
@@ -349,3 +349,22 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: How do you know unencrypted database access is blocked? A: A `sslmode=disable` connection from the instance is rejected by `pg_hba` with "no encryption", and the RDS parameter `rds.force_ssl` is 1.
   - Q: Why hop limit 2 on the instance metadata service? A: n8n will run in a Docker container, which adds a network hop. With the default limit of 1 the container cannot reach the instance role for the SES credentials in T24. IMDSv2 stays required, so the token requirement still blocks simple SSRF-style access.
   - Q: The instance has a public IP, so is it exposed? A: The IP is only for outbound traffic. The security group has no inbound rules, so nothing can connect to it. Using a private subnet instead would need a NAT Gateway, which costs about $32 a month and is excluded by the cost rules.
+
+### T13 — Migrate RDS (2026-10-21)
+- Files: `infra/ec2/migrate.sh` (new), `docs/rubric-evidence.md`, `PROGRESS.md`
+- Method: `db/` and `migrate.sh` were shipped to `/opt/clickpe/migrate` on the EC2 host with SSM Run Command (schema SHA-256 matched the local file). `migrate.sh` builds a `python:3.12-slim` image with `pg8000==1.31.5` and runs `python -m db.migrate --seed` with the RDS CA bundle mounted, so the certificate is verified. The password was typed with `read -rs` in an SSM session and never written to a file or command parameter.
+- Evidence (from the SSM session):
+  - First run: `{"stage": "migration_applied", "version": "0001_schema", "duration_ms": 99}`, `{"stage": "seed_done", "count": 5}`
+  - Second run: `{"stage": "migrations_done", "applied": [], "count": 0}`, `{"stage": "seed_done", "count": 0}`
+  - `\dt` → `chunk_loads, cohort_verdicts, crawl_runs, llm_calls, loan_products, matches, pipeline_runs, rejected_rows, schema_migrations, upload_batches, users` (11 rows)
+  - `SELECT count(*), bool_and(is_seed) FROM loan_products;` → `5 | t`
+- Mistakes fixed along the way: (1) the first attempt pasted the `read` line and the following lines together, so `read` consumed the `export DB_HOST…` line as the password and no variables were set; nothing reached the database. (2) `sudo docker run -e VAR` lost the variables because `sudo` resets the environment; the script now uses `sudo -E`.
+- Open finding for T14/T22: `serverless.yml` sets `dbName: loans` and `dbUser: loans_app`, but RDS has database `clickpe`, user `clickpe`, and no `loans_app` role. Must be aligned before the Lambdas connect (preferably a least-privilege `loans_app` role).
+- Quality gates: no Python touched (shell script only). Secrets scan: only variable names in `migrate.sh`.
+- Rubric: Backend (idempotent, checksummed migrations applied to the real database), Cloud (migration run from inside the VPC over verified TLS).
+- Explain it back:
+  - Built: the schema and seed applied to the private RDS instance from the EC2 host, with a repeatable script.
+  - Why this over the obvious alternative (open RDS publicly or tunnel from the laptop): RDS stays private, and the EC2 host is already inside the VPC. A container avoids installing Python packages on the host.
+  - Q: How do you know the migration is idempotent? A: The second run reported `applied: []` and `seed_done count 0`; the ledger stores a SHA-256 per file and refuses edited files.
+  - Q: Why not pass the password to Run Command? A: SSM keeps command history, so the value would be stored; the interactive prompt keeps it in shell memory only.
+  - Q: Why `sudo -E`? A: `sudo` resets the environment, so `docker run -e DB_HOST` would pass nothing; `-E` keeps the exported variables.
