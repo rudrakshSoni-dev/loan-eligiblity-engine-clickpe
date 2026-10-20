@@ -4,10 +4,10 @@ import ssl
 from typing import Any
 
 import pytest
-from pg8000.exceptions import InterfaceError
+from pg8000.exceptions import DatabaseError, InterfaceError
 
 from lambdas.shared.config import RDS_CA_BUNDLE, DbConfig
-from lambdas.shared.db import Database, is_alive, tls_context, transaction
+from lambdas.shared.db import Database, is_alive, server_error, tls_context, transaction
 
 CONFIG = DbConfig("h", 5432, "d", "u", "p", ca_bundle=None)
 
@@ -99,3 +99,12 @@ def test_tls_context_verifies_chain_and_hostname_with_the_rds_bundle() -> None:
     assert context.check_hostname
     assert len(context.get_ca_certs()) > 100
     assert tls_context(None) is None
+
+
+def test_server_error_reads_sqlstate_and_message() -> None:
+    error = DatabaseError({"S": "ERROR", "C": "23514", "M": "violates check constraint"})
+    assert server_error(error) == ("23514", "violates check constraint")
+
+
+def test_server_error_without_details_is_empty() -> None:
+    assert server_error(DatabaseError("plain text")) == ("", "")

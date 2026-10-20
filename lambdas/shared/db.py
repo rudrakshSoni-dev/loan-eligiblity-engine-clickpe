@@ -47,6 +47,12 @@ def open_connection(config: DbConfig) -> Connection:
     )
 
 
+def server_error(error: DatabaseError) -> tuple[str, str]:
+    """Return (SQLSTATE, message) from a pg8000 server error; empty strings if it carries none."""
+    details = error.args[0] if error.args and isinstance(error.args[0], dict) else {}
+    return str(details.get("C", "")), str(details.get("M", ""))
+
+
 def is_alive(conn: Connection) -> bool:
     try:
         conn.run("SELECT 1")

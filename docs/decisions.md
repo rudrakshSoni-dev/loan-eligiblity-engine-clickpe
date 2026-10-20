@@ -33,6 +33,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 19. [Crawl targets](#crawl-targets)
 20. [Infrastructure as code: Serverless Framework v3](#infrastructure-as-code-serverless-framework-v3)
 21. [Row validation: strict on meaning, lenient on format](#row-validation-strict-on-meaning-lenient-on-format)
+22. [Chunk loader: outcomes, limits and sizing](#chunk-loader-outcomes-limits-and-sizing)
 
 ---
 
@@ -160,10 +161,18 @@ implemented".
 
 **Choice.** `split-csv` streams the file once with a quote-aware CSV scan and records the exact byte
 offsets of record boundaries. Each message carries
-`{batch_id, s3_key, chunk_no, total_chunks, start_byte, end_byte, first_line_no, row_count, columns}`,
+`{batch_id, s3_key, etag, chunk_no, total_chunks, start_byte, end_byte, first_line_no, row_count, columns}`,
 where `columns` is the header in file order (a byte-range chunk has no header row; added in T16).
-`load-chunk` issues `Range: bytes=start-end` and receives whole records, so line numbers in the reject
-report are exact.
+`start_byte` is inclusive and `end_byte` exclusive, like a Python slice; `load-chunk` issues
+`Range: bytes=start-(end-1)` and receives whole records, so line numbers in the reject report are exact.
+The contract is code, not prose: `lambdas/shared/chunks.py` encodes and parses it for both Lambdas.
+
+**`etag` (added in T18).** The ETag from the S3 event is sent as `IfMatch` on every ranged read. A
+presigned POST stays valid for 5 minutes, so the same key can be uploaded twice; without the check,
+chunks split from the first file could read byte ranges of the second. **Measured on real S3
+(T18):** a wrong ETag → `PreconditionFailed`, quoted and unquoted ETags are both accepted, a range
+past the end → `InvalidRange`, and the two ranged reads of the sample reassemble the 993,191-byte file
+exactly.
 
 **Rejected.** "Guess a range, then realign to the next newline." It breaks on quoted fields that
 contain newlines, which CSV allows
@@ -240,8 +249,20 @@ for 1 GiB that is at most ~112 before OS reservations. The real value is recorde
 
 **Choice.** `pg8000` with a verifying TLS context, and per chunk:
 TEMP staging → `COPY FROM STDIN` →
-`INSERT INTO users SELECT DISTINCT ON (user_id) … ORDER BY user_id, line_no DESC
-ON CONFLICT (user_id) DO UPDATE SET … WHERE users.* IS DISTINCT FROM EXCLUDED.*`.
+`INSERT INTO users SELECT DISTINCT ON (user_id) … ORDER BY user_id, seq
+ON CONFLICT (user_id) DO UPDATE SET … WHERE (<data columns>) IS DISTINCT FROM (<EXCLUDED data columns>)
+RETURNING (xmax = 0)`.
+
+**Corrected in T18.** The original text compared `users.* IS DISTINCT FROM EXCLUDED.*`. That row
+includes `batch_id`, `created_at` and `updated_at`, which always differ for a new batch, so every row
+would be rewritten on an identical re-upload. The comparison now covers the six data columns only.
+**Measured:** with the guard removed (a mutation probe), the identical re-upload moved all 10,000
+users to the new batch and the test failed with `assert 0 == 10000`; with it, the re-upload reports
+`inserted 0, updated 0, unchanged 5000` per chunk. `seq` (file order) replaces `line_no DESC`, so the
+upsert keeps the same row as validation (the first occurrence), and `ORDER BY user_id` makes
+concurrent chunks take row locks in the same order, which should prevent deadlocks between chunks
+that share ids (estimate, not load-tested; see Chunk loader). `RETURNING (xmax = 0)` is the common PostgreSQL idiom for telling inserted from updated rows; it
+feeds the per-chunk log counts only.
 
 **Why pg8000 (cited + measured).** It is pure Python and supports
 `con.run("COPY … FROM STDIN WITH (FORMAT CSV)", stream=…)` ([pg8000](https://pypi.org/project/pg8000/)).
@@ -667,3 +688,60 @@ and the 10,000 validated rows insert into PostgreSQL 16 under the real CHECK con
 statement. Boundary rows (score 300/900, age 18/100, income 0.01 and 9,999,999,999.99, 254-character
 email, 200-character name) insert the same way. With email lowercasing removed (a mutation probe),
 that test fails with `users_email_check`. Commands in `PROGRESS.md` T16.
+
+## Chunk loader: outcomes, limits and sizing
+
+**Choice (T18).** `load-chunk` handles each SQS message in four steps: `start_loading` (autocommit) →
+ranged S3 read + validation → one transaction (claim the chunk in the ledger, COPY into staging,
+upsert, store rejects, add the counts) → `try_complete` after the commit. The S3 read and validation
+run before the transaction, so the transaction holds locks only for database work; a redelivered
+chunk costs one wasted ranged GET, which is rare.
+
+**Every message ends in exactly one of three outcomes:**
+
+| Outcome | When | What happens |
+|---|---|---|
+| Acknowledged | chunk loaded; duplicate delivery; batch already failed or finished | nothing more |
+| Acknowledged, batch `failed` | split control message; object replaced (`PreconditionFailed`), range invalid or short read; columns missing; chunk count differs from the stored one; the database refuses the data (SQLSTATE class 22 or 23) | `upload_batches.error` names the chunk and the reason; later chunks of that batch are skipped without reading S3 |
+| Retried (`batchItemFailures`) | connection, network, timeout, deadlock or other database errors; S3 throttling or unreachable; an unparseable message | SQS redelivers that message only; after 5 receives it moves to `ingest-dlq` (T21 turns that into a failed batch) |
+
+Rejected: retrying every error. A chunk whose bytes or data can never load would use all 5 receives
+(up to an hour with the 720 s visibility timeout) before the user sees a failure. Rejected: failing
+the batch on every error. One network blip would kill a 40-chunk upload that a retry would finish.
+
+**Missing object (measured + cited).** With `s3:ListBucket`, a missing key returns `NoSuchKey`
+(measured with the admin user). The `load-chunk` role has only `s3:GetObject` on `uploads/*`, and
+without `ListBucket` S3 answers a missing key with `403 AccessDenied`
+([GetObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)). That
+case is therefore retried and ends in the DLQ instead of failing at once. The only cause in this
+design is the 7-day lifecycle rule, so it is accepted rather than solved by granting `ListBucket`.
+
+**Reject report.** Every reject is counted in `chunk_loads` and `upload_batches.rows_rejected`; the
+first 100 per chunk are stored in `rejected_rows` with the file line number, the reason and the raw
+text (≤ 1,000 characters). A per-chunk cap is deterministic under parallel chunks; a per-batch "first
+N" would need a lock or a count that concurrent chunks can race on. A 20 MB upload is about 40 chunks,
+so at most ~4,000 stored rows (estimate). NUL and bytes that are not UTF-8 are replaced with U+FFFD
+before storing, because a Postgres `text` column cannot hold them.
+
+**Invalid UTF-8.** Bytes are decoded with `surrogateescape`, and any record containing an undecodable
+byte becomes a `not valid UTF-8` reject. Rejected: strict decoding, which fails the whole chunk on one
+byte, and `errors="replace"`, which would silently store a corrupted name.
+
+**`row_count` mismatch** between the message and the records read is logged as a warning, not a
+failure: split-csv and Python's `csv` module may count an unparseable record differently, and the
+ledger counts what was actually loaded or rejected.
+
+**Sizing (measured + estimate).** A 5,000-row chunk of the sample is ~0.5 MB (measured: 496,503 and
+496,618 bytes). The local run (PostgreSQL 16 in Docker on the dev machine) took 283–286 ms per chunk
+for the first load and 144–146 ms for the unchanged re-upload. That is not Lambda-on-RDS throughput;
+T22/T37 measure that. The 120 s timeout leaves a large margin for a cold start, the TLS handshake and
+a slower `db.t4g.micro`, and keeps the visibility timeout (6×) at 12 minutes. 512 MB because Lambda
+allocates CPU in proportion to memory
+([memory and CPU](https://docs.aws.amazon.com/lambda/latest/dg/configuration-memory.html)), and
+validation is CPU-bound Python; a chunk's bytes, text and parsed rows use a few MB (estimate).
+
+**Concurrent chunks with the same `user_id` (estimate, not load-tested).** The upsert takes row locks
+in `user_id` order, so two chunks that share ids wait for each other instead of deadlocking. If a
+deadlock happened anyway, its SQLSTATE `40P01` is in the retried class.
+
+**Not in T18.** The POST to n8n when `try_complete` wins is T19; T18 logs `batch_processed` at that point.
