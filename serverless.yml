@@ -19,8 +19,8 @@ custom:
   loadChunkTimeout: 120
   loadChunkConcurrency: 3
   maxUploadBytes: "20971520"
-  dbName: loans
-  dbUser: loans_app
+  dbName: clickpe
+  dbUser: clickpe
   logGroupPrefix: arn:aws:logs:${aws:region}:${self:custom.accountId}:log-group:/aws/lambda/${self:service}-${sls:stage}
   pythonRequirements:
     fileName: infra/requirements-lambda.txt

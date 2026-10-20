@@ -786,3 +786,32 @@ in `user_id` order, so two chunks that share ids wait for each other instead of 
 deadlock happened anyway, its SQLSTATE `40P01` is in the retried class.
 
 **Not in T18.** The POST to n8n when `try_complete` wins is T19; T18 logs `batch_processed` at that point.
+
+## First deployment (T22): measured results and one shortcut
+
+**Deployed and verified (measured, `clickpe-loan-engine-dev`, `ap-southeast-2`).** `sls deploy` took 280 s.
+The smoke test (`scripts/smoke_test.sh`) calls the `getUploadUrl` Function URL, posts the CSV to S3 with
+the returned presigned fields (HTTP 204), then polls `batchStatus` until the batch is `processed`:
+
+| Upload | Chunks | Result | `splitCsv` | `loadChunk` per chunk |
+|---|---|---|---|---|
+| `good_users.csv` (5 rows) | 1 | `processed`, 5 ok | 175 ms | 98 ms |
+| `data/users.csv` (10,000 rows, 993,191 B) | 2 | `processed`, 10,000 ok, 0 rejected | 217 ms | 288 ms and 250 ms |
+| same file again | 2 | 0 inserted, 0 updated, 10,000 unchanged | | 146 ms and 177 ms |
+| `malformed_users.csv` (11 rows) | 1 | `processed`, 1 ok, 10 rejected with line numbers | 107 ms | 80 ms |
+
+From batch creation (`created_at`) to `processed` (`updated_at`) took 5.7 s (5 rows, includes cold starts), 6.9 s (10,000 rows) and 2.3 s (malformed fixture). Peak memory: `loadChunk` 112 MB of 512 MB, `splitCsv`
+110 MB of 512 MB, `getUploadUrl` 103 MB of 256 MB, `batchStatus` 66 MB of 256 MB. `loadChunk` init was 306 ms
+on a cold start. After all uploads `ingest`, `ingest-dlq` and `split-failures` each held 0 messages. This
+confirms from inside the VPC the paths that were only simulated before: S3 ranged reads through the Gateway
+Endpoint, TLS-verified connections to the private RDS instance, and the SQS event source mapping.
+
+**Shortcut: the Lambdas connect as the RDS master user `clickpe`.** `serverless.yml` first named a
+least-privilege `loans_app` role that was never created on RDS. For the demo the config now matches the
+instance (`dbName` and `dbUser` both `clickpe`). The connection is still private, TLS-verified and limited by
+security group to the Lambda SG, but the role can do more than the loader needs. The upgrade is a role with
+`INSERT`/`UPDATE`/`SELECT` on the ingest tables only, tracked for the T45 security review.
+
+**RDS ingress.** The Lambda security group is created by the stack, so the RDS group rule is added after the
+first deploy, by SG reference only:
+`aws ec2 authorize-security-group-ingress --group-id sg-0f0ca5e2b7cb5e1c3 --ip-permissions "IpProtocol=tcp,FromPort=5432,ToPort=5432,UserIdGroupPairs=[{GroupId=<LambdaSecurityGroupId output>}]"`.

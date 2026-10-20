@@ -23,7 +23,7 @@
 | T19 | P0 | Completion → n8n trigger | TODO | |  |
 | T20 | P0 | batch-status Lambda | DONE | 2026-10-21 | GET ?batch_id= → counters, first 5 rejects, match/notified counts, latest funnel (NULL = not measured); 400/404/405/503; 5 DB tests on PG16; shared coverage 100% |
 | T21 | P1 | DLQ handling + alarm | TODO | |  |
-| T22 | P0 | Deploy + smoke test | TODO | |  |
+| T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
 | T23 | P0 | docker-compose | TODO | |  |
 | T24 | P0 | n8n credentials | TODO | |  |
 | T25 | P1 | Workflow E — global error handler | TODO | |  |
@@ -542,3 +542,29 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: How do you know no record is ever cut in half? A: Cuts are only placed where `csv.reader` has just returned a record, and load-chunk restarts the same reader at that point. The tests check it as a property: on every fixture and a random file with quoted newlines, the chunks reassemble the file byte for byte, and validating chunk by chunk gives the same rows and the same rejected line numbers as validating the file as one chunk.
   - Q: The user uploads a file with only a header. What happens? A: Zero chunks would leave the batch `pending` forever, because load-chunk only learns `total_chunks` from a chunk message. So split-csv sends one control message, `file has no data rows`, and load-chunk marks the batch `failed` with that reason.
   - Q: S3 delivers the same event twice. Do users get loaded twice? A: No. Planning is deterministic, so the second split sends identical `(batch_id, chunk_no)` messages. The `chunk_loads` ledger rejects the duplicates inside each chunk's transaction, and the upsert is idempotent anyway. A test checks that a duplicate event produces identical chunks, and the DB test delivers duplicates and gets exactly 4 ledger rows.
+
+### T22 — Deploy + smoke test (2026-10-21)
+- Why before T19: T19 depends on T22, and T22's dependencies (T15, T17, T18, T20) were DONE.
+- Files: `scripts/smoke_test.sh` (new), `serverless.yml` (`dbName`/`dbUser` → `clickpe`, closing the open finding from T13), `docs/decisions.md` → "First deployment (T22)".
+- Built: `sls deploy` of stack `clickpe-loan-engine-dev` to `ap-southeast-2`, then RDS ingress 5432 from the stack's Lambda SG (`sg-0ad4c9a31f3b8f7cc`) by SG reference, no CIDR. The smoke script finds the Function URLs with `aws lambda get-function-url-config`, calls `getUploadUrl`, posts the CSV with `--form-string` fields to S3, polls `batchStatus` every 3 s, and fails unless the batch reaches `processed` and `rows_ok + rows_rejected` equals the CSV data lines (`failed`, a bad S3 status or a 180 s timeout also fail).
+- Evidence:
+  - `npx serverless deploy` → `✔ Service deployed to stack clickpe-loan-engine-dev (280s)`; endpoints `getUploadUrl` and `batchStatus` on `*.lambda-url.ap-southeast-2.on.aws`; 4 functions, 952 kB each.
+  - `aws ec2 authorize-security-group-ingress` → rule `sgr-079badaa4b84f2eae`; `describe-security-groups` on `sg-0f0ca5e2b7cb5e1c3` → 5432 from two SGs (n8n SG and Lambda SG), `IpRanges []`.
+  - `scripts/smoke_test.sh` (default fixture) → `uploaded tests/fixtures/good_users.csv: HTTP 204`, `status=pending` then `status=processed chunks=1/1`, `rows_ok 5`, `PASS`.
+  - `scripts/smoke_test.sh data/users.csv` → `HTTP 204`, `status=loading chunks=0/2`, `status=processed chunks=2/2`, `rows_ok 10000, rows_rejected 0`, `PASS`.
+  - Same file again → `PASS`; CloudWatch `chunk_loaded` for the new batch: `"inserted": 0, "updated": 0, "unchanged": 5000` for both chunks (146 ms, 177 ms).
+  - `scripts/smoke_test.sh tests/fixtures/malformed_users.csv` → `rows_ok 1, rows_rejected 10`, first rejects with line numbers (`2: age: missing`, `3: user_id: 'not-a-uuid' is not a UUID`, `4: email: ...`), `PASS` with 11 rows accounted for.
+  - CloudWatch REPORT lines: `loadChunk` 189 ms, 112 MB of 512 MB, init 306 ms (cold); `splitCsv` 108 ms, 110 MB of 512 MB; `getUploadUrl` 5.6 ms, 103 MB of 256 MB; `batchStatus` 15.8 ms, 66 MB of 256 MB. Structured logs: `upload_split` 217 ms for the 993,191 B sample (2 chunks); `chunk_loaded` 288 ms and 250 ms for 5,000 rows each.
+  - `ingest`, `ingest-dlq`, `split-failures` → `ApproximateNumberOfMessages` 0 and `NotVisible` 0 after all uploads.
+  - `make check` → `All checks passed!`, `61 files already formatted`, `Success: no issues found in 49 source files`, `266 passed, 38 skipped`, `Required test coverage of 80.0% reached. Total coverage: 99.79%`. `make package` → `✔ Service packaged`, `package_imports_ok`, `count: 15`.
+  - Secrets scan on touched files → only `${ssm:/…}` references and variable names. No comments in the new script (a shebang is not a comment).
+- Side effects to know about: RDS now holds the 10,000 sample users (labeled by `batch_id`; the real CSV was going to be loaded in T42 anyway, and re-loading is a no-op) and 5 fixture users with ids `00000000-0000-4000-8000-00000000000x` and `@example.invalid` emails. Four batches were created in total (fixture, sample, identical re-upload, malformed), the last one with 10 stored rejects. No test data was deleted (no destructive commands).
+- Not verified: the browser/CORS path (T40); the webhook POST to n8n (T19, `webhook_url` is still the SSM placeholder); the DLQ route with a poisoned chunk (T21); the Lambdas under 100k-row load (T37).
+- Shortcut recorded: the Lambdas connect as RDS master user `clickpe`; a least-privilege role is tracked for T45.
+- Rubric: Cloud (deployed S3 → split → SQS → VPC loader → private RDS verified end to end, measured durations), Backend (smoke script, idempotent re-upload measured on the real deployment).
+- Explain it back:
+  - Built: the first live deployment of the ingestion path, and a script that proves it works from the outside: it uses only the public Function URLs and the presigned form, the same way the browser will.
+  - Why this approach over the obvious alternative (invoke the Lambdas directly with `aws lambda invoke`): direct invokes skip the Function URL permissions, the presigned policy, the S3 event and the SQS event source mapping, which are exactly what can be misconfigured. The smoke test crosses all of them.
+  - Q: Why open the RDS security group after the deploy, in a separate command? A: The Lambda security group is created by the stack, and the RDS group was created before it in T11, so neither can reference the other at creation time. The rule references the Lambda SG by ID, not a CIDR, so only these functions can reach 5432. Folding the rule into the stack is possible but would make the stack edit a group it does not own.
+  - Q: The Lambdas use the RDS master user. Is that acceptable? A: It is a documented shortcut, not a hidden one. The connection is private, TLS-verified and limited to the Lambda SG, but a compromised function could alter any table. The fix is a role with only the privileges the loader needs; it is listed for T45.
+  - Q: How do you know exactly-once completion held on the real system? A: Each batch shows `chunks_done` equal to `total_chunks` and `processed`, queues drained with an empty DLQ, and the re-upload logged `unchanged` for every row. The concurrent-finisher guarantee itself was tested against PostgreSQL in T14 (25 × 2 trials); the real deployment ran at most 2 chunks at once, so it does not stress it further. T37 does.
