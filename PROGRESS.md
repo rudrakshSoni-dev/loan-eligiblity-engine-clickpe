@@ -9,7 +9,7 @@
 | T05 | P0 | Repo skeleton | DONE | 2026-10-20 | Layout per CLAUDE.md §3; task IDs renumbered to match CLAUDE.md §6 |
 | T06 | P0 | Quality tooling | DONE | 2026-10-20 | `make check` = ruff lint + format, mypy strict, pytest + 80% coverage floor on `lambdas/shared` |
 | T07 | P0 | Decisions doc ⚖️ | DONE | 2026-10-20 | Research-revised; approved by user. 13 plan changes (concurrency, ledger, presigned POST, SSM-only n8n, strict LLM schema, reason-keyed cohorts) |
-| T08 | P0 | Schema ⚖️ | TODO | |  |
+| T08 | P0 | Schema ⚖️ | DONE | 2026-10-20 | 10 tables, 21 self-asserting constraint checks; all 10,000 sample rows pass the CHECKs |
 | T09 | P0 | Migrations + seed | TODO | |  |
 | T10 | P0 | serverless.yml base ⚖️ | TODO | |  |
 | T11 | P0 | RDS | TODO | |  |
@@ -192,3 +192,32 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why not reserved concurrency to protect RDS? A: AWS lets you reserve only up to unreserved concurrency minus 100, and this account's limit is 10, so it cannot be set. The SQS event source mapping's `MaximumConcurrency: 3` caps pollers instead, which also avoids throttled messages drifting to the DLQ.
   - Q: How do you guarantee exactly one n8n trigger when chunks finish at the same time or SQS redelivers? A: Each chunk writes a ledger row keyed by (batch_id, chunk_no) in its own transaction, so a redelivery is a no-op. After commit, a conditional UPDATE moves the batch from `loading` to `processed` only when the ledger count equals total_chunks; Postgres row locking lets exactly one caller get a row back, and only that caller calls n8n.
   - Q: Why SQS instead of Step Functions, which gives a single finalize step for free? A: Both are correct; SQS already matches the task plan, needs no new plugin or ASL, and keeps every VPC Lambda free of AWS API calls. Step Functions is documented as the runner-up and would be chosen only with spare time after the SQS path passes the smoke test, mainly for its execution graph in the video.
+
+### T08 — Schema (2026-10-20)
+- Plan approved by the user ("go").
+- Files: `db/schema.sql` (new), `tests/sql/schema_constraints.sql` (new)
+- Choices:
+  - 10 tables per CLAUDE.md §6 T08, created in one `BEGIN … COMMIT` (all or nothing). Re-run safety is T09's migrations ledger, so no `IF NOT EXISTS`.
+  - Status columns are `text` + `CHECK`, not `ENUM`. Adding a value is a constraint swap, and a new ENUM value can't be used inside the transaction that adds it.
+  - Added `users.name` (in the CSV, needed by Workflow C; missing from the §6 column list).
+  - CHECKs looser than the observed data (score 300–900, age 18–100, income > 0) and `employment_status` limited to the 3 canonical values. `email` must already be lower-case and trimmed, so the DB enforces the T16 normalisation.
+  - `loan_products`: min ≤ max for rate, score and age; `allowed_employment` must be a non-empty subset of the 3 values; NULL = unconstrained. `content_hash` must be 64 hex characters.
+  - `pipeline_runs` counters stay NULL until their stage has run, so 0 always means a measured zero.
+  - One `set_updated_at()` trigger on `upload_batches`, `users`, `loan_products`.
+  - Indexes: the 4 from the spec plus `matches(batch_id)`, `pipeline_runs(batch_id)`, `llm_calls(batch_id)`.
+  - Deferred: `n8n_errors` (T25), `app_config` (decided in T23).
+  - Agreed behaviour: `users.batch_id` = the batch that last *changed* the row. An identical re-upload changes 0 rows, so Workflow B finds 0 new users and sends 0 emails (T43 idempotency).
+- Evidence (throwaway `postgres:16` container, `PostgreSQL 16.15`, removed afterwards):
+  - `psql -v ON_ERROR_STOP=1 < db/schema.sql` → applied; `\dt` → 10 tables (`chunk_loads, cohort_verdicts, crawl_runs, llm_calls, loan_products, matches, pipeline_runs, rejected_rows, upload_batches, users`); `\di` → 19 indexes (incl. PK/unique)
+  - `psql -v ON_ERROR_STOP=1 < tests/sql/schema_constraints.sql` → exit 0; 21 bad rows rejected with the expected SQLSTATE (e.g. `ok credit score above 900 (rejected, 23514)`, `ok duplicate chunk delivery (rejected, 23505)`, `ok user_id not a UUID (rejected, 22P02)`, `ok unknown batch (rejected, 23503)`), plus `ok redelivered chunk is a no-op`, `ok updated_at set by trigger`, `ok product with all-NULL criteria accepted`. The script rolls back, so T13 can rerun it on RDS.
+  - The first run failed on a typo in the test itself (`42701` duplicate column in the INSERT), which showed the harness rejects a wrong SQLSTATE. The test was fixed; the schema was not changed.
+  - Real sample through every CHECK: `\copy` of `data/users.csv` into staging → `INSERT INTO users … SELECT` (trim, lower-case email) → `users_loaded = 10000`, rolled back
+  - `make check` → `All checks passed!`, `19 files already formatted`, `Success: no issues found in 9 source files`, `5 passed`, coverage floor reached (no Python touched)
+  - Secrets scan on `db/`, `tests/sql/` → no matches
+- Rubric: Backend & Code Quality (schema with CHECK constraints, ledger tables, self-asserting constraint tests), n8n (Treasure Hunt tables: `pipeline_runs`, `cohort_verdicts`, `llm_calls`).
+- Explain it back:
+  - Built: the full Postgres schema. Ingestion bookkeeping (batches, chunk ledger, rejects), users, products, matches, and the tables that measure the matching funnel and the LLM cost. Plus a SQL test that proves each constraint rejects bad data.
+  - Why this approach over the obvious alternative (loose columns, all checks in Python): validation in code gives good reject reasons, but only the database sees every write path, including n8n's Postgres nodes. CHECKs make a bad row impossible, not just unlikely, and the real sample proves they reject no valid data.
+  - Q: Why isn't `email` unique? A: In the sample 7,368 rows share an email with another user (each address is used 2–5 times). Only `user_id` is unique, so it is the primary key and the upsert key.
+  - Q: How does the schema make SQS redelivery safe? A: `chunk_loads` has primary key `(batch_id, chunk_no)`. A redelivered chunk's `INSERT … ON CONFLICT DO NOTHING RETURNING` gets no row back, so the Lambda acknowledges and exits without loading anything twice. The test script shows this.
+  - Q: How does a product change invalidate cached LLM verdicts without a purge job? A: `cohort_verdicts` is keyed by `(cohort_key, product_content_hash)`. When Workflow A sees new criteria text, the product gets a new hash, so lookups for it miss and the old rows are simply never read again.

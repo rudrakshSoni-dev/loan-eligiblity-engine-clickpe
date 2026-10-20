@@ -18,6 +18,7 @@ Sophistication, robustness, efficiency, creative nodes, Optimization Treasure Hu
 | ✅ | Data shape analysis: 9,869 distinct (income, score, age, employment) tuples in 10,000 users, and 1,028–5,528 raw-band cohorts per product, so the design keys cohorts by borderline reason and caches verdicts instead | `docs/data-notes.md`, `docs/decisions.md` → "Matching and the Optimization Treasure Hunt" | T01, T07 |
 | ✅ | Treasure Hunt strategy: LLM at ingest gated by content hash, SQL + rules first, skip-LLM rule, reason-keyed cohorts, `cohort_verdicts` cache, budget guard; counterfactual 30,000 calls = 30 days of quota | `docs/decisions.md` | T07 |
 | ✅ | Crawl targets probed live (HTTP status, robots.txt, criteria present in static HTML) | `docs/decisions.md` → "Crawl targets" | T07 |
+| ✅ | Funnel and cost tables in the schema: `pipeline_runs` (per-stage counts, NULL until measured), `cohort_verdicts` (cache keyed by product content hash), `llm_calls` (per-call token ledger) | `db/schema.sql` | T08 |
 | ⬜ | Global error workflow (Workflow E) | `n8n/workflows/` | T25 |
 | ⬜ | Reusable LLM Gateway sub-workflow | `n8n/workflows/` | T26 |
 | ⬜ | Crawl + change detection + structuring (Workflow A) | `n8n/workflows/` | T27–T31 |
@@ -48,7 +49,8 @@ Correct ingestion, clean, modular, commented code.
 | ✅ | Column profile and validation rules derived from the real CSV | `docs/data-notes.md` | T01 |
 | ✅ | Modular layout: one package per Lambda plus a pure `shared/` package | `lambdas/` | T05 |
 | ✅ | One-command quality gates: ruff lint (incl. no `print`, no bare/blind `except`, module docstrings) + format, mypy strict on all code, pytest with an 80% branch-coverage floor on `lambdas/shared`; a negative probe shows each gate failing | `pyproject.toml`, `Makefile`, `uv.lock`; `PROGRESS.md` T06 | T06 |
-| ⬜ | Schema with CHECK constraints, migrations, seed data flagged `is_seed` | `db/` | T08–T09 |
+| ✅ | Schema: 10 tables, CHECK constraints derived from the sample (score, age, income, canonical employment, normalised email, product min ≤ max), `chunk_loads` idempotency ledger, `updated_at` trigger; 21 self-asserting constraint checks pass and all 10,000 sample rows pass the CHECKs | `db/schema.sql`, `tests/sql/schema_constraints.sql`; `PROGRESS.md` T08 | T08 |
+| ⬜ | Migrations (idempotent), seed data flagged `is_seed` | `db/` | T09 |
 | ⬜ | Validation with reject report; COPY bulk load; idempotent upsert | `lambdas/shared/`, `lambdas/load_chunk/` | T16–T18 |
 | ⬜ | Tests with coverage ≥ 80% on shared + validation | `tests/` | T44 |
 
