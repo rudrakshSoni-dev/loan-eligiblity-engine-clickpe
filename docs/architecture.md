@@ -47,6 +47,7 @@ flowchart TB
                 wfA["Workflow A<br/>Product discovery"]
                 wfB["Workflow B<br/>Matching"]
                 wfC["Workflow C<br/>Notification"]
+                wfE["Workflow E<br/>Error handler"]
             end
         end
     end
@@ -75,6 +76,11 @@ flowchart TB
     wfB -- "Execute Workflow" --> wfC
     wfC -- "matches, app_config" --> rds
     wfC -- "AssumeRole clickpe-n8n-ses-role" --> ses
+    wfA -. "Error Workflow" .-> wfE
+    wfB -. "Error Workflow" .-> wfE
+    wfC -. "Error Workflow" .-> wfE
+    wfE -- "n8n_errors row" --> rds
+    wfE -- "one alert email, test alias" --> ses
     ses -- "redirected recipients only" --> inbox
     admin -- "port forward 5678" --> ssm
     ssm -.-> ec2
@@ -113,6 +119,8 @@ flowchart TB
    misses only), then inserts `matches`, finalizes `pipeline_runs` and calls Workflow C.
 6. Workflow C composes emails, redirects every recipient to `TEST_INBOX_ALIASES`, aborts if any recipient is outside
    that list, then sends through SES unless `dry_run` is true, and marks `notified_at`.
+7. If A, B or C fails an automatic execution, n8n starts Workflow E, which stores an `n8n_errors` row and sends one
+   alert email to the first test alias.
 
 ## Designed, not implemented
 
@@ -120,7 +128,6 @@ These are not in the deployed system and are drawn nowhere above.
 
 | Item | Task | State |
 |---|---|---|
-| Workflow E, global error handler | T25 | TODO; A, B and C have no Error Workflow set |
 | Reusable Groq "LLM Gateway" sub-workflow | T26 | TODO; A and B call Groq with their own HTTP Request nodes |
 | Crawl change detection (skip Groq when criteria text is unchanged) | T29 | TODO; Workflow A calls Groq for every site each run |
 | CloudWatch alarm on `ingest-dlq` depth | T21 | Built and drilled: alarm, batch marked `failed` on the 5th receive, `scripts/redrive_dlq.sh` |

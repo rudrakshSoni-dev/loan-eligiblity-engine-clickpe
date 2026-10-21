@@ -221,3 +221,18 @@ UPDATE app_config SET value = 'true' WHERE key = 'dry_run';
 A batch ends `notified` after a sending run, even when the cap held users back (`users_still_waiting` in the `Finish` output). To send the next users, set the batch back to `matched` and run C again; only matches with `notified_at IS NULL` are selected.
 
 Drivers `t39driver0001` to `t39driver0003` (unpublished) and `t39sesdrill001` (a copy of C whose sender is an unverified address; published for the drill, then unpublished and n8n restarted) stay in the n8n database until they are deleted in the editor. The throwaway batches `7a390000-0000-4000-8000-000000000039` and `7a390000-0000-4000-8000-0000000000d1`, their 3 synthetic `example.invalid` users and 4 matches were deleted from RDS afterwards.
+
+## Workflow E: global error handler (T25)
+
+Migration `0008_n8n_errors` was applied with `infra/ec2/migrate.sh` (file SHA-256 `69b8451c…ca31` identical on both sides; `migrations_done` count 1, seed 0). All four workflow files were sent in one gzipped tar through SSM and imported with the CLI, E first so that the others' `errorWorkflow` setting resolves. E must be published as well as imported, otherwise n8n skips it:
+
+```bash
+docker exec n8n n8n import:workflow --input=/tmp/wf/workflow-e-error-handler.json
+docker exec n8n n8n publish:workflow --id=wferrorhandler01
+docker exec n8n n8n publish:workflow --id=wfbmatching001
+docker exec n8n n8n publish:workflow --id=wfcnotification01
+cd /opt/clickpe/n8n && docker compose restart n8n
+docker exec n8n n8n list:workflow --active=true      # B, C and E must be listed
+```
+
+A and B/C were re-imported with only the `errorWorkflow` setting changed. The drill workflow `t25drill000001` (path `t25-error-drill`) was unpublished and answers 404; like the earlier probes it stays inactive in the n8n database until it is deleted in the editor. Read the stored failures with `scripts/rds_query.sh "SELECT * FROM n8n_errors ORDER BY id DESC LIMIT 5"`.

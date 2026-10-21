@@ -309,7 +309,8 @@ The SQL and Code nodes inside the exported workflows are tested where they live:
 Stated plainly, because these are known:
 
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
-- **Designed, not implemented:** Workflow E (global error handler, T25), the reusable Groq "LLM Gateway" sub-workflow (T26, so Workflows A and B call Groq with their own HTTP Request nodes), crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45). Workflows A, B and C therefore have no Error Workflow set.
+- **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
+- **Designed, not implemented:** the reusable Groq "LLM Gateway" sub-workflow (T26, so Workflows A and B call Groq with their own HTTP Request nodes), crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45).
 - **UI polish (T41) is built and tested locally but not deployed.** The deployed `batch-status` does not yet return the grouped reject report or the CSV download.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
@@ -319,7 +320,7 @@ Stated plainly, because these are known:
 
 ## Future work
 
-- Finish the designed items above, starting with the LLM Gateway and Workflow E.
+- Finish the designed items above, starting with the LLM Gateway.
 - API Gateway with authentication and throttling in front of the Function URLs.
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.

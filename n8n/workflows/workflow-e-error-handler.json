@@ -1,0 +1,279 @@
+[
+  {
+    "id": "wferrorhandler01",
+    "name": "E · Error handler",
+    "active": false,
+    "nodes": [
+      {
+        "parameters": {
+          "content": "## Workflow E · Global error handler\n\n**Purpose.** One place that hears about every failed production execution: it records the failure in the `n8n_errors` table and sends one alert email to a test inbox.\n\n**Trigger.** Error Trigger. Workflows A, B and C name this workflow as their Error Workflow (Settings → Error Workflow). n8n starts it only for failed automatic executions (webhook, schedule, sub-workflow call), not for runs started with Execute Workflow in the editor. This workflow has no Error Workflow itself, so a failure here cannot loop.\n\n**Input.** The Error Trigger payload: `workflow {id, name}`, `execution {id, url, mode, lastNodeExecuted, error {message, stack}}`. When a trigger node itself fails the payload has `trigger.error` instead of `execution`; both shapes are handled.\n\n**Output.** One `n8n_errors` row per failure (message and stack truncated to 2,000 and 4,000 characters) and one email. The row records `alert_sent_at` and the SES message id, or `alert_error` when SES refuses.\n\n**Stages.**\n1. `Format` flattens either payload shape, truncates, and builds a one-line subject with control characters removed (no header injection).\n2. `Record` inserts the row first, so the failure is stored even if the alert cannot be sent. A failed insert is retried 3 times and then does not stop the alert.\n3. `Alert · Load recipient` reads the sender and the first address of `test_inbox_aliases` from `app_config`. `Alert · Check recipient` throws unless the recipient is in that list, so an alert can only go to a test inbox.\n4. `Alert · SES email` sends through the same assume-role credential as Workflow C (3 tries). The outcome is written back to the row.",
+          "height": 760,
+          "width": 760,
+          "color": 4
+        },
+        "id": "e0000000-0000-4000-8000-000000000001",
+        "name": "Note · Workflow E overview",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -120,
+          -420
+        ]
+      },
+      {
+        "parameters": {},
+        "id": "e0000000-0000-4000-8000-000000000002",
+        "name": "Trigger · Workflow failed (Error Workflow)",
+        "type": "n8n-nodes-base.errorTrigger",
+        "typeVersion": 1,
+        "position": [
+          0,
+          440
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const payload = $input.first().json;\nconst execution = payload.execution ?? {};\nconst trigger = payload.trigger ?? {};\nconst error = execution.error ?? trigger.error ?? {};\nconst clip = (value, limit) => String(value ?? '').slice(0, limit);\nconst oneLine = (value, limit) => clip(value, limit).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').trim();\nconst workflowName = oneLine(payload.workflow?.name, 200) || 'unknown workflow';\nconst nodeName = oneLine(execution.lastNodeExecuted ?? error.node?.name ?? trigger.node?.name, 200);\nconst message = clip(error.message, 2000) || 'no error message in the payload';\nconst stack = clip(error.stack, 4000);\nconst executionId = oneLine(execution.id, 50);\nconst executionUrl = oneLine(execution.url, 500);\nconst mode = oneLine(execution.mode ?? (payload.trigger ? 'trigger' : ''), 50);\nconst subject = oneLine(`[TEST] n8n error · ${workflowName}${nodeName ? ' · ' + nodeName : ''}`, 200);\nconst text = [\n  `Workflow: ${workflowName} (${oneLine(payload.workflow?.id, 50)})`,\n  `Node: ${nodeName || 'unknown'}`,\n  `Mode: ${mode || 'unknown'}`,\n  `Execution: ${executionId || 'none'} ${executionUrl}`.trim(),\n  '',\n  `Error: ${message}`,\n].join('\\n');\nreturn [{ json: {\n  workflow_id: oneLine(payload.workflow?.id, 50),\n  workflow_name: workflowName,\n  execution_id: executionId,\n  execution_url: executionUrl,\n  node_name: nodeName,\n  mode,\n  error_message: message,\n  error_stack: stack,\n  subject,\n  text,\n} }];"
+        },
+        "id": "e0000000-0000-4000-8000-000000000003",
+        "name": "Format · Build alert",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          260,
+          440
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "INSERT INTO n8n_errors (workflow_id, workflow_name, execution_id, execution_url,\n                        node_name, mode, error_message, error_stack)\nVALUES (nullif($1, ''), $2, nullif($3, ''), nullif($4, ''), nullif($5, ''), nullif($6, ''), $7, nullif($8, ''))\nRETURNING id::text AS id",
+          "options": {
+            "queryReplacement": "={{ [$('Format · Build alert').item.json.workflow_id, $('Format · Build alert').item.json.workflow_name, $('Format · Build alert').item.json.execution_id, $('Format · Build alert').item.json.execution_url, $('Format · Build alert').item.json.node_name, $('Format · Build alert').item.json.mode, $('Format · Build alert').item.json.error_message, $('Format · Build alert').item.json.error_stack] }}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "id": "e0000000-0000-4000-8000-000000000004",
+        "name": "Record · Insert error",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          520,
+          440
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT (SELECT value #>> '{}' FROM app_config WHERE key = 'from_address') AS from_address,\n       (SELECT value ->> 0 FROM app_config WHERE key = 'test_inbox_aliases') AS to_address,\n       (SELECT value FROM app_config WHERE key = 'test_inbox_aliases') AS test_inbox_aliases",
+          "options": {}
+        },
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "id": "e0000000-0000-4000-8000-000000000005",
+        "name": "Alert · Load recipient",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          780,
+          440
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000
+      },
+      {
+        "parameters": {
+          "jsCode": "const config = $input.first().json;\nconst allowed = $('Alert · Load recipient').first().json.test_inbox_aliases;\nconst to = config.to_address;\nconst from = config.from_address;\nif (!Array.isArray(allowed) || !to || !from || !allowed.includes(to)) {\n  throw new Error('Alert recipient is missing or not in test_inbox_aliases; no alert sent');\n}\nconst alert = $('Format · Build alert').first().json;\nreturn [{ json: { to, from, subject: alert.subject, text: alert.text, record_id: $('Record · Insert error').first().json.id ?? '' } }];"
+        },
+        "id": "e0000000-0000-4000-8000-000000000006",
+        "name": "Alert · Check recipient",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1040,
+          440
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "assumeRole",
+          "resource": "email",
+          "operation": "send",
+          "isBodyHtml": false,
+          "subject": "={{ $json.subject }}",
+          "body": "={{ $json.text }}",
+          "fromEmail": "={{ $json.from }}",
+          "toAddresses": [
+            "={{ $json.to }}"
+          ],
+          "additionalFields": {}
+        },
+        "credentials": {
+          "awsAssumeRole": {
+            "id": "8Ht3kL6DMNho0EeE",
+            "name": "aws-ses-assume-role"
+          }
+        },
+        "id": "e0000000-0000-4000-8000-000000000007",
+        "name": "Alert · SES email",
+        "type": "n8n-nodes-base.awsSes",
+        "typeVersion": 1,
+        "position": [
+          1300,
+          440
+        ],
+        "onError": "continueErrorOutput",
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "UPDATE n8n_errors\nSET alert_sent_at = now(), ses_message_id = nullif($2, '')\nWHERE id = nullif($1, '')::bigint\nRETURNING id",
+          "options": {
+            "queryReplacement": "={{ [$('Alert · Check recipient').item.json.record_id, String($json.SendEmailResponse?.SendEmailResult?.MessageId ?? '')] }}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "id": "e0000000-0000-4000-8000-000000000008",
+        "name": "Record · Alert sent",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          1560,
+          340
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "UPDATE n8n_errors\nSET alert_error = left($2, 1000)\nWHERE id = nullif($1, '')::bigint\nRETURNING id",
+          "options": {
+            "queryReplacement": "={{ [$('Alert · Check recipient').item.json.record_id, String($json.error ?? 'SES send failed')] }}"
+          }
+        },
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "id": "e0000000-0000-4000-8000-000000000009",
+        "name": "Record · Alert failed",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          1560,
+          560
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000
+      }
+    ],
+    "connections": {
+      "Trigger · Workflow failed (Error Workflow)": {
+        "main": [
+          [
+            {
+              "node": "Format · Build alert",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Format · Build alert": {
+        "main": [
+          [
+            {
+              "node": "Record · Insert error",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Record · Insert error": {
+        "main": [
+          [
+            {
+              "node": "Alert · Load recipient",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Alert · Load recipient": {
+        "main": [
+          [
+            {
+              "node": "Alert · Check recipient",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Alert · Check recipient": {
+        "main": [
+          [
+            {
+              "node": "Alert · SES email",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Alert · SES email": {
+        "main": [
+          [
+            {
+              "node": "Record · Alert sent",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Record · Alert failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Kolkata",
+      "saveManualExecutions": true
+    },
+    "pinData": {}
+  }
+]

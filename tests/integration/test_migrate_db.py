@@ -26,7 +26,7 @@ from db.migrate import (
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
-SCHEMA_TABLES = 12
+SCHEMA_TABLES = 13
 LEDGER_TABLES = 1
 
 
@@ -78,7 +78,7 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         if e["stage"] in {"migrations_done", "seed_done"}
     ]
     assert done == [
-        ("migrations_done", 7),
+        ("migrations_done", 8),
         ("seed_done", 5),
         ("migrations_done", 0),
         ("seed_done", 0),
@@ -92,6 +92,7 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         ["0005_final_matches"],
         ["0006_app_config"],
         ["0007_from_address"],
+        ["0008_n8n_errors"],
     ]
     tables = conn.run(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
@@ -129,7 +130,7 @@ def test_edited_migration_is_refused_and_nothing_changes(db_env: dict[str, str],
     edited = [Migration(m.version, m.sql + "\nSELECT 1;") for m in load_migrations()]
     with pytest.raises(MigrationError, match="edited after it was applied"):
         migrate(conn, edited)
-    assert conn.run("SELECT count(*) FROM schema_migrations") == [[7]]
+    assert conn.run("SELECT count(*) FROM schema_migrations") == [[8]]
 
 
 def test_failed_migration_rolls_back_completely(db_env: dict[str, str], conn: Any) -> None:

@@ -43,6 +43,7 @@ MIGRATIONS: tuple[tuple[str, Path], ...] = (
     ("0005_final_matches", DB_DIR / "0005_final_matches.sql"),
     ("0006_app_config", DB_DIR / "0006_app_config.sql"),
     ("0007_from_address", DB_DIR / "0007_from_address.sql"),
+    ("0008_n8n_errors", DB_DIR / "0008_n8n_errors.sql"),
 )
 
 SEED_FILE = DB_DIR / "seed_products.sql"

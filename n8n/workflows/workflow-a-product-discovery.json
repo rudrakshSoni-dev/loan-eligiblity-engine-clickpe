@@ -1032,7 +1032,8 @@
     "settings": {
       "executionOrder": "v1",
       "timezone": "Asia/Kolkata",
-      "saveManualExecutions": true
+      "saveManualExecutions": true,
+      "errorWorkflow": "wferrorhandler01"
     },
     "pinData": {}
   }
