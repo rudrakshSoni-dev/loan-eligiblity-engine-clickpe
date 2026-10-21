@@ -201,3 +201,23 @@ UPDATE app_config SET value = '25' WHERE key = 'max_emails_per_run';
 Run C by hand on a `matched` batch: import a three-node driver (Manual Trigger, a Set node with `batch_id`, Execute Workflow with `waitForSubWorkflow` true) and `n8n execute --id=<driver>` with the T28 port overrides. Reading a saved execution is as described under "Stage 3 (T35)".
 
 Throwaway workflows from the T38 checks (`t38driver0001` and `t38driver0002` drivers, `t38guarddrill01`, a copy of C whose compose step addresses the original email): all unpublished; they stay in the n8n database until the owner account exists to delete them in the editor. The throwaway batch `7a380000-0000-4000-8000-000000000038`, its synthetic `example.invalid` users, matches, candidates and run row were deleted from RDS afterwards.
+
+## Workflow C sending (T39)
+
+Migration `0007_from_address` was applied with `infra/ec2/migrate.sh` (file SHA-256 `ba29f90b…7f6c` identical on both sides; `migrations_done` count 1, seed 0). Workflow C was re-imported (gzipped, as for B in T36; remote SHA-256 `0680b653…50c1` equals the local file) and published, then n8n was restarted. B did not change. `n8n list:workflow --active=true` → `wfbmatching001`, `wfcnotification01`.
+
+C sends through the `aws-ses-assume-role` credential (no new credential). Sending is off unless `dry_run` is `false` in `app_config`. The seed and the state after T39 are `true`. Turn sending on (at most `max_emails_per_run` emails per run):
+
+```sql
+UPDATE app_config SET value = 'false' WHERE key = 'dry_run';
+```
+
+and back off after the demo:
+
+```sql
+UPDATE app_config SET value = 'true' WHERE key = 'dry_run';
+```
+
+A batch ends `notified` after a sending run, even when the cap held users back (`users_still_waiting` in the `Finish` output). To send the next users, set the batch back to `matched` and run C again; only matches with `notified_at IS NULL` are selected.
+
+Drivers `t39driver0001` to `t39driver0003` (unpublished) and `t39sesdrill001` (a copy of C whose sender is an unverified address; published for the drill, then unpublished and n8n restarted) stay in the n8n database until they are deleted in the editor. The throwaway batches `7a390000-0000-4000-8000-000000000039` and `7a390000-0000-4000-8000-0000000000d1`, their 3 synthetic `example.invalid` users and 4 matches were deleted from RDS afterwards.
