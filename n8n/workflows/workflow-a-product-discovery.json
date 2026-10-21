@@ -6,7 +6,7 @@
     "nodes": [
       {
         "parameters": {
-          "content": "## Workflow A · Product discovery (fetch, extract, structure)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Prompt` + `LLM` send the lines to Groq (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning). Every call is recorded in `llm_calls`.\n4. `Route` on the HTTP status: 200 -> `Coerce`; 429 -> `Mark · Groq rate limited`; anything else -> `Mark · Groq call failed`. The wait-and-fall-back-to-20b logic is the planned LLM Gateway (T26).\n5. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n6. Valid -> `Check · Product valid` true output. Anything that fails at any stage is written to `crawl_runs` with its reason and never reaches `loan_products`.\n\n**Output.** Per site either a structured product (column names of `loan_products`) or a failure row in `crawl_runs`.\n\n**Next.** T29 hashes `criteria_text` to skip unchanged pages; T31 upserts the structured products and ages out products no longer seen.",
+          "content": "## Workflow A · Product discovery (fetch, extract, structure, store)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row, and retire products that stop being seen.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Prompt` + `LLM` send the lines to Groq (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning). Every call is recorded in `llm_calls`.\n4. `Route` on the HTTP status: 200 -> `Coerce`; 429 -> `Mark · Groq rate limited`; anything else -> `Mark · Groq call failed`. The wait-and-fall-back-to-20b logic is the planned LLM Gateway (T26).\n5. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n6. `Upsert` writes the product on `(source, product_name)` (sets `active`, `last_seen_at`, the SHA-256 `content_hash` of the criteria text) and the success row of `crawl_runs` in one statement, so the two cannot disagree. A database error on one site goes to `Mark · Upsert failed` and the failure log; the other sites carry on.\n7. After every failed site is logged, `Retire` checks that source's last 3 `crawl_runs` rows: all failed -> its non-seed product is set `active = false`. Nothing is deleted; the next good run reactivates it.\n\n**Output.** `loan_products` rows (crawled rows have `is_seed = false`), one `crawl_runs` row per site per run, one `llm_calls` row per Groq call.\n\n**Next.** T29 hashes `criteria_text` to skip the LLM for unchanged pages.",
           "height": 560,
           "width": 640,
           "color": 4
@@ -628,7 +628,123 @@
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.5,
         "position": [
+          4000,
+          300
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const product = $input.item.json;\nconst employment = product.allowed_employment;\n\nreturn {\n  json: {\n    source: product.source,\n    product_name: product.product_name,\n    source_url: product.source_url,\n    interest_rate_min: product.interest_rate_min,\n    interest_rate_max: product.interest_rate_max,\n    min_monthly_income: product.min_monthly_income,\n    min_credit_score: product.min_credit_score,\n    max_credit_score: product.max_credit_score,\n    min_age: product.min_age,\n    max_age: product.max_age,\n    allowed_employment: employment === null ? null : `{${employment.join(',')}}`,\n    raw_criteria_text: product.raw_criteria_text,\n    parse_confidence: product.parse_confidence,\n    llm_calls: product.llm_calls,\n  },\n};"
+        },
+        "id": "a0000000-0000-4000-8000-000000000031",
+        "name": "Prepare · loan_products row",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
           3280,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH incoming AS (\n  SELECT $1::text AS source,\n         $2::text AS product_name,\n         $3::text AS source_url,\n         $4::numeric(5,2) AS interest_rate_min,\n         $5::numeric(5,2) AS interest_rate_max,\n         $6::numeric(12,2) AS min_monthly_income,\n         $7::smallint AS min_credit_score,\n         $8::smallint AS max_credit_score,\n         $9::smallint AS min_age,\n         $10::smallint AS max_age,\n         $11::text[] AS allowed_employment,\n         $12::text AS raw_criteria_text,\n         $13::real AS parse_confidence,\n         $14::integer AS llm_calls,\n         encode(sha256(convert_to($12::text, 'UTF8')), 'hex') AS content_hash\n),\nexisting AS (\n  SELECT p.*\n  FROM loan_products p\n  JOIN incoming i ON i.source = p.source AND i.product_name = p.product_name\n),\noutcome AS (\n  SELECT e.id IS NULL AS inserted,\n         COALESCE(NOT e.active, false) AS reactivated,\n         e.id IS NULL OR (e.source_url, e.interest_rate_min, e.interest_rate_max, e.min_monthly_income,\n                          e.min_credit_score, e.max_credit_score, e.min_age, e.max_age,\n                          e.allowed_employment, e.parse_confidence, e.content_hash)\n           IS DISTINCT FROM (i.source_url, i.interest_rate_min, i.interest_rate_max, i.min_monthly_income,\n                             i.min_credit_score, i.max_credit_score, i.min_age, i.max_age,\n                             i.allowed_employment, i.parse_confidence, i.content_hash) AS changed\n  FROM incoming i\n  LEFT JOIN existing e ON true\n),\nupserted AS (\n  INSERT INTO loan_products (source, product_name, source_url, interest_rate_min, interest_rate_max,\n                             min_monthly_income, min_credit_score, max_credit_score, min_age, max_age,\n                             allowed_employment, raw_criteria_text, content_hash, parse_confidence,\n                             active, last_seen_at)\n  SELECT source, product_name, source_url, interest_rate_min, interest_rate_max,\n         min_monthly_income, min_credit_score, max_credit_score, min_age, max_age,\n         allowed_employment, raw_criteria_text, content_hash, parse_confidence,\n         true, now()\n  FROM incoming\n  ON CONFLICT (source, product_name) DO UPDATE SET\n    source_url = EXCLUDED.source_url,\n    interest_rate_min = EXCLUDED.interest_rate_min,\n    interest_rate_max = EXCLUDED.interest_rate_max,\n    min_monthly_income = EXCLUDED.min_monthly_income,\n    min_credit_score = EXCLUDED.min_credit_score,\n    max_credit_score = EXCLUDED.max_credit_score,\n    min_age = EXCLUDED.min_age,\n    max_age = EXCLUDED.max_age,\n    allowed_employment = EXCLUDED.allowed_employment,\n    raw_criteria_text = EXCLUDED.raw_criteria_text,\n    content_hash = EXCLUDED.content_hash,\n    parse_confidence = EXCLUDED.parse_confidence,\n    active = true,\n    last_seen_at = now()\n  RETURNING id\n),\nlogged AS (\n  INSERT INTO crawl_runs (source, status, products_found, changed, llm_calls)\n  SELECT i.source, 'ok', 1, o.changed, i.llm_calls\n  FROM incoming i\n  CROSS JOIN outcome o\n  RETURNING id\n)\nSELECT u.id AS product_id, i.source, i.product_name, o.inserted, o.reactivated, o.changed, l.id AS crawl_run_id\nFROM upserted u\nCROSS JOIN incoming i\nCROSS JOIN outcome o\nCROSS JOIN logged l",
+          "options": {
+            "queryBatching": "independently",
+            "queryReplacement": "={{ [$json.source, $json.product_name, $json.source_url, $json.interest_rate_min, $json.interest_rate_max, $json.min_monthly_income, $json.min_credit_score, $json.max_credit_score, $json.min_age, $json.max_age, $json.allowed_employment, $json.raw_criteria_text, $json.parse_confidence, $json.llm_calls] }}"
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000032",
+        "name": "Upsert · loan_products + crawl_runs",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          3520,
+          60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "u1",
+                "name": "source",
+                "type": "string",
+                "value": "={{ $('Prepare · loan_products row').item.json.source }}"
+              },
+              {
+                "id": "u2",
+                "name": "product_name",
+                "type": "string",
+                "value": "={{ $('Prepare · loan_products row').item.json.product_name }}"
+              },
+              {
+                "id": "u3",
+                "name": "source_url",
+                "type": "string",
+                "value": "={{ $('Prepare · loan_products row').item.json.source_url }}"
+              },
+              {
+                "id": "u4",
+                "name": "status",
+                "type": "string",
+                "value": "upsert_failed"
+              },
+              {
+                "id": "u5",
+                "name": "error",
+                "type": "string",
+                "value": "={{ 'Database write failed: ' + String($json.error?.description || $json.error?.name || 'unknown error').slice(0, 300) }}"
+              },
+              {
+                "id": "u6",
+                "name": "llm_calls",
+                "type": "number",
+                "value": "={{ $('Prepare · loan_products row').item.json.llm_calls }}"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "a0000000-0000-4000-8000-000000000033",
+        "name": "Mark · Upsert failed",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          3760,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH policy AS (\n  SELECT 3 AS max_missed_runs\n),\nlatest AS (\n  SELECT cr.status\n  FROM crawl_runs cr\n  WHERE cr.source = $1\n  ORDER BY cr.ran_at DESC, cr.id DESC\n  LIMIT (SELECT max_missed_runs FROM policy)\n),\nverdict AS (\n  SELECT count(*) = (SELECT max_missed_runs FROM policy) AND bool_and(status = 'failed') AS silent\n  FROM latest\n),\nretired AS (\n  UPDATE loan_products lp\n  SET active = false\n  FROM verdict v\n  WHERE v.silent AND lp.source = $1 AND lp.active AND NOT lp.is_seed\n  RETURNING lp.id, lp.product_name\n)\nSELECT $1::text AS source,\n       COALESCE((SELECT silent FROM verdict), false) AS silent_for_3_runs,\n       (SELECT count(*) FROM retired) AS retired_count",
+          "options": {
+            "queryBatching": "independently",
+            "queryReplacement": "={{ [$json.source] }}"
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000035",
+        "name": "Retire · Product after 3 failed runs",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          4240,
           300
         ],
         "credentials": {
@@ -840,7 +956,13 @@
       },
       "Check · Product valid": {
         "main": [
-          [],
+          [
+            {
+              "node": "Prepare · loan_products row",
+              "type": "main",
+              "index": 0
+            }
+          ],
           [
             {
               "node": "Log · crawl_runs failure",
@@ -855,6 +977,51 @@
           [
             {
               "node": "Log · crawl_runs failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Prepare · loan_products row": {
+        "main": [
+          [
+            {
+              "node": "Upsert · loan_products + crawl_runs",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Upsert · loan_products + crawl_runs": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Mark · Upsert failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Mark · Upsert failed": {
+        "main": [
+          [
+            {
+              "node": "Log · crawl_runs failure",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log · crawl_runs failure": {
+        "main": [
+          [
+            {
+              "node": "Retire · Product after 3 failed runs",
               "type": "main",
               "index": 0
             }

@@ -37,6 +37,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 23. [First deployment (T22): measured results and one shortcut](#first-deployment-t22-measured-results-and-one-shortcut)
 24. [Completion trigger: one POST from the winner](#completion-trigger-one-post-from-the-winner)
 25. [Product structuring: strict schema, then distrust the answer](#product-structuring-strict-schema-then-distrust-the-answer)
+26. [Product storage and lifecycle: one statement per site, retire by run history](#product-storage-and-lifecycle-one-statement-per-site-retire-by-run-history)
 
 ---
 
@@ -992,4 +993,65 @@ instead of object, no choices): each is accepted or rejected as designed.
   been tested against Groq; it was fixed in place (`GET /models` 200 from the instance afterwards).
 - The `crawl_runs` and `llm_calls` tables contain rows from these drills (including the duplicated inserts
   above); they are real events from T30 development, not seed data.
+
+## Product storage and lifecycle: one statement per site, retire by run history
+
+**Choice (T31).** A product that passes `Coerce · Validate product` is written by one Postgres statement
+(`Upsert · loan_products + crawl_runs`) made of four CTEs:
+
+- `incoming` holds the parameters and computes `content_hash` as `sha256` of the criteria text inside
+  Postgres, so the hash is defined in one place and T29 can compare against it;
+- `existing` and `outcome` read the row as it was before the statement (CTEs share one snapshot) and decide
+  `inserted`, `reactivated` and `changed`, where `changed` means the hash or any structured field differs;
+- `upserted` is `INSERT … ON CONFLICT (source, product_name) DO UPDATE` and always sets `active = true` and
+  `last_seen_at = now()`; the row id is stable, and `is_seed` is never touched (seed rows carry
+  `source = 'seed'`, so a crawl cannot collide with them);
+- `logged` inserts the `ok` row into `crawl_runs` in the same statement, so a product row and its run row
+  cannot disagree and a failed write leaves neither.
+
+**Lifecycle.** A product is never deleted. The node `Retire · Product after 3 failed runs` runs after each
+failure is logged and looks at that source's last three `crawl_runs` rows; if all three are `failed` it sets
+`active = false` for the source's non-seed product. The next good crawl reactivates the same row. "Run" means
+a `crawl_runs` row, not a calendar day, so manual demo runs and the daily schedule count alike, and a product
+is not retired by a single bad day. The threshold is the constant `max_missed_runs` at the top of the query.
+Failure includes a site being down: we cannot tell "the lender dropped the product" from "the page moved",
+and for matching the safe answer to both is to stop recommending a product we can no longer verify.
+
+**Rejected.**
+- *A "run once after all sites" node (Merge, then retire).* Measured: in n8n 2.44.4 with execution order
+  `v1`, the Merge fired once per arriving branch (twice in a run with a database failure and a fetch failure),
+  so the supposed single retire ran twice. The rule is per source anyway, so it moved next to the failure log.
+- *Time-based retirement* (`last_seen_at` older than N days): a site outage over a long weekend would retire
+  products that are still on offer.
+- *The Postgres node's built-in Insert or Update operation:* it cannot set `last_seen_at = now()`, compute the
+  hash, read the previous row or write the `crawl_runs` row in the same transaction.
+
+**Measured (execution ids from `execution_entity` on the EC2 instance).**
+
+| Drill | Result |
+|---|---|
+| First run, 3 lenders | 3 inserted (ids 11–13), `changed = true`, 3 `ok` rows in `crawl_runs`, `loan_products` 5 seed + 3 crawled |
+| Identical re-run (execution 32) | same ids, `inserted = false`, `changed = false`, `last_seen_at` moved, 8 rows and 8 distinct keys |
+| Site 404 plus a forced CHECK violation on ICICI's write (execution 44) | HDFC and IDFC upserted, ICICI routed to `Mark · Upsert failed`, 404 site to `Mark · Fetch failed`; both logged in `crawl_runs`; execution status `success` |
+| ICICI URL broken for 3 runs (executions 41–43) | `silent_for_3_runs` false, false, then true with `retired_count = 1`; HDFC and IDFC upserted every time |
+| Next good run (executions 40, 45) | ICICI `reactivated = true`, same id 11, nothing deleted |
+
+**Findings worth knowing.**
+- **One failed write stopped every other site.** With the Postgres node's default `queryBatching: single`, the
+  first failing item aborted the node: HDFC and IDFC were never written. `queryBatching: independently` runs
+  one statement per item and lets the error output carry only the failed item. The success path of
+  `Log · crawl_runs failure` still uses the default, which is acceptable for an append-only insert.
+- On the error output the database message is not readable (`$json.error.message` is undefined); the
+  `description` field holds the row detail ("Failing row contains …"), which is what the log stores, cut to
+  300 characters. The full error remains in the n8n execution.
+- `loan_products.id` has gaps (11, 12, 13, then 17+ in drill runs): a statement that fails or conflicts still
+  consumes identity values, as in any PostgreSQL `GENERATED BY DEFAULT` column. The ids are not meaningful.
+- `updated_at` moves on every crawl because `last_seen_at` is written to the same row and the table's trigger
+  fires on any update. "Did the product change?" is answered by `crawl_runs.changed` and `content_hash`, not
+  by `updated_at`.
+- `content_hash` covers the criteria text only (T29 compares it before calling the LLM). If the model or
+  prompt changes and the same text yields different structured fields, the hash stays equal. T35's verdict
+  cache must therefore also key on the structured fields, not on `content_hash` alone.
+- The crawl log has one row per source per run, not per product; two products from one source would share
+  one retirement history. Today every source has one product.
 
