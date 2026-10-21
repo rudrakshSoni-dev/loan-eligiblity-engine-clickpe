@@ -1,4 +1,4 @@
-"""Read-only batch progress for the UI poller: counters, first rejects, match counts, funnel.
+"""Read-only batch progress for the UI poller: counters, rejects by problem, match counts, funnel.
 
 Four small queries on indexed columns, run in autocommit. `pipeline_runs` counters are NULL until
 their stage has run, and they are passed through as null so the UI can tell "not measured yet"
@@ -12,15 +12,13 @@ from datetime import datetime
 from typing import Any
 
 from lambdas.shared.db import Connection
+from lambdas.shared.reject_report import stored_reasons, summarise
 
 REJECT_PREVIEW_LIMIT = 5
 
 BATCH_SQL = (
     "SELECT status, error, total_chunks, chunks_done, rows_ok, rows_rejected,"
     " created_at, updated_at FROM upload_batches WHERE id = :id"
-)
-REJECTS_SQL = (
-    "SELECT line_no, reason FROM rejected_rows WHERE batch_id = :id ORDER BY line_no LIMIT :limit"
 )
 MATCHES_SQL = "SELECT count(*), count(notified_at) FROM matches WHERE batch_id = :id"
 FUNNEL_COLUMNS = (
@@ -69,7 +67,7 @@ def batch_status(conn: Connection, batch_id: uuid.UUID) -> dict[str, Any] | None
     if not rows:
         return None
     status, error, total, done, ok, rejected, created, updated = rows[0]
-    rejects = conn.run(REJECTS_SQL, id=batch_id, limit=REJECT_PREVIEW_LIMIT)
+    rejects = stored_reasons(conn, batch_id)
     matches, notified = conn.run(MATCHES_SQL, id=batch_id)[0]
     return {
         "batch_id": str(batch_id),
@@ -79,7 +77,11 @@ def batch_status(conn: Connection, batch_id: uuid.UUID) -> dict[str, Any] | None
         "chunks_done": done,
         "rows_ok": ok,
         "rows_rejected": rejected,
-        "first_rejects": [{"line_no": line, "reason": reason} for line, reason in rejects],
+        "first_rejects": [
+            {"line_no": line, "reason": reason} for line, reason in rejects[:REJECT_PREVIEW_LIMIT]
+        ],
+        "rejects_stored": len(rejects),
+        "reject_summary": summarise(rejects),
         "matches": matches,
         "notified": notified,
         "funnel": funnel(conn, batch_id),
