@@ -57,8 +57,9 @@ The probe workflow remains in the n8n database, inactive; delete it in the edito
 ## Batch-processed webhook (T19)
 
 `load-chunk` POSTs `{"batch_id"}` with `X-Webhook-Secret` to `http://172.31.26.164:5678/webhook/match-batch`
-(SSM `/clickpe/n8n/webhook_url`, resolved at deploy). Workflow B (T32) must be published on exactly this
-path and start by moving the batch `processed → matching`, refusing when that UPDATE returns no row.
+(SSM `/clickpe/n8n/webhook_url`, resolved at deploy). Workflow B (`wfbmatching001`, T32) is published on
+exactly this path and starts by moving the batch `processed → matching`, replying 409 when that UPDATE
+claims nothing (replies: 202 / 400 / 409 / 500, see `docs/decisions.md` → "Workflow B entry").
 
 Re-send a batch whose POST failed (n8n down, workflow not published):
 
@@ -96,7 +97,7 @@ Created in the editor by name; workflows reference only these names. Screenshots
 |---|---|---|---|
 | `rds-postgres` | Postgres | RDS endpoint from SSM `/clickpe/db/host`, database and user `clickpe`, SSL Require, Ignore SSL Issues off | "Connection tested successfully" |
 | `aws-ses-assume-role` | AWS (Assume Role) | `ap-southeast-2`, Use System Credentials on, role `clickpe-n8n-ses-role`, external ID `clickpe-n8n` (the form requires one; the trust policy does not check it) | "Connection tested successfully" |
-| `webhook-secret` | Header Auth | `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` | not testable until T32 |
+| `webhook-secret` | Header Auth | `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` | T32: wrong or missing secret → 403, right secret → 202 / 409 on `match-batch` |
 | `groq-api` | Header Auth | `Authorization`, value `Bearer <key>` (the prefix is part of the value; T24 first saved the bare key, which Groq rejected with 401, fixed in T30) | `GET https://api.groq.com/openai/v1/models` → 200 from the instance; used by Workflow A |
 
 SES role chain: instance role `clickpe-n8n-ec2-role` (inline policy `assume-n8n-ses-role`, `sts:AssumeRole` on one ARN) assumes `clickpe-n8n-ses-role` (trust: that instance role only; policy `ses-send-test-identities`: `ses:SendEmail` and `ses:SendRawEmail` on the three verified identities). Policy documents are in `infra/iam/`. From the instance, `aws sts assume-role` returned `assumed-role/clickpe-n8n-ses-role/t24check`. No static keys exist.
@@ -121,3 +122,19 @@ aws ssm send-command --instance-ids $I --document-name AWS-RunShellScript --time
 
 `n8n execute` prints the whole run data to stdout and cuts it off inside the first multi-megabyte page,
 so results are read from the saved execution in `database.sqlite` (read-only) instead.
+
+## Publishing Workflow B (T32)
+
+Same import as T28, then publish and restart (the CLI only flags the workflow; a running n8n registers its
+webhook after a restart, and `/healthz` answers 200 before that):
+
+```bash
+B64=$(base64 -w0 n8n/workflows/workflow-b-matching.json)
+aws ssm send-command --instance-ids $I --document-name AWS-RunShellScript --timeout-seconds 300 \
+  --parameters "commands=[\"echo $B64 | base64 -d > /tmp/wfb.json && docker cp /tmp/wfb.json n8n:/tmp/wfb.json && docker exec n8n n8n import:workflow --input=/tmp/wfb.json && docker exec n8n n8n publish:workflow --id=wfbmatching001; rm -f /tmp/wfb.json; cd /opt/clickpe/n8n && docker compose restart n8n\"]"
+docker exec n8n n8n list:workflow --active=true      # B · Matching must be listed
+```
+
+The throwaway workflow `t32faildrill01` (forced database error, path `t32-fail-drill`) was unpublished and
+answers 404; like `t23probe0001`, `t19stubrecv1` and `scratchprobe0001` it stays inactive in the n8n
+database until the owner account exists to delete it in the editor.

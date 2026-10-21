@@ -38,6 +38,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 24. [Completion trigger: one POST from the winner](#completion-trigger-one-post-from-the-winner)
 25. [Product structuring: strict schema, then distrust the answer](#product-structuring-strict-schema-then-distrust-the-answer)
 26. [Product storage and lifecycle: one statement per site, retire by run history](#product-storage-and-lifecycle-one-statement-per-site-retire-by-run-history)
+27. [Workflow B entry: claim, count and record in one statement](#workflow-b-entry-claim-count-and-record-in-one-statement)
 
 ---
 
@@ -910,7 +911,7 @@ mismatch):
 | `good_users.csv`, n8n stopped | 1 | 0 | 0 | 3 attempts, `Connection refused`, `webhook_failed`; batch `processed`, queue empty | 0 |
 | retrigger of that batch after restart | | | | HTTP 200 | 1 |
 
-**Open item for T32/T45.** n8n saves the Webhook node's output, which includes the request headers, so
+**Open item for T32/T45 (T32 decision: [Workflow B entry](#workflow-b-entry-claim-count-and-record-in-one-statement)).** n8n saves the Webhook node's output, which includes the request headers, so
 `X-Webhook-Secret` lands in execution data on the n8n volume (the same instance and trust boundary as the
 encryption key; pruned after 168 h). A Header Auth credential does not change this. T32 decides how
 Workflow B avoids keeping it.
@@ -1055,3 +1056,64 @@ and for matching the safe answer to both is to stop recommending a product we ca
 - The crawl log has one row per source per run, not per product; two products from one source would share
   one retirement history. Today every source has one product.
 
+## Workflow B entry: claim, count and record in one statement
+
+**Choice (T32).** `POST /webhook/match-batch` is a Webhook node with Header Auth (`webhook-secret`), the
+VPC-CIDR IP allowlist and a Respond to Webhook node. After `batch_id` is checked against a lower-case UUID
+pattern, one SQL statement does three things: `UPDATE upload_batches SET status = 'matching' WHERE id = $1
+AND status = 'processed'`, count `users_in_batch × active_products`, and `INSERT INTO pipeline_runs`. The
+final `SELECT` starts from the counts and `LEFT JOIN`s the inserted run, so it always returns exactly one
+row; `run_id` is NULL when nothing was claimed. Replies: 202 with `{batch_id, run_id, total_pairs,
+users_in_batch, active_products}`, 400 malformed id, 409 batch not `processed`, 500 database error. The
+reply is sent before the funnel stages, so the Lambda's 5 s timeout never waits on matching.
+
+**Why one statement.** A claim followed by a separate run insert can fail between the two and leave a batch
+in `matching` with no `pipeline_runs` row, and nothing would move it back. Data-modifying CTEs commit or
+roll back together.
+
+**Replay safety.** The claim is the guard (layer 4 of [Webhook security](#webhook-security-four-layers)): the
+second delivery of the same batch finds `status = 'matching'`, updates nothing and gets 409. The Lambda
+treats 409 as non-retryable, which is right: the first delivery already won. A 5xx is retried by the Lambda
+(3 attempts), and a failed claim changes nothing, so the retry is safe.
+
+**What "users in batch" means.** `users.batch_id` is the batch that last inserted or changed the user (the
+upsert is guarded by `IS DISTINCT FROM`). An identical re-upload therefore has 0 users in its own batch and
+`total_pairs = 0`; those users were matched when they first arrived. Consequence, stated honestly: a user
+who arrived before a product existed is not re-matched when the product is added later. Re-matching on a
+product change is not built. A zero-pair batch still moves to `matching`, so T36 must always finish a run,
+including when there is nothing to match.
+
+**Rejected.**
+- *Separate nodes for claim, count and run insert.* Readable on the canvas, but not atomic (above).
+- *`Always Output Data` on the Postgres node to cope with the empty result of a lost claim.* Measured with a
+  throwaway copy whose query was `SELECT 1/0`: the forced database error came back as **409**, not 500,
+  because the empty item left on the success output hid the error output. A broken database would have looked
+  like a replay and the Lambda would not have retried. The always-one-row `LEFT JOIN` removes the need; the
+  same drill then returned 500.
+- *Retry On Fail on the claim node.* After a successful claim a retry finds the batch in `matching` and
+  reports a false 409; the Lambda's own retry covers real failures. (Same lesson as T30's INSERT.)
+- *Matching in the webhook's own response.* Would hold the Lambda's connection for the length of the funnel.
+
+**Secret in saved executions (open item from T19).** n8n stores the Webhook node's output, headers included,
+so every execution on the volume contains `X-Webhook-Secret` (confirmed in `execution_data` of this workflow;
+n8n 2.44.4 has no per-node "do not save" option). Chosen: keep saving executions, because they are the
+evidence reviewers can open, and accept the risk inside its boundary: the data sits on the same encrypted-at-rest
+EBS volume and instance as the n8n encryption key, executions are pruned after 168 h, and the secret is only
+accepted from the VPC. Mitigation for the demo: rotate `/clickpe/n8n/webhook_secret` and the `webhook-secret`
+credential after the recording, and never open the Webhook node's output panel on camera. Turning off
+`EXECUTIONS_DATA_SAVE_ON_SUCCESS` for this workflow would remove the exposure and the evidence; listed for T45.
+
+**Measured (2026-10-21, n8n 2.44.4 on `i-02ffa9d08e8403a4a`, Lambda `loadChunk` in the VPC).**
+
+| Probe | Result |
+|---|---|
+| No header / wrong secret | HTTP 403 `Authorization data is wrong!`, no execution created |
+| Right secret from `127.0.0.1` (outside the allowlist) | HTTP 403 `IP is not allowed to access the webhook!` |
+| `batch_id` not a UUID / upper-case UUID / empty body | HTTP 400 each |
+| Well-formed unknown `batch_id` | HTTP 409, no `pipeline_runs` row |
+| Real upload of 200 new users (batch `4d5d548f…`) | Lambda `webhook_sent` status 202 on attempt 1; one execution; `pipeline_runs` row `total_pairs = 1600` = 200 users × 8 active products; batch `matching` |
+| Same batch POSTed again | HTTP 409; still exactly 1 `pipeline_runs` row |
+| Forced `SELECT 1/0` in a throwaway copy | HTTP 500 `could not start matching run` |
+
+`active_products = 8` is the 5 labelled seed products plus the 3 crawled ones; Workflow B matches against
+both until the seed rows are deactivated or kept on purpose (decision for T33).
