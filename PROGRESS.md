@@ -45,7 +45,7 @@
 | T41 | P2 | UI polish | DONE | 2026-10-22 | Rejects grouped by problem, CSV download (spreadsheet-safe, capped at 2,000 rows), System/Light/Dark switch; 506 passed, coverage 100%, 6 mutation probes caught; verified in headless Chrome against the real handler on local PG16 |
 | T42 | P0 | End-to-end run | DONE | 2026-10-21 | Fresh state, real 10,000-row CSV uploaded from the user's browser → batch `notified` in 41.5 s: 2 chunks, 10,000 users, 30,000 → 14,165 → 10,405 / 2,221 / 1,539 → 20 cohorts → 2 Groq calls (3,536 tokens) → 11,841 matches; 5 SES emails, 10 matches notified; received in Gmail (Spam) |
 | T43 | P0 | Idempotency + failure drills | DONE | 2026-10-22 | All 4 drills live: (a) identical re-upload with `dry_run` off → 0 inserted / 0 updated, 0 new matches, 0 emails; (b) malformed CSV → 1 loaded, 10 rejects with line numbers; (c) n8n stopped → `webhook_failed`, batch stays `processed`, retrigger → 202 → 9 matches; (d) one lender unreachable → other 2 upserted, HDFC stays active. Found: n8n stores `X-Webhook-Secret` in execution data (see T45) |
-| T44 | P1 | Test coverage pass | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T44 | P1 | Test coverage pass | DONE | 2026-10-22 | Coverage gate now covers all of `lambdas` (handlers too) at a 95% floor; 100.00% branch coverage, 691 passed against postgres:16 |
 | T45 | P1 | Security review | DONE | 2026-10-22 | 12-item live checklist; fixed: webhook key in n8n executions (signed 60 s HS256 token, key rotated, 7 live drills), master DB user everywhere (`app_ingest` / `app_n8n`, 39 role tests, A/B/C/E + upload live), account S3 BPA; 6 residual risks with fixes; 691 passed |
 | T46 | P1 | Cost table | DONE | 2026-10-22 | Demo stack $42.26/month at list prices (RDS + n8n host = 91%); 1M users/month ≈ $42.3 without email, +$60.17 if all matched users were mailed; NAT ($43.07) and per-pair LLM ($585.18) priced as avoided costs |
 | T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
@@ -1261,3 +1261,18 @@ Task T29 complete. Run the commit commands above, then start a new session (`/cl
   - Q: Why is 1M users barely more than the demo? A: Cost is fixed instance-hours (91%); Lambda, SQS and S3 are cents because ingestion takes seconds of compute and the LLM stage depends on cohort count, not user count.
   - Q: Is $42 what you paid? A: No. Cost Explorer shows $0 (Free Plan/credits or not yet posted); these are list prices, and I did not read what the credits cover.
   - Q: Would a db.t4g.micro survive 1M users? A: Untested. Storage fits (~1.6 GB) but nothing above 100,000 users was run; the table says so.
+
+### T44 — Test coverage pass (2026-10-22)
+- Files: pyproject.toml (coverage `source` = `lambdas`, `fail_under` = 95), README.md (Testing), docs/rubric-evidence.md
+- Finding: `lambdas/shared` was already at 99.82% and the COPY/upsert integration tests already existed (`tests/integration/test_load_chunk_db.py`), but they were skipped without a server and the gate ignored the four handlers. No test was missing; the gate was too narrow and too low.
+- Evidence (throwaway `postgres:16` on port 55432, removed afterwards; `TEST_DB_*` set):
+  - `make check` → `All checks passed!`, `99 files already formatted`, `Success: no issues found in 82 source files`, `691 passed in 97.23s`, `TOTAL 1209 stmts, 0 miss, 222 branches, 0 partial, 100%`, `Required test coverage of 95.0% reached`
+  - Without a database: `448 passed, 243 skipped`, total 98%, only `load_chunk/handler.py` lines 160-172 and 199-207 uncovered (covered by the database tests)
+  - `docker ps -a | grep t44` → empty (container removed)
+- Rubric: Backend & Code Quality (+ coverage gate on handlers, 95% floor)
+- Explain it back:
+  - Built: a stricter gate, not new tests. Coverage now measures every Lambda module and fails under 95%.
+  - Why this approach: writing tests to chase a number that was already 99.8% would add noise; the real risk was that the gate ignored the handlers and silently skipped DB tests, so I widened the measurement and ran the DB tests to prove it.
+  - Q: Why 95% and not 100%? A: 100% is what the run reached with a database; without one the DB-only branches in `load_chunk/handler.py` are skipped (98%), so 95% passes on a laptop with no Docker and still catches a real regression.
+  - Q: Does 100% line coverage mean the COPY path is correct? A: No, it means every line ran. Correctness comes from the assertions: identical re-upload changes 0 rows, a redelivered chunk is a no-op, malformed rows give file line numbers, a refused row rolls the chunk back.
+  - Q: Why did tests skip silently? A: Integration tests need `TEST_DB_HOST`; without it they skip so `make check` works anywhere. The README and this log state the with/without numbers separately.

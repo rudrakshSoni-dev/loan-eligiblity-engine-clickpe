@@ -329,7 +329,7 @@ The fixed cost is the database and the n8n host (91%); usage-based items are cen
 make check
 ```
 
-runs `ruff check`, `ruff format --check`, `mypy` (strict) and `pytest` with an 80% branch-coverage floor on `lambdas/shared`.
+runs `ruff check`, `ruff format --check`, `mypy` (strict) and `pytest` with a 95% branch-coverage floor on all of `lambdas` (the four handlers and `lambdas/shared`).
 
 Tests that need PostgreSQL create a throwaway database per test and are skipped without a server:
 
@@ -338,7 +338,7 @@ docker run -d --rm --name pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
 TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_PASSWORD=test make check
 ```
 
-Result of the last run (T45): `All checks passed!`, `99 files already formatted`, `Success: no issues found in 82 source files`, **`691 passed`** and **100.00% coverage** of `lambdas/shared`. Without a database, `448 passed, 243 skipped` and 99.82%.
+Result of the last run (T44, 2026-10-22): `All checks passed!`, `99 files already formatted`, `Success: no issues found in 82 source files`, **`691 passed`** and **100.00% branch coverage** of `lambdas` (1,209 statements, 222 branches, 0 missed). Without a database, `448 passed, 243 skipped` and 98% (the uncovered lines are in `load_chunk/handler.py`, covered by the database tests).
 
 The SQL and Code nodes inside the exported workflows are tested where they live: the exported SQL runs on PostgreSQL 16 and the exported Code nodes run under Node.js inside pytest. Mutation probes (weakening a guard on purpose) were run for the critical paths, and each one failed at least one test.
 
