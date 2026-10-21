@@ -50,7 +50,7 @@
 | T46 | P1 | Cost table | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
 | T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
-| T49 | P0 | README | TODO | |  |
+| T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items (T21/T25/T26/T29/T37/T41 deploy/T45/T46) stated plainly; EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
 | T50 | P0 | Video script | TODO | |  |
 | T51 | P0 | Rehearsal | TODO | |  |
 | T52 | P0 | Record + upload | TODO | |  |
@@ -1044,3 +1044,27 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Which Lambdas are in the VPC and why? A: `load-chunk`, `get-upload-url`, `batch-status` need RDS; `split-csv` sends to SQS and never touches RDS, so it stays outside and no paid SQS endpoint is needed.
   - Q: How does n8n reach Groq and SES with no NAT? A: It sits in a public subnet with an outbound-only public IP via the free Internet Gateway; the SG has no inbound rules.
   - Q: What must change in the diagram when T25/T26/T29 land? A: Add Workflow E with error links from A/B/C, replace the two Groq HTTP nodes with a gateway sub-workflow, and move those rows out of "Designed, not implemented".
+
+### T49 — README (2026-10-22)
+- Files: `README.md` (rewritten from the architecture-only stub), `infra/ec2.md` (new "Launch commands" section), `docs/rubric-evidence.md`, `PROGRESS.md`.
+- Sections in the order of CLAUDE.md: overview with a measured summary table, architecture diagram, repo map, prerequisites, deploy AWS, launch n8n and credentials, import workflows, run the demo, design decisions (ingestion, no-NAT VPC, crawling, Treasure Hunt with the measured funnel and Groq limits), security, cost, testing, limitations, future work.
+- Evidence:
+  - `make check` without a database → `All checks passed!`, `329 passed, 177 skipped`, `Total coverage: 99.82%`.
+  - Full suite on a throwaway `postgres:16` container (`TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55449 …`, container stopped afterwards) → `506 passed in 171.22s`, `Total coverage: 100.00%`. `make lint format-check typecheck` → `All checks passed!`, `80 files already formatted`, `Success: no issues found in 65 source files`.
+  - Every relative link in `README.md` resolves to an existing file or folder (loop over the extracted link targets printed no `MISSING`).
+  - Secrets scan of `README.md`: only variable and parameter names, the `openssl rand` generators and the `POSTGRES_PASSWORD=test` throwaway-container example.
+  - Number provenance: 30,000 → 14,165 → 10,405 / 1,539 / 2,221 → 20 cohorts → 2 calls, 3,536 tokens → 1,436 / 785 → 11,841 matches and 41.5 s from T42 (execution 94); 6.9 s from T22; Stage 1 578 ms, Stage 2 625 ms from T33 and T34; Groq limits from T04. A first draft said 12,944 rules-resolved pairs; the sum 10,405 + 1,539 is 11,944, fixed before finishing.
+- Walkthrough of the README as a fresh reader, gaps found:
+  1. EC2 creation (role, instance profile, security group, `run-instances`) was done interactively and was in no file. Fixed: reconstructed from `describe-instances`, `describe-volumes` and `get-role` into `infra/ec2.md` → "Launch commands", labelled as not re-run.
+  2. The SG ingress commands were only in `docs/decisions.md`; now in the same section.
+  3. Not fixed: the SES-only role and its trust policy have JSON in `infra/iam/` but no `create-role` commands; the n8n credentials are made by hand in the editor; Workflow A must be imported and run through the CLI commands in `infra/n8n.md`. Both are explained in the README by pointing at those files.
+  4. Not fixed: 2FA on the n8n owner account was done in the browser and has no screenshot; the README says so.
+- Honest scope: the README states T21, T25, T26, T29, T37, T45 and T46 are not done and the T41 live deploy is pending, and gives no dollar figures.
+- Rubric: Docs & Presentation (README with copy-pasteable setup and measured design decisions).
+- Explain it back:
+  - Built: the submission README. A reader gets the claim (a summary table of measured numbers), the architecture, how to deploy and run it, why each design choice was made, and what is not finished.
+  - Why this approach over the obvious alternative (a long README repeating `docs/decisions.md`): reviewers skim. The README gives each decision a few lines with its measured number and links the full reasoning, and it puts the "not built" list in one place so nothing reads as a hidden gap.
+  - Q: Why should I believe the funnel numbers? A: Each comes from a named run (execution 94, T33 to T36) with the query or command in `PROGRESS.md`; the per-stage counts add up through database CHECK constraints, and an independent count agreed on 14,165 of 14,165 pairs.
+  - Q: Is 2 LLM calls for 2,221 borderline pairs a fair comparison? A: It is the cold-cache count for one batch: the pairs collapse into 20 cohorts packed per product. The comparison point is 2,221 calls if each pair were asked separately. The cache then makes the same batch cost 0 calls.
+  - Q: What breaks first at 100× the data? A: Not measured, so the README makes no claim. The chunked ingest is bounded per chunk and the SQL stages are set-based, but Stage 3 is limited by Groq's 200,000 tokens a day and the benchmark (T37) is still TODO.
+
