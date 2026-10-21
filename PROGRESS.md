@@ -22,7 +22,7 @@
 | T18 | P0 | load-chunk Lambda (inside VPC) | DONE | 2026-10-21 | 10,000 rows in 2 chunks → 10,000 users; identical re-upload 0 inserted / 0 updated; redelivery no-op; ranged GET + IfMatch checked on real S3; shared coverage 100% with DB |
 | T19 | P0 | Completion → n8n trigger | DONE | 2026-10-21 | Only the `try_complete` winner POSTs (5 s, 3 attempts); live: 4 batches → 4 POSTs, 4 n8n executions, 5 losing checks per 6-chunk batch; n8n-down drill → `webhook_failed`, retrigger script → 200; local race 100 deliveries → 10 POSTs, mutation → 2–4 per batch |
 | T20 | P0 | batch-status Lambda | DONE | 2026-10-21 | GET ?batch_id= → counters, first 5 rejects, match/notified counts, latest funnel (NULL = not measured); 400/404/405/503; 5 DB tests on PG16; shared coverage 100% |
-| T21 | P1 | DLQ handling + alarm | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T21 | P1 | DLQ handling + alarm | DONE | 2026-10-22 | Batch marked `failed` with chunk number on the 5th receive; alarms on `ingest-dlq` and `split-failures`; `scripts/redrive_dlq.sh`; drilled live |
 | T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
 | T23 | P0 | docker-compose | DONE | 2026-10-21 | n8n 2.44.4 healthy on EC2; editor only via SSM tunnel (200), public IP times out; webhook allowlist 200 inside / 403 outside; owner account + 2FA still to be created in browser |
 | T24 | P0 | n8n credentials | DONE | 2026-10-21 | 4 credentials; Postgres (verified TLS via mounted RDS CA) and AWS Assume Role (system credentials, SES-only role, no static keys) tests green |
@@ -1088,3 +1088,21 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why does the live run show zeros? A: Re-uploading an identical file is idempotent: the upsert rewrites only changed rows, so the new batch has no users, no pairs, no matches and no emails. That is a feature to show, and the funnel comes from the first-run batch.
   - Q: Why does the script admit Workflow E and the LLM Gateway are missing? A: CLAUDE.md §0.4 forbids implying a designed feature is built, and a reviewer who reads the README Limitations will catch any gap between video and repo.
   - Q: What happens to the script if T25, T26 or T29 are built later? A: Segments 3, 4 and 8, the "Number sources" table and "Not to claim" are edited; the rest stands.
+
+### T21 — DLQ handling + alarm (2026-10-22)
+- Files: lambdas/load_chunk/handler.py, serverless.yml, scripts/redrive_dlq.sh, tests/unit/test_load_chunk.py, tests/unit/test_dlq_config.py, docs/decisions.md, docs/architecture.md, docs/rubric-evidence.md, README.md, docs/video-script.md
+- Evidence:
+  - `make check` → ruff/format/mypy clean, `334 passed, 177 skipped` (the skipped are the PostgreSQL integration tests; no local Postgres was running this session), coverage 99.82%.
+  - `sls deploy` → stack updated in 73 s.
+  - Drill: pending batch `979b2b89-8d95-4dc6-9f40-e274dc216184` + a hand-built chunk message for a key that does not exist (S3 returns `AccessDenied`, no ListBucket) with ingest visibility temporarily 5 s. Five `chunk_retry` logs, then `batch_failed` "chunk 0: gave up after 5 receives (ChunkUnavailableError: S3 error AccessDenied)"; batch status `failed`.
+  - `ingest-dlq` held 2 messages; `aws cloudwatch describe-alarms` → `ingest-dlq-not-empty ALARM`, `split-failures-not-empty OK`.
+  - `scripts/redrive_dlq.sh` → `list-message-move-tasks` `COMPLETED 2 2`; loader logged `chunk_skipped reason "not loading"` for the failed batch.
+  - Ingest visibility restored to 720 (verified).
+- Honest notes: the first receive used 720 s because the queue attribute change had not propagated, so the drill took about 12 min. A second stray message (my first attempt, chunk_no 1 of 1, invalid) was redriven too and will cycle back into the DLQ after ~1 h, keeping the alarm in ALARM until purged or redriven out. Alarms have no notification target.
+- Rubric: Cloud Architecture (DLQ, alarm, redrive), Backend (failure bookkeeping).
+- Explain it back:
+  - Built: the loader fails the batch on the last allowed receive, names the chunk, and the DLQs are alarmed and redrivable.
+  - Why in the loader and not a DLQ consumer: no extra VPC function; a DLQ consumer would need its own role and ENIs to run one UPDATE.
+  - Q: Why not just leave the batch `loading` when a chunk dies? A: The UI would poll forever; `failed` plus the chunk number gives a visible, final state. A: it is also the only state `retrigger` and the funnel can reason about.
+  - Q: What if the DB is down on the last receive? A: The UPDATE cannot be recorded; `give_up_unrecorded` is logged, the message still goes to the DLQ and the alarm fires.
+  - Q: Does redrive fix a failed batch? A: No. `start_loading` refuses a failed batch, so redriven chunks are skipped; the file must be uploaded again.

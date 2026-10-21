@@ -123,6 +123,6 @@ These are not in the deployed system and are drawn nowhere above.
 | Workflow E, global error handler | T25 | TODO; A, B and C have no Error Workflow set |
 | Reusable Groq "LLM Gateway" sub-workflow | T26 | TODO; A and B call Groq with their own HTTP Request nodes |
 | Crawl change detection (skip Groq when criteria text is unchanged) | T29 | TODO; Workflow A calls Groq for every site each run |
-| CloudWatch alarm on `ingest-dlq` depth | T21 | TODO; the DLQ exists, nothing alerts on it |
+| CloudWatch alarm on `ingest-dlq` depth | T21 | Built and drilled: alarm, batch marked `failed` on the 5th receive, `scripts/redrive_dlq.sh` |
 | Transactional outbox for the n8n trigger | n/a | Production upgrade; `scripts/retrigger_batch.sh` is the recovery path |
 | API Gateway in front of the Function URLs, Multi-AZ RDS, Secrets Manager | n/a | Production upgrades only |

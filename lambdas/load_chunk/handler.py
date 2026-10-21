@@ -9,7 +9,8 @@ A message is acknowledged when its chunk loaded, was a duplicate delivery, belon
 is no longer loading, or can never load (control message, broken split, data the database
 refuses); in the last case the batch is marked failed. Database, network and S3 trouble is
 returned in `batchItemFailures`, so SQS retries only that message and moves it to ingest-dlq after
-5 receives. A failed n8n POST is logged and the message still acknowledged: a redelivery could not
+5 receives; on the fifth receive the batch is marked failed with the chunk number first. A failed
+n8n POST is logged and the message still acknowledged: a redelivery could not
 win the completion again, so retrying it would never re-send. Configuration is read on the first
 invocation, not at import.
 """
@@ -56,6 +57,7 @@ logger = logging.getLogger("load_chunk")
 PERMANENT_SQLSTATE_CLASSES = frozenset({"22", "23"})
 RETRYABLE_ERRORS = (DatabaseError, InterfaceError, OSError, ChunkUnavailableError)
 MAX_ERROR_LENGTH = 1000
+MAX_RECEIVES = 5
 
 
 @dataclass(frozen=True)
@@ -111,8 +113,31 @@ def handle_record(app: Runtime, record: dict[str, Any]) -> bool:
             batch_id=str(message.batch_id),
             error=f"{type(error).__name__}: {error}",
         )
+        if receive_count(record) >= MAX_RECEIVES:
+            give_up(app, message, f"{type(error).__name__}: {error}")
         return False
     return True
+
+
+def receive_count(record: dict[str, Any]) -> int:
+    return int(record.get("attributes", {}).get("ApproximateReceiveCount", 1))
+
+
+def give_up(app: Runtime, message: ChunkMessage | SplitFailure, cause: str) -> None:
+    """Fail the batch on the last receive, naming the chunk; the message then moves to the DLQ."""
+    chunk = getattr(message, "chunk_no", "control")
+    reason = f"chunk {chunk}: gave up after {MAX_RECEIVES} receives ({cause})"
+    try:
+        mark_failed(app, message.batch_id, reason)
+    except RETRYABLE_ERRORS as error:
+        app.database.reset()
+        log_event(
+            logger,
+            "give_up_unrecorded",
+            level=logging.ERROR,
+            batch_id=str(message.batch_id),
+            error=f"{type(error).__name__}: {error}",
+        )
 
 
 def process(app: Runtime, message: ChunkMessage | SplitFailure) -> str | None:

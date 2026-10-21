@@ -740,7 +740,7 @@ the per-function roles.
   silently, leaving the batch `pending` forever. `maximumRetryAttempts: 2`, `maximumEventAge: 3600` and an
   on-failure destination, the `split-failures` queue (kept apart from `ingest-dlq` because its records
   are Lambda invocation records, not chunk messages, and must never be redriven into `ingest`), make
-  that failure visible. T21 adds the alarm.
+  that failure visible. T21 added an alarm on each (see "DLQ handling (T21)").
 
 **SSM parameters and placeholders.** `${ssm:…}` is resolved at package time, so all four parameters
 must exist before `sls package`. `/clickpe/db/host` and `/clickpe/n8n/webhook_url` hold placeholders
@@ -795,7 +795,7 @@ chunk costs one wasted ranged GET, which is rare.
 |---|---|---|
 | Acknowledged | chunk loaded; duplicate delivery; batch already failed or finished | nothing more |
 | Acknowledged, batch `failed` | split control message; object replaced (`PreconditionFailed`), range invalid or short read; columns missing; chunk count differs from the stored one; the database refuses the data (SQLSTATE class 22 or 23) | `upload_batches.error` names the chunk and the reason; later chunks of that batch are skipped without reading S3 |
-| Retried (`batchItemFailures`) | connection, network, timeout, deadlock or other database errors; S3 throttling or unreachable; an unparseable message | SQS redelivers that message only; after 5 receives it moves to `ingest-dlq` (T21 turns that into a failed batch) |
+| Retried (`batchItemFailures`) | connection, network, timeout, deadlock or other database errors; S3 throttling or unreachable; an unparseable message | SQS redelivers that message only; after 5 receives it moves to `ingest-dlq` (on the 5th receive the loader first marks the batch `failed`, T21) |
 
 Rejected: retrying every error. A chunk whose bytes or data can never load would use all 5 receives
 (up to an hour with the 720 s visibility timeout) before the user sees a failure. Rejected: failing
@@ -1449,3 +1449,10 @@ and the stored outcome and reason equal the cached verdict for `(cohort_key, con
 **Measured (EC2 n8n, RDS, real SES sandbox).** Dry run, throwaway batch of 2 synthetic users: release path, 0 sent (execution 82). Live, same batch: 2 SES message ids, 3 matches marked, marks 1.22 s apart, batch `notified` (execution 84). Same batch set back to `matched` and run again: 0 waiting, 0 sent, `Finish` straight from `Send · Anything to send?` (execution 86). Unverified-sender drill: batch `failed` with the message, match still unnotified, execution `error` (execution 88). Real 10,000-user sample batch, cap 5: 5 emails (SES node 181 to 412 ms each, mark 14 to 33 ms), 10 matches marked, 6,012 users still waiting, batch `notified`, 8.4 s for the whole execution (execution 90). Local: 29 new tests; 17 mutation probes on the exported workflow each fail at least one test.
 
 **Deliverability (observed).** The emails reach the Gmail test mailbox but Gmail files them in Spam (user screenshot, `docs/screenshots/t39-gmail-drill-email-in-spam.png`). Likely cause, not verified from the headers: the sender is a `@gmail.com` address sent through SES, so the message is not DKIM-signed for `gmail.com` and fails DMARC alignment. Production fix: an SES domain identity on an owned domain with Easy DKIM, SPF through a custom MAIL FROM domain and a DMARC record. Designed, not implemented (no domain in this project).
+
+## DLQ handling (T21)
+
+- **Where the batch is failed:** `loadChunk` itself, on the fifth receive (`MAX_RECEIVES`, pinned equal to `maxReceiveCount` by `tests/unit/test_dlq_config.py`). Rejected alternative: a Lambda consuming `ingest-dlq`, which needs another VPC function, role and ENI cost just to run one UPDATE. If the database is the thing that is down, the UPDATE cannot be recorded; this is logged as `give_up_unrecorded` and the DLQ alarm is the only signal.
+- **Alarms:** `ApproximateNumberOfMessagesVisible > 0` on `ingest-dlq` and `split-failures`, 60 s period. They have no SNS action, so they show in the console and `describe-alarms` but nobody is paged; that is stated in the README.
+- **Redrive:** `scripts/redrive_dlq.sh` uses `sqs start-message-move-task`. It cannot revive a failed batch (`start_loading` refuses it, the chunk is logged `chunk_skipped` and acknowledged), so it helps only when the batch is still `loading`, for example after a transient outage that did not exhaust the other chunks.
+- **Finding from the drill:** the loader role has `s3:GetObject` but no `s3:ListBucket`, so S3 answers a missing key with `AccessDenied`, which the loader treats as retryable, not `NoSuchKey`. A replaced or deleted object therefore burns five receives before failing the batch instead of failing at once. Granting ListBucket on `uploads/*` would fix that; not done, recorded here.

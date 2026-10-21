@@ -155,6 +155,41 @@ def test_transient_problems_are_retried_and_drop_the_connection(
     assert conn.closed
 
 
+def event_received(count: int, body: str) -> dict[str, Any]:
+    attributes = {"ApproximateReceiveCount": str(count)}
+    record = {"messageId": "m0", "body": body, "attributes": attributes}
+    return {"Records": [record]}
+
+
+def test_last_receive_fails_the_batch_naming_the_chunk_and_still_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = install(monkeypatch, raising(OSError("timed out")))
+
+    result = module.handler(event_received(module.MAX_RECEIVES, encode_message(CHUNK)), None)
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m0"}]}
+    assert conn.failed[0]["id"] == BATCH
+    assert conn.failed[0]["error"] == "chunk 2: gave up after 5 receives (OSError: timed out)"
+
+
+def test_earlier_receives_do_not_fail_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = install(monkeypatch, raising(OSError("timed out")))
+    module.handler(event_received(module.MAX_RECEIVES - 1, encode_message(CHUNK)), None)
+    assert conn.failed == []
+
+
+def test_last_receive_survives_a_database_that_cannot_record_the_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = FailConnection(fail_with=InterfaceError("network error"))
+    install(monkeypatch, raising(OSError("timed out")), conn)
+
+    result = module.handler(event_received(module.MAX_RECEIVES, encode_message(CHUNK)), None)
+
+    assert result == {"batchItemFailures": [{"itemIdentifier": "m0"}]}
+
+
 def test_failing_to_record_the_failure_retries_the_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

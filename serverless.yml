@@ -232,6 +232,40 @@ resources:
           deadLetterTargetArn: !GetAtt IngestDlq.Arn
           maxReceiveCount: 5
 
+    IngestDlqNotEmptyAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-ingest-dlq-not-empty
+        AlarmDescription: A chunk message exhausted its receives; redrive with scripts/redrive_dlq.sh
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt IngestDlq.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+
+    SplitFailuresNotEmptyAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-split-failures-not-empty
+        AlarmDescription: splitCsv failed asynchronously and its event was parked here
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt SplitFailuresQueue.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+
     S3GatewayEndpoint:
       Type: AWS::EC2::VPCEndpoint
       Properties:
