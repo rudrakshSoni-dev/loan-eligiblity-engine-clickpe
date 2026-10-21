@@ -40,6 +40,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 26. [Product storage and lifecycle: one statement per site, retire by run history](#product-storage-and-lifecycle-one-statement-per-site-retire-by-run-history)
 27. [Workflow B entry: claim, count and record in one statement](#workflow-b-entry-claim-count-and-record-in-one-statement)
 28. [Workflow B Stage 1: SQL pre-filter that keeps near misses](#workflow-b-stage-1-sql-pre-filter-that-keeps-near-misses)
+29. [Workflow B Stage 2: rule cards in code, classification in SQL](#workflow-b-stage-2-rule-cards-in-code-classification-in-sql)
 
 ---
 
@@ -1195,3 +1196,90 @@ not a Stage 1 one, and is recorded rather than changed silently here.
 - *Pairs as n8n items*: simplest for T34's Code node; does not scale on this instance (above).
 - *Dropping the `user_id` / `product_id` foreign keys* to save about 0.27 s per 14k rows: integrity and
   cascading cleanup are worth more than that at this scale.
+
+## Workflow B Stage 2: rule cards in code, classification in SQL
+
+**Choice (T34, four decisions approved by the user).** A Code node turns each product into a *rule card*;
+one set-based `UPDATE` applies the cards to every pair Stage 1 left in `match_candidates`. Each pair becomes
+`clear_match`, `clear_reject` or `borderline`. n8n handles 3 items (one per product), never the 14,165 pairs.
+
+| Rule | Applies to | Result |
+|---|---|---|
+| Indicative EMI above 65% of monthly income | any pair whose product publishes a rate | `clear_reject` |
+| Strict pass (no near miss) | every product | `clear_match`, with the EMI or "affordability not checked" in the reason |
+| Near miss, product `parse_confidence` ≥ 0.70 | fully structured products | `clear_reject`: the threshold is applied as written, no LLM |
+| Near miss, product `parse_confidence` < 0.70 | partly structured products | `borderline`, tagged for Stage 3 |
+
+1. **Low confidence makes only near misses borderline (decision A).** ICICI's and HDFC's confidence is capped at
+   0.60 because their pages add work-experience and employer-type conditions, and the CSV has no such columns.
+   An LLM cannot judge a user's work history from income, score, age and employment either, so sending their
+   strict passes to Stage 3 would spend tokens confirming what the columns already say (about 8,486 borderline
+   pairs instead of 2,221). Their strict passes become `clear_match`, and the reason says the result is
+   indicative and the lender's full conditions still apply.
+2. **Skip-LLM rule at 0.70 (decision B).** IDFC FIRST is the one fully structured product, and its page words
+   the score floor firmly ("You should have a CIBIL Score of 710 or above"), so its near misses are rejected
+   without the LLM. ICICI ("700 and above is preferred") and HDFC ("above 720 is ideal") keep theirs for Stage 3.
+   `parse_confidence` is a `real`; the load query rounds it to 2 decimals before the comparison, because 0.7
+   stored as `real` is 0.699999988 and fails `>= 0.7` in SQL (found when an independent cross-check disagreed
+   on all 1,539 IDFC near misses; a test now pins the cutoff edge).
+3. **EMI assumption (decision C).** ₹5,00,000 over 60 months, the top of IDFC FIRST's published EMI calculator
+   range ("loans from ₹1 lakh to ₹5 lakh over 24 to 60 months"), at the product's top published rate, else its
+   starting rate. Cap: EMI up to 65% of income, from BankBazaar's published guidance (see "Matching and the
+   Optimization Treasure Hunt"). A product with no published rate is marked "affordability not checked"; no
+   fallback rate is invented. Using IDFC's *starting* rate is optimistic, but it changes no verdict on this data:
+   the lowest income in the sample is ₹25,000, and the EMI would need a rate above **30.24% p.a.** to exceed
+   65% of it (₹16,250); at 9.99% it is ₹10,621.06. So the EMI rule rejects **0 pairs** on the sample, which is
+   reported as measured, not tuned away. It stays because a product with a published high rate, or a low-income
+   batch, would trigger it (a test with a 40% product rejects ₹1 below the affordable income and accepts at it).
+4. **No "within 5% above a threshold" borderline (decision D).** Passing a stated threshold is not ambiguous;
+   the ambiguous side, within 5% below, is already Stage 1's near miss.
+
+**What Stage 3 receives.** Every borderline pair carries `borderline_reason` (`near_miss:<criteria>`, sorted and
+joined with `+`), `trigger_feature` (`credit_score` when a score criterion was missed, else `monthly_income`) and
+`trigger_value` (the user's value). These are the cohort key fields from "Matching and the Optimization Treasure
+Hunt"; T35 adds the band and employment. Every pair also gets a readable `stage2_reason`, for example
+"Near miss: credit score 690 vs minimum 700. The product is only partly structured (parse confidence 0.60), so
+Stage 3 judges the lender's wording."
+
+**Completeness is enforced by the database.** Migration `0003` adds a CHECK that
+`stage2_clear + stage2_borderline + stage2_reject = stage1_pairs`. A pair the cards did not cover stays
+unclassified, the record node violates the CHECK, and the run fails instead of quietly losing pairs (tested by
+dropping one card).
+
+**Idempotent, so Retry On Fail again.** The `UPDATE` skips pairs whose six Stage 2 columns already hold the
+computed values (`IS DISTINCT FROM`), the counts are read from the table, and the first `stage2` time is kept.
+
+**Measured (2026-10-21, RDS PostgreSQL 16.9, sample batch `9d278e88…`, run 10, n8n 2.44.4).**
+
+| Product | Confidence | `clear_match` | `clear_reject` | `borderline` |
+|---|---|---|---|---|
+| ICICI Bank (11) | 0.60 | 4,425 | 0 | 1,478 (score 1,436 · income 29 · both 13) |
+| HDFC Bank (12) | 0.60 | 1,840 | 0 | 743 (score) |
+| IDFC FIRST Bank (13) | 0.70 | 4,140 | 1,539 | 0 |
+| **Total** (of 14,165) | | **10,405** | **1,539** | **2,221** |
+
+`stage_ms`: `{"stage1": 558, "stage2": 625}`. An independent query that classifies from `near_miss_criteria` and
+the product's rounded confidence agrees on 14,165 of 14,165 pairs. Borderline trigger values: 11 distinct credit
+scores (665–715) and 1 income (₹29,000), so T35's cohorts will be few. Re-running the Stage 2 statements for run 10
+on RDS updated 0 pairs, returned the same counts and kept `stage2 = 625` although it was given a start time in the
+year 2000.
+
+**Failure branch.** Same pattern as Stage 1: `Fail · Mark batch failed (Stage 2)` moves `matching → failed` with
+`matching stage 2 failed: <message>` and closes the run. Drill with a throwaway copy (`t34faildrill01`, Classify
+replaced by `SELECT 1/0`) on a throwaway empty batch: webhook 202, batch `failed` with
+`matching stage 2 failed: division by zero`, run closed after 4,196 ms (3 tries, 2 s apart), Stage 2 counts NULL.
+The drill batch and its run were deleted afterwards and the drill workflow unpublished (path 404).
+
+**Rejected.**
+- *All pairs of low-confidence products borderline* (the literal spec): about 8,486 borderline pairs whose open
+  questions (work history, employer) no model can answer from this data.
+- *Rules as SQL only*: the EMI arithmetic and the per-product policy read better and test more directly as a
+  small function; SQL keeps the per-pair work set-based.
+- *Pairs as n8n items*: same reason as Stage 1.
+- *A fallback interest rate for products that publish none*: it would be a number with no source.
+
+**Known gap.** ICICI requires self-employed applicants to be 23 or older, but Workflow A stored the loosest bound
+(18), so 110 ICICI candidate pairs (run 7) are self-employed 22-year-olds, and those that pass strictly become
+`clear_match`. The fix belongs in
+Workflow A (per-employment age fields), not in a Stage 2 special case.
+

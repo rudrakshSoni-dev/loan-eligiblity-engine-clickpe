@@ -14,8 +14,8 @@
           -140
         ],
         "parameters": {
-          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates` and the Stage 1 counts in `pipeline_runs`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
-          "height": 860,
+          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates`, each classified by Stage 2, and the Stage 1 and Stage 2 counts in `pipeline_runs`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n6. `Stage 2 · Load product rules` returns one item: the products that have candidates in this run (confidence and published rates) and the Stage 2 start time.\n7. `Stage 2 · Build rule cards` (Code) turns each product into a rule card: products with `parse_confidence` >= 0.7 are fully structured, so their near misses are `clear_reject`; below 0.7 the near misses are `borderline` for Stage 3. It also computes an indicative EMI for Rs 5,00,000 over 60 months at the product's top published rate (else its starting rate; no rate = affordability not checked) and the 65%-of-income affordability cap.\n8. `Stage 2 · Classify pairs` applies the cards to every pair in one set-based UPDATE: unaffordable EMI -> `clear_reject`; strict pass -> `clear_match`; near miss -> the card's policy. Borderline pairs get `borderline_reason` (`near_miss:<criteria>`) and the triggering feature and value, which Stage 3 uses as its cohort key. Every pair gets a readable `stage2_reason`.\n9. `Record · Stage 2 funnel` stores `stage2_clear` / `stage2_borderline` / `stage2_reject` and `stage_ms.stage2`. A CHECK requires the three to add up to `stage1_pairs`, so a pair left unclassified fails the run instead of disappearing.\n\nStage 2 nodes are idempotent too (unchanged pairs are not rewritten; the first `stage2` time is kept), so they also use Retry On Fail; any error marks the batch `failed` with `matching stage 2 failed: <message>`.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
+          "height": 1260,
           "width": 820,
           "color": 4
         }
@@ -295,6 +295,124 @@
             "name": "rds-postgres"
           }
         }
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT $1::bigint::text AS run_id, $2::uuid::text AS batch_id,\n       statement_timestamp() AS stage2_started_at,\n       coalesce(jsonb_agg(jsonb_build_object(\n         'product_id', p.id,\n         'parse_confidence', round(p.parse_confidence::numeric, 2),\n         'interest_rate_min', p.interest_rate_min,\n         'interest_rate_max', p.interest_rate_max\n       ) ORDER BY p.id), '[]'::jsonb) AS products\nFROM loan_products p\nWHERE p.id IN (SELECT DISTINCT product_id FROM match_candidates WHERE run_id = $1::bigint)",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000014",
+        "name": "Stage 2 · Load product rules",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2620,
+          -160
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "jsCode": "const HIGH_CONFIDENCE_CUTOFF = 0.7;\nconst AFFORDABILITY_CAP = 0.65;\nconst INDICATIVE_LOAN_RUPEES = 500000;\nconst INDICATIVE_TENURE_MONTHS = 60;\n\nfunction rupees(amount) {\n  return '₹' + Math.round(amount).toLocaleString('en-IN');\n}\n\nfunction monthlyEmi(principal, annualRatePct, months) {\n  const monthlyRate = annualRatePct / 1200;\n  if (monthlyRate === 0) {\n    return principal / months;\n  }\n  const growth = (1 + monthlyRate) ** months;\n  return (principal * monthlyRate * growth) / (growth - 1);\n}\n\nfunction publishedRate(product) {\n  if (product.interest_rate_max !== null && product.interest_rate_max !== undefined) {\n    return { pct: Number(product.interest_rate_max), basis: 'top published rate' };\n  }\n  if (product.interest_rate_min !== null && product.interest_rate_min !== undefined) {\n    return { pct: Number(product.interest_rate_min), basis: 'published starting rate' };\n  }\n  return null;\n}\n\nfunction affordability(product) {\n  const rate = publishedRate(product);\n  if (rate === null) {\n    return { indicative_emi: null, emi_note: null };\n  }\n  const emi = Math.round(monthlyEmi(INDICATIVE_LOAN_RUPEES, rate.pct, INDICATIVE_TENURE_MONTHS) * 100) / 100;\n  return {\n    indicative_emi: emi,\n    emi_note: `indicative EMI ${rupees(emi)} for ${rupees(INDICATIVE_LOAN_RUPEES)} over ${INDICATIVE_TENURE_MONTHS} months at the ${rate.basis} of ${rate.pct}% p.a.`,\n  };\n}\n\nfunction ruleCard(product) {\n  const confidence = product.parse_confidence === null ? 0 : Number(product.parse_confidence);\n  const fullyStructured = confidence >= HIGH_CONFIDENCE_CUTOFF;\n  return {\n    product_id: Number(product.product_id),\n    parse_confidence: confidence,\n    near_miss_policy: fullyStructured ? 'clear_reject' : 'borderline',\n    affordability_cap: AFFORDABILITY_CAP,\n    ...affordability(product),\n    conditions_note: fullyStructured\n      ? null\n      : `The lender's criteria are only partly captured in structured fields (parse confidence ${confidence.toFixed(2)}), so this is indicative; the lender's full conditions still apply.`,\n  };\n}\n\nconst run = $input.first().json;\n\nreturn [\n  {\n    json: {\n      run_id: run.run_id,\n      batch_id: run.batch_id,\n      stage2_started_at: run.stage2_started_at,\n      cards: (run.products || []).map(ruleCard),\n    },\n  },\n];"
+        },
+        "id": "b0000000-0000-4000-8000-000000000015",
+        "name": "Stage 2 · Build rule cards",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2860,
+          -160
+        ],
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH cards AS (\n  SELECT *\n  FROM jsonb_to_recordset($3::jsonb) AS c(\n    product_id integer, parse_confidence numeric, near_miss_policy text,\n    affordability_cap numeric, indicative_emi numeric, emi_note text, conditions_note text)\n),\njudged AS (\n  SELECT m.user_id, m.product_id, u.monthly_income, u.credit_score,\n         c.near_miss_policy, c.affordability_cap, c.indicative_emi, c.emi_note,\n         c.conditions_note, c.parse_confidence,\n         c.indicative_emi > u.monthly_income * c.affordability_cap AS unaffordable,\n         array_to_string(ARRAY(SELECT unnest(m.near_miss_criteria) ORDER BY 1), '+') AS missed,\n         array_to_string(array_remove(ARRAY[\n           CASE WHEN 'min_credit_score' = ANY (m.near_miss_criteria)\n                THEN format('credit score %s vs minimum %s', u.credit_score, p.min_credit_score) END,\n           CASE WHEN 'max_credit_score' = ANY (m.near_miss_criteria)\n                THEN format('credit score %s vs maximum %s', u.credit_score, p.max_credit_score) END,\n           CASE WHEN 'min_monthly_income' = ANY (m.near_miss_criteria)\n                THEN format('monthly income ₹%s vs minimum ₹%s',\n                            to_char(u.monthly_income, 'FM99,99,99,990'),\n                            to_char(p.min_monthly_income, 'FM99,99,99,990')) END\n         ], NULL), ' and ') AS missed_detail\n  FROM match_candidates m\n  JOIN users u ON u.user_id = m.user_id\n  JOIN loan_products p ON p.id = m.product_id\n  JOIN cards c ON c.product_id = m.product_id\n  WHERE m.run_id = $1::bigint\n),\nclassified AS (\n  SELECT *,\n         CASE WHEN unaffordable THEN 'clear_reject'\n              WHEN missed = '' THEN 'clear_match'\n              ELSE near_miss_policy END AS stage2_class,\n         CASE WHEN missed LIKE '%credit_score%' THEN 'credit_score' ELSE 'monthly_income' END\n           AS missed_feature\n  FROM judged\n),\noutcomes AS (\n  SELECT user_id, product_id, indicative_emi, stage2_class,\n         CASE WHEN stage2_class = 'borderline' THEN 'near_miss:' || missed END AS borderline_reason,\n         CASE WHEN stage2_class = 'borderline' THEN missed_feature END AS trigger_feature,\n         CASE WHEN stage2_class = 'borderline'\n              THEN CASE missed_feature WHEN 'credit_score' THEN credit_score ELSE monthly_income END\n         END AS trigger_value,\n         CASE\n           WHEN unaffordable THEN format('Not affordable: the %s is above %s%% of the monthly income of ₹%s.',\n                                         emi_note, round(affordability_cap * 100),\n                                         to_char(monthly_income, 'FM99,99,99,990'))\n           WHEN stage2_class = 'clear_match' THEN concat_ws(' ', 'Meets every listed criterion.',\n                                           CASE WHEN emi_note IS NULL\n                                                THEN 'Affordability not checked: the lender publishes no interest rate.'\n                                                ELSE format('Affordable: the %s is within %s%% of income.',\n                                                            emi_note, round(affordability_cap * 100)) END,\n                                           conditions_note)\n           WHEN stage2_class = 'clear_reject'\n             THEN format('Below the stated threshold: %s. The product is fully structured (parse confidence %s), so the threshold is applied as written.',\n                         missed_detail, to_char(parse_confidence, 'FM0.00'))\n           ELSE format('Near miss: %s. The product is only partly structured (parse confidence %s), so Stage 3 judges the lender''s wording.',\n                       missed_detail, to_char(parse_confidence, 'FM0.00'))\n         END AS stage2_reason\n  FROM classified\n),\nupdated AS (\n  UPDATE match_candidates m\n  SET stage2_class = k.stage2_class,\n      borderline_reason = k.borderline_reason,\n      trigger_feature = k.trigger_feature,\n      trigger_value = k.trigger_value,\n      indicative_emi = k.indicative_emi,\n      stage2_reason = k.stage2_reason\n  FROM outcomes k\n  WHERE m.run_id = $1::bigint AND m.user_id = k.user_id AND m.product_id = k.product_id\n    AND (m.stage2_class, m.borderline_reason, m.trigger_feature, m.trigger_value,\n         m.indicative_emi, m.stage2_reason)\n        IS DISTINCT FROM (k.stage2_class, k.borderline_reason, k.trigger_feature, k.trigger_value,\n                          k.indicative_emi, k.stage2_reason)\n  RETURNING 1\n)\nSELECT $1::bigint::text AS run_id, $2::uuid::text AS batch_id,\n       (SELECT count(*) FROM updated) AS classified_now,\n       $4::timestamptz AS stage2_started_at",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id, JSON.stringify($json.cards), $json.stage2_started_at] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000016",
+        "name": "Stage 2 · Classify pairs",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          3100,
+          -160
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "UPDATE pipeline_runs r\nSET stage2_clear = c.clear_match,\n    stage2_borderline = c.borderline,\n    stage2_reject = c.clear_reject,\n    stage_ms = CASE WHEN r.stage_ms ? 'stage2' THEN r.stage_ms\n               ELSE r.stage_ms || jsonb_build_object(\n                 'stage2', round(extract(epoch FROM clock_timestamp() - $3::timestamptz) * 1000)::int)\n               END\nFROM (\n  SELECT count(*) FILTER (WHERE stage2_class = 'clear_match') AS clear_match,\n         count(*) FILTER (WHERE stage2_class = 'borderline') AS borderline,\n         count(*) FILTER (WHERE stage2_class = 'clear_reject') AS clear_reject\n  FROM match_candidates\n  WHERE run_id = $1::bigint\n) c\nWHERE r.id = $1::bigint AND r.batch_id = $2::uuid\nRETURNING r.id::text AS run_id, r.batch_id::text AS batch_id, r.stage1_pairs,\n          r.stage2_clear, r.stage2_borderline, r.stage2_reject,\n          (r.stage_ms ->> 'stage2')::int AS stage2_ms",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id, $json.stage2_started_at] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000017",
+        "name": "Record · Stage 2 funnel",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          3340,
+          -260
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH failed AS (\n  UPDATE upload_batches\n  SET status = 'failed', error = left('matching stage 2 failed: ' || $3, 1000)\n  WHERE id = $2::uuid AND status = 'matching'\n  RETURNING id\n)\nUPDATE pipeline_runs r\nSET finished_at = now()\nFROM failed f\nWHERE r.id = $1::bigint AND r.batch_id = f.id AND r.finished_at IS NULL\nRETURNING r.id::text AS run_id, f.id::text AS batch_id",
+          "options": {
+            "queryReplacement": "={{ [$('Claim · processed to matching + create run').first().json.run_id, $('Claim · processed to matching + create run').first().json.batch_id, String($json.error?.message ?? $json.message ?? $json.error ?? 'unknown error')] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000018",
+        "name": "Fail · Mark batch failed (Stage 2)",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          3580,
+          60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        }
       }
     ],
     "connections": {
@@ -405,10 +523,82 @@
       },
       "Record · Stage 1 funnel": {
         "main": [
-          [],
+          [
+            {
+              "node": "Stage 2 · Load product rules",
+              "type": "main",
+              "index": 0
+            }
+          ],
           [
             {
               "node": "Fail · Mark batch failed (Stage 1)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Stage 2 · Load product rules": {
+        "main": [
+          [
+            {
+              "node": "Stage 2 · Build rule cards",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 2)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Stage 2 · Build rule cards": {
+        "main": [
+          [
+            {
+              "node": "Stage 2 · Classify pairs",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 2)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Stage 2 · Classify pairs": {
+        "main": [
+          [
+            {
+              "node": "Record · Stage 2 funnel",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 2)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Record · Stage 2 funnel": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 2)",
               "type": "main",
               "index": 0
             }

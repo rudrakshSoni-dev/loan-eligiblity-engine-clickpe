@@ -145,3 +145,11 @@ database until the owner account exists to delete it in the editor.
 published, called once from the instance (claim 202, Stage 1 retried 3 times in 4,047 ms, batch set `failed`),
 then unpublished with `docker exec n8n n8n unpublish:workflow --id=t33faildrill01` and a restart; the path then
 answers 404. Like the earlier probes it stays inactive in the n8n database until it is deleted in the editor.
+
+## Stage 2 drill (T34)
+
+`t34faildrill01` is a copy of Workflow B on path `t34-fail-drill` whose `Stage 2 · Classify pairs` query is
+`SELECT 1/0`. It was published, called once from the instance with a throwaway empty batch in `processed`
+(202, batch `failed` with `matching stage 2 failed: division by zero`), then unpublished with a restart; the path
+answers 404. The throwaway batch and its run row were deleted. Like the earlier probes the workflow stays
+inactive in the n8n database until it is deleted in the editor.

@@ -38,6 +38,7 @@ DB_DIR = Path(__file__).resolve().parent
 MIGRATIONS: tuple[tuple[str, Path], ...] = (
     ("0001_schema", DB_DIR / "schema.sql"),
     ("0002_match_candidates", DB_DIR / "0002_match_candidates.sql"),
+    ("0003_stage2_rules", DB_DIR / "0003_stage2_rules.sql"),
 )
 
 SEED_FILE = DB_DIR / "seed_products.sql"

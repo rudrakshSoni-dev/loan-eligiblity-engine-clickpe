@@ -1,24 +1,24 @@
-"""Workflow B Stage 1 on real PostgreSQL 16, running the exact SQL stored in the workflow JSON.
+"""Workflow B Stage 1 on real PostgreSQL 16, running the exact SQL stored in the workflow JSON."""
 
-The statements are read from n8n/workflows/workflow-b-matching.json, so a change made in the
-n8n editor and exported is what these tests check. n8n passes positional parameters ($1, $2,
-$3); the tests bind the same values by name.
-"""
-
-import json
 import os
-import re
 import uuid
 from collections.abc import Callable
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tests.workflow_b_helpers import (
+    add_product,
+    add_user,
+    new_batch,
+    new_run,
+    node_query,
+    single_row,
+)
+
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
-WORKFLOW = Path(__file__).resolve().parents[2] / "n8n" / "workflows" / "workflow-b-matching.json"
 STAGE1_NODE = "Stage 1 · SQL pre-filter"
 RECORD_NODE = "Record · Stage 1 funnel"
 FAIL_NODE = "Fail · Mark batch failed (Stage 1)"
@@ -28,73 +28,6 @@ FAIL_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":message"}
 
 STRICT = "strict"
 EXCLUDED = "excluded"
-
-
-def node_query(name: str, placeholders: dict[str, str]) -> str:
-    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))[0]
-    query: str = next(n for n in workflow["nodes"] if n["name"] == name)["parameters"]["query"]
-    return re.sub(r"\$\d+", lambda m: placeholders[m.group(0)], query)
-
-
-def new_batch(conn: Any, status: str = "matching") -> uuid.UUID:
-    batch_id = uuid.uuid4()
-    conn.run(
-        "INSERT INTO upload_batches (id, s3_key, status) VALUES (:id, :key, :status)",
-        id=batch_id,
-        key=f"uploads/{batch_id}.csv",
-        status=status,
-    )
-    return batch_id
-
-
-def new_run(conn: Any, batch_id: uuid.UUID) -> int:
-    rows = conn.run(
-        "INSERT INTO pipeline_runs (batch_id, total_pairs) VALUES (:id, 0) RETURNING id",
-        id=batch_id,
-    )
-    return int(rows[0][0])
-
-
-def add_user(
-    conn: Any,
-    batch_id: uuid.UUID,
-    income: int,
-    score: int,
-    age: int = 30,
-    employment: str = "Salaried",
-) -> uuid.UUID:
-    user_id = uuid.uuid4()
-    conn.run(
-        "INSERT INTO users (user_id, name, email, monthly_income, credit_score,"
-        " employment_status, age, batch_id) VALUES (:id, 'T', 't@example.invalid', :income,"
-        " :score, :employment, :age, :batch)",
-        id=user_id,
-        income=Decimal(income),
-        score=score,
-        employment=employment,
-        age=age,
-        batch=batch_id,
-    )
-    return user_id
-
-
-def add_product(conn: Any, name: str, active: bool = True, **criteria: Any) -> int:
-    columns = ["source", "product_name", "active", *criteria]
-    values = [":source", ":name", ":active", *(f":{c}" for c in criteria)]
-    rows = conn.run(
-        f"INSERT INTO loan_products ({', '.join(columns)}) VALUES ({', '.join(values)})"
-        " RETURNING id",
-        source="test",
-        name=name,
-        active=active,
-        **criteria,
-    )
-    return int(rows[0][0])
-
-
-def single_row(conn: Any, rows: list[list[Any]]) -> dict[str, Any]:
-    assert len(rows) == 1
-    return dict(zip([c["name"] for c in conn.columns], rows[0], strict=True))
 
 
 def run_stage1(conn: Any, run_id: int, batch_id: uuid.UUID) -> dict[str, Any]:
