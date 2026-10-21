@@ -36,6 +36,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 22. [Chunk loader: outcomes, limits and sizing](#chunk-loader-outcomes-limits-and-sizing)
 23. [First deployment (T22): measured results and one shortcut](#first-deployment-t22-measured-results-and-one-shortcut)
 24. [Completion trigger: one POST from the winner](#completion-trigger-one-post-from-the-winner)
+25. [Product structuring: strict schema, then distrust the answer](#product-structuring-strict-schema-then-distrust-the-answer)
 
 ---
 
@@ -912,3 +913,83 @@ mismatch):
 `X-Webhook-Secret` lands in execution data on the n8n volume (the same instance and trust boundary as the
 encryption key; pruned after 168 h). A Header Auth credential does not change this. T32 decides how
 Workflow B avoids keeping it.
+
+## Product structuring: strict schema, then distrust the answer
+
+**Choice (T30).** Workflow A sends each lender's normalised criteria lines to Groq `openai/gpt-oss-120b`
+with a strict JSON-schema response (`temperature 0`, `reasoning_effort low`, `include_reasoning false`,
+`max_completion_tokens 1000`) through a direct HTTP Request node. T26's LLM Gateway is not built; when it
+is, the HTTP node is replaced by an Execute Workflow call and the `Route` node keeps its three outputs.
+The schema has nine required fields, all nullable except one boolean, named after `loan_products` columns.
+The model's answer is then re-checked in a Code node (`Coerce · Validate product`), because a schema
+guarantees the shape, not the truth:
+
+- units are coerced (`₹25,000/month`, `9.99% p.a.`, `0.3 lakh`, `60 years` become plain numbers) and
+  ranges are enforced: the database CHECK ranges, plus a plausibility floor of ₹1,000 monthly income;
+- minimum ≤ maximum for age, score and rate; employment limited to the three canonical values, never an
+  empty list (an empty array matches nobody, so the schema forbids it);
+- **grounding:** every extracted number must occur in the source text (digits, with `,` grouping and
+  `k` / `lakh` / `crore` expansions). An ungrounded number rejects the product; it is never set to NULL,
+  because a NULL criterion means "unconstrained" and would silently widen eligibility;
+- `parse_confidence` is computed from completeness, not asked of the model: weights income 0.30,
+  credit score 0.25, age 0.20, interest rate 0.15, employment 0.10; capped at 0.60 when the model sets
+  `has_conditional_criteria` (thresholds that differ by employment type, work-experience or employer
+  conditions the columns cannot hold). Where thresholds conflict the model is told to use the loosest bound,
+  so Stage 1 never drops a user who might qualify; Stage 2 (T34) treats low confidence as "borderline".
+
+Anything that fails (HTTP 429, any other HTTP error, network error, truncated or non-JSON content,
+schema or range violation, ungrounded number, no criteria found, fetch failure) is written to `crawl_runs`
+with status `failed` and the reason, and never reaches `loan_products`. Every Groq call, successful or not,
+is written to `llm_calls` (purpose `crawl_structuring`, tokens, server-side latency).
+
+**Rejected.**
+- *Asking the model for a confidence score.* Self-reported confidence is uncalibrated; completeness of the
+  extracted fields is something the next stage can reason about and a reviewer can recompute.
+- *Letting the model convert or infer* (annual to monthly income, "preferred" to a softer score). The prompt
+  forbids it; conversions that matter happen in code where they can be tested.
+- *n8n's Information Extractor / AI Agent nodes.* No strict schema, no status-code branching, no control
+  over the 429 path (see "LLM provider: Groq").
+- *Retry On Fail on the two Postgres write nodes.* See the finding below.
+
+**Measured (2026-10-21, n8n on the EC2 instance, real Groq calls).** Execution 27, the three primary lenders:
+
+| Lender | Income | Score | Age | Rate | Employment | Conditional | `parse_confidence` | Prompt / completion tokens | Server latency |
+|---|---|---|---|---|---|---|---|---|---|
+| ICICI Bank | 30,000 | ≥ 700 | 18–65 | NULL | Salaried, Self-Employed | yes | 0.60 | 1,562 / 264 | 612 ms |
+| HDFC Bank | 25,000 | ≥ 720 | 21–60 | NULL | Salaried | yes | 0.60 | 979 / 259 | 570 ms |
+| IDFC FIRST | NULL | ≥ 710 | 21–60 | from 9.99 | Salaried, Self-Employed | no | 0.70 | 652 / 196 | 434 ms |
+
+ICICI's own page gives contradictory ages (18, 23, "18 to 58", a tenure limit of 65); the loosest bound
+and `conditional = yes` is the honest result. Three calls, 3,193 prompt and 719 completion tokens in total.
+The extracted text hashes identically across three executions (15, 17, 27), which is what T29 relies on.
+
+**Drills (real API responses, each leaves the other lenders untouched).**
+
+| Drill | What happened | Where it ended |
+|---|---|---|
+| Wrong credential (found, not planned) | `groq-api` held the bare key, Groq answered 401 for all three | `Mark · Groq call failed` → `crawl_runs`, `llm_calls` status 401 |
+| `max_completion_tokens` 30 | Groq answers **HTTP 400** when a strict-schema reply is cut off, not a 200 with `finish_reason=length` | `Mark · Groq call failed` → `crawl_runs`, `llm_calls` status 400 |
+| ICICI forced to return `min_credit_score 1200`, `min_age 60 > max_age 21`, employment `Student`, income 45,000 | HTTP 200, schema bypassed with JSON mode | `Coerce` rejected with 7 reasons; `Check · Product valid` 2 true / 1 false; HDFC and IDFC structured |
+| Criteria text repeated 14× per prompt | First call (4,213 prompt tokens) 200, second (7,053 requested) **HTTP 429**, `retry-after` 21 s: "TPM limit 8000, used 3725, requested 7053" | `Mark · Groq rate limited` → `crawl_runs` with Groq's message |
+
+Also exercised locally against 17 fixture answers (unit strings, ranges as strings, out-of-range, ungrounded,
+min > max, fractional age, unknown group, empty array, all NULL, non-JSON, truncated, missing key, array
+instead of object, no choices): each is accepted or rejected as designed.
+
+**Findings worth knowing.**
+- **Retry On Fail re-ran a successful INSERT.** On n8n 2.44.4, the `crawl_runs` insert node with Retry On Fail
+  (3 tries, 5 s) executed three times on success (ids 1–3, 4–6, 7–9 in `crawl_runs`, five seconds apart), so
+  every failure was logged three times; the same query with retry off ran once (27 ms). The `llm_calls`
+  insert with identical retry settings ran once. The cause was not isolated. Both Postgres write nodes now
+  have no retry: a database error fails loudly (and, once T25 exists, alerts through Workflow E) instead of
+  risking a duplicate write. Retry On Fail stays only on the HTTP calls (network errors).
+- `usage.completion_tokens` from gpt-oss includes hidden reasoning (a probe showed 129 of 234 completion
+  tokens were reasoning), so `llm_calls.completion_tokens` is what Groq bills. Groq also returns
+  `usage.total_time` in seconds, which is stored as server-side latency (n8n exposes no request timing).
+  `prompt_tokens` for the identical ICICI prompt was 794 on one run and 1,562 on another, so per-call token
+  figures are quoted as measured, not as constants.
+- The `groq-api` Header Auth credential from T24 stored the key without the `Bearer ` prefix and had never
+  been tested against Groq; it was fixed in place (`GET /models` 200 from the instance afterwards).
+- The `crawl_runs` and `llm_calls` tables contain rows from these drills (including the duplicated inserts
+  above); they are real events from T30 development, not seed data.
+

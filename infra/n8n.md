@@ -97,7 +97,7 @@ Created in the editor by name; workflows reference only these names. Screenshots
 | `rds-postgres` | Postgres | RDS endpoint from SSM `/clickpe/db/host`, database and user `clickpe`, SSL Require, Ignore SSL Issues off | "Connection tested successfully" |
 | `aws-ses-assume-role` | AWS (Assume Role) | `ap-southeast-2`, Use System Credentials on, role `clickpe-n8n-ses-role`, external ID `clickpe-n8n` (the form requires one; the trust policy does not check it) | "Connection tested successfully" |
 | `webhook-secret` | Header Auth | `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` | not testable until T32 |
-| `groq-api` | Header Auth | `Authorization: Bearer <key>` | first call in T26 |
+| `groq-api` | Header Auth | `Authorization`, value `Bearer <key>` (the prefix is part of the value; T24 first saved the bare key, which Groq rejected with 401, fixed in T30) | `GET https://api.groq.com/openai/v1/models` → 200 from the instance; used by Workflow A |
 
 SES role chain: instance role `clickpe-n8n-ec2-role` (inline policy `assume-n8n-ses-role`, `sts:AssumeRole` on one ARN) assumes `clickpe-n8n-ses-role` (trust: that instance role only; policy `ses-send-test-identities`: `ses:SendEmail` and `ses:SendRawEmail` on the three verified identities). Policy documents are in `infra/iam/`. From the instance, `aws sts assume-role` returned `assumed-role/clickpe-n8n-ses-role/t24check`. No static keys exist.
 
