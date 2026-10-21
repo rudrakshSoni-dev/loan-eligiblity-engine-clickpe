@@ -1398,3 +1398,15 @@ and the stored outcome and reason equal the cached verdict for `(cohort_key, con
 - No live 429 for Stage 3: the branch is tested with the real 429 body and `retry-after` header observed in T30.
 - The two probe calls made from a laptop before building (3,566 tokens) are not in `llm_calls`.
 - When the prompt changes, `verdict_version` in `Form cohorts` must be bumped by hand; nothing enforces it.
+
+## Workflow B persist: matches written from the database, final count read back
+
+**Choice.** Two nodes after Stage 3. `Persist · Insert matches` copies every `clear_match` pair (`stage` = `rules`, reason from Stage 2) and every Stage 3 `eligible` pair (`stage` = `llm`, reason from the cohort verdict) from `match_candidates` into `matches` in one set-based `INSERT … SELECT … ON CONFLICT (user_id, product_id) DO NOTHING`. `Persist · Finalize run + mark matched` is one statement that sets `final_matches` to the number of qualifying pairs that really have a row in `matches`, stores `stage_ms.persist`, sets `finished_at` and moves the batch `matching → matched`. Migration `0005_final_matches` adds the CHECK `final_matches = stage2_clear + stage3_eligible`.
+
+**Rejected.** (a) Reading pairs into n8n and inserting from a Code node: moves up to hundreds of thousands of rows through n8n memory for no gain. (b) `final_matches` computed from the same filter as the insert: it would repeat the insert's logic, so a bug in it would be invisible. Reading back through a join on `matches` and checking it against the Stage 2 and Stage 3 counts makes a lost pair fail the run. (c) `ON CONFLICT DO UPDATE`: would overwrite `notified_at` and `reason` of an existing match and could re-email a user.
+
+**Why.** An existing match keeps its `batch_id` and `notified_at`, so a user who shows up in two batches is never emailed twice for the same product (Workflow C reads `notified_at IS NULL`). `unresolved_*` and `not_eligible` pairs are never stored: an unanswered question is not a match. Both nodes are idempotent, so Retry On Fail is safe on them. `persist` is timed from the insert's `statement_timestamp()` to after its commit, so foreign-key checks are included (the Stage 1 lesson).
+
+**Not built.** The hand-off to Workflow C. It does not exist until T38, so Workflow B ends at `matched`.
+
+**Measured (RDS, 10,000-user sample, run 17, then run 18 on the same batch).** 11,841 matches = 10,405 `rules` + 1,436 `llm`, for 6,017 distinct users; persist 504 ms the first time, 82 ms the second; the second run inserted 0 rows, made 0 LLM calls and still reports 11,841.

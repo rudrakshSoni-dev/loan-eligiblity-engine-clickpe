@@ -172,3 +172,9 @@ Reading a saved execution's per-node timings (read-only, on the instance): open
 execution id and decode it with the `flatted` format (every string and nested object is an index into the
 top-level array); `resultData.runData[node][i]` holds `startTime`, `executionTime` and the output items.
 
+
+## Persist step (T36)
+
+Migration `0005_final_matches` was applied with `infra/ec2/migrate.sh` (file SHA-256 `de22a2e7…3090` identical on both sides). Workflow B was re-imported and published as in T32, but the file is now over SSM's 97 KB parameter limit, so it is sent gzipped: `gzip -9c n8n/workflows/workflow-b-matching.json | base64 -w0` and `base64 -d | gunzip` on the instance (remote file SHA-256 `847db5fc…4e24` equals the local one).
+
+To run the funnel again on a batch that is already `matched`, set it back to `processed` and call `scripts/retrigger_batch.sh <batch_id>`; the claim step then creates a new `pipeline_runs` row.
