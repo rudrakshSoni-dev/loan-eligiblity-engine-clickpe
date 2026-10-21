@@ -73,3 +73,17 @@ def test_code_and_sql_carry_no_comment_lines() -> None:
     for node in workflow()["nodes"]:
         source = node["parameters"].get("jsCode") or node["parameters"].get("query") or ""
         assert not COMMENT_LINE.search(source), node["name"]
+
+
+def test_persist_follows_stage_3_and_every_persist_error_marks_the_batch_failed() -> None:
+    connections = workflow()["connections"]
+
+    def targets(node: str, output: int = 0) -> list[str]:
+        return [t["node"] for t in connections[node]["main"][output]]
+
+    assert targets("Record · Stage 3 funnel") == ["Persist · Insert matches"]
+    assert targets("Persist · Insert matches") == ["Persist · Finalize run + mark matched"]
+    assert targets("Persist · Finalize run + mark matched") == []
+    for node in ("Persist · Insert matches", "Persist · Finalize run + mark matched"):
+        assert targets(node, 1) == ["Fail · Mark batch failed (Persist)"]
+    assert "Fail · Mark batch failed (Persist)" not in connections

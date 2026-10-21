@@ -14,7 +14,7 @@
           -140
         ],
         "parameters": {
-          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel: SQL, rules, cohort LLM)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates`, each classified by Stage 2 and, if borderline, judged by Stage 3 (`stage3_outcome`), and the funnel counts in `pipeline_runs`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n`Stage 1 · Refresh planner statistics` then runs `ANALYZE match_candidates`. Stage 1 has just inserted the run's pairs, and autovacuum analyzes the table only about a minute later, so without it every later statement planned with an estimate of almost no rows for the run (measured: Stage 3 cohort forming took 16 s instead of about 0.15 s).\n6. `Stage 2 · Load product rules` returns one item: the products that have candidates in this run (confidence and published rates) and the Stage 2 start time.\n7. `Stage 2 · Build rule cards` (Code) turns each product into a rule card: products with `parse_confidence` >= 0.7 are fully structured, so their near misses are `clear_reject`; below 0.7 the near misses are `borderline` for Stage 3. It also computes an indicative EMI for Rs 5,00,000 over 60 months at the product's top published rate (else its starting rate; no rate = affordability not checked) and the 65%-of-income affordability cap.\n8. `Stage 2 · Classify pairs` applies the cards to every pair in one set-based UPDATE: unaffordable EMI -> `clear_reject`; strict pass -> `clear_match`; near miss -> the card's policy. Borderline pairs get `borderline_reason` (`near_miss:<criteria>`) and the triggering feature and value, which Stage 3 uses as its cohort key. Every pair gets a readable `stage2_reason`.\n9. `Record · Stage 2 funnel` stores `stage2_clear` / `stage2_borderline` / `stage2_reject` and `stage_ms.stage2`. A CHECK requires the three to add up to `stage1_pairs`, so a pair left unclassified fails the run instead of disappearing.\n\nStage 2 nodes are idempotent too (unchanged pairs are not rewritten; the first `stage2` time is kept), so they also use Retry On Fail; any error marks the batch `failed` with `matching stage 2 failed: <message>`.\n\n10. `Stage 3 · Form cohorts` (SQL) gives every borderline pair a `cohort_key`: verdict version, product, borderline reason, employment, and a fixed band per missed criterion (credit score in 10-point bands, income in Rs 1,000 bands) labelled with the lender's figure. It returns one item: the cohorts with member counts and whether `cohort_verdicts` already holds a verdict for the key and the product's current `content_hash`, the lender texts, and the Groq tokens used in the last 24 h from `llm_calls`.\n11. `Stage 3 · Build LLM requests` (Code) packs the uncached cohorts of each product into one request (at most 16 cohorts; the lender text is sent once) with a strict JSON schema whose `cohort_id` is an enum of the ids in that request. Budget guard: a request is sent only if its estimated tokens fit the Stage 3 daily budget (150,000 tokens minus the last 24 h) and the run stays within 30 calls; otherwise its cohorts become `unresolved_budget`. The model judges the worst value of each band, so one verdict covers every member.\n12. `Check · Any cohort to ask Groq` skips the call when everything is cached. Otherwise `LLM · Judge cohorts (Groq)` sends the requests one at a time, 20 s apart (tokens per minute bind, not requests), and `Log · llm_calls (Stage 3)` records every call with its tokens, run and batch.\n13. `Stage 3 · Read verdicts` (Code) accepts a verdict only from HTTP 200 with exactly one well-formed answer per cohort. HTTP 429 (with `retry-after`), other HTTP errors, no response, non-JSON or missing / duplicate answers make those cohorts `unresolved_error` with the reason. Nothing is guessed. Waiting out a 429 and falling back to the 20b model belong to the LLM Gateway (T26), not built.\n14. `Stage 3 · Store verdicts + fan out` stores new verdicts in `cohort_verdicts` (first verdict wins) and gives every borderline pair its cohort's outcome and reason (`eligible`, `not_eligible`, `unresolved_budget`, `unresolved_error`). `Record · Stage 3 funnel` stores the outcome counts, `llm_cohorts`, `cache_hits`, `llm_calls`, `llm_tokens` and `stage_ms.stage3`; a CHECK requires the four outcomes to add up to `stage2_borderline`.\n\nStage 3 SQL nodes are idempotent (verdicts insert-or-skip, pairs rewritten only when the outcome changes, first measurements kept), so they use Retry On Fail; the Groq call retries only network errors. Any error marks the batch `failed` with `matching stage 3 failed: <message>`. The batch stays in `matching` for the persist step (T36).\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
+          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel: SQL, rules, cohort LLM)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates`, each classified by Stage 2 and, if borderline, judged by Stage 3 (`stage3_outcome`), the funnel counts in `pipeline_runs`, and the eligible pairs in `matches` with the batch moved to `matched`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n`Stage 1 · Refresh planner statistics` then runs `ANALYZE match_candidates`. Stage 1 has just inserted the run's pairs, and autovacuum analyzes the table only about a minute later, so without it every later statement planned with an estimate of almost no rows for the run (measured: Stage 3 cohort forming took 16 s instead of about 0.15 s).\n6. `Stage 2 · Load product rules` returns one item: the products that have candidates in this run (confidence and published rates) and the Stage 2 start time.\n7. `Stage 2 · Build rule cards` (Code) turns each product into a rule card: products with `parse_confidence` >= 0.7 are fully structured, so their near misses are `clear_reject`; below 0.7 the near misses are `borderline` for Stage 3. It also computes an indicative EMI for Rs 5,00,000 over 60 months at the product's top published rate (else its starting rate; no rate = affordability not checked) and the 65%-of-income affordability cap.\n8. `Stage 2 · Classify pairs` applies the cards to every pair in one set-based UPDATE: unaffordable EMI -> `clear_reject`; strict pass -> `clear_match`; near miss -> the card's policy. Borderline pairs get `borderline_reason` (`near_miss:<criteria>`) and the triggering feature and value, which Stage 3 uses as its cohort key. Every pair gets a readable `stage2_reason`.\n9. `Record · Stage 2 funnel` stores `stage2_clear` / `stage2_borderline` / `stage2_reject` and `stage_ms.stage2`. A CHECK requires the three to add up to `stage1_pairs`, so a pair left unclassified fails the run instead of disappearing.\n\nStage 2 nodes are idempotent too (unchanged pairs are not rewritten; the first `stage2` time is kept), so they also use Retry On Fail; any error marks the batch `failed` with `matching stage 2 failed: <message>`.\n\n10. `Stage 3 · Form cohorts` (SQL) gives every borderline pair a `cohort_key`: verdict version, product, borderline reason, employment, and a fixed band per missed criterion (credit score in 10-point bands, income in Rs 1,000 bands) labelled with the lender's figure. It returns one item: the cohorts with member counts and whether `cohort_verdicts` already holds a verdict for the key and the product's current `content_hash`, the lender texts, and the Groq tokens used in the last 24 h from `llm_calls`.\n11. `Stage 3 · Build LLM requests` (Code) packs the uncached cohorts of each product into one request (at most 16 cohorts; the lender text is sent once) with a strict JSON schema whose `cohort_id` is an enum of the ids in that request. Budget guard: a request is sent only if its estimated tokens fit the Stage 3 daily budget (150,000 tokens minus the last 24 h) and the run stays within 30 calls; otherwise its cohorts become `unresolved_budget`. The model judges the worst value of each band, so one verdict covers every member.\n12. `Check · Any cohort to ask Groq` skips the call when everything is cached. Otherwise `LLM · Judge cohorts (Groq)` sends the requests one at a time, 20 s apart (tokens per minute bind, not requests), and `Log · llm_calls (Stage 3)` records every call with its tokens, run and batch.\n13. `Stage 3 · Read verdicts` (Code) accepts a verdict only from HTTP 200 with exactly one well-formed answer per cohort. HTTP 429 (with `retry-after`), other HTTP errors, no response, non-JSON or missing / duplicate answers make those cohorts `unresolved_error` with the reason. Nothing is guessed. Waiting out a 429 and falling back to the 20b model belong to the LLM Gateway (T26), not built.\n14. `Stage 3 · Store verdicts + fan out` stores new verdicts in `cohort_verdicts` (first verdict wins) and gives every borderline pair its cohort's outcome and reason (`eligible`, `not_eligible`, `unresolved_budget`, `unresolved_error`). `Record · Stage 3 funnel` stores the outcome counts, `llm_cohorts`, `cache_hits`, `llm_calls`, `llm_tokens` and `stage_ms.stage3`; a CHECK requires the four outcomes to add up to `stage2_borderline`.\n\nStage 3 SQL nodes are idempotent (verdicts insert-or-skip, pairs rewritten only when the outcome changes, first measurements kept), so they use Retry On Fail; the Groq call retries only network errors. Any error marks the batch `failed` with `matching stage 3 failed: <message>`. \n\n15. `Persist · Insert matches` copies every `clear_match` pair (`stage` = `rules`, reason from Stage 2) and every Stage 3 `eligible` pair (`stage` = `llm`, reason from the cohort verdict) into `matches` with `ON CONFLICT (user_id, product_id) DO NOTHING`. `clear_reject`, `not_eligible` and both `unresolved_*` outcomes are never stored: an unanswered pair is not a match. An existing match keeps its `batch_id` and its `notified_at`, so a user who appears in two batches is never emailed twice for the same product.\n16. `Persist · Finalize run + mark matched` is one statement: `final_matches` is the number of qualifying pairs that really have a row in `matches` (a CHECK requires `final_matches = stage2_clear + stage3_eligible`), `stage_ms.persist` is measured from the start of the insert to after its commit, the run gets `finished_at`, and the batch moves `matching -> matched`. All three happen or none does.\n\nBoth persist nodes are idempotent (a re-run inserts 0 rows, keeps the first `persist` time and `finished_at`, and the batch update only fires from `matching`), so they use Retry On Fail. Any error marks the batch `failed` with `matching persist failed: <message>`.\n\n**Chain to Workflow C.** Workflow C (compose and send, T38) does not exist yet, so this workflow ends at `matched`; T38 adds the Execute Workflow hand-off after `Persist · Finalize run + mark matched`. Until then nothing is emailed.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
           "height": 1900,
           "width": 820,
           "color": 4
@@ -687,6 +687,83 @@
         "maxTries": 3,
         "waitBetweenTries": 2000,
         "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH qualifying AS (\n  SELECT m.user_id, m.product_id,\n         CASE WHEN m.stage2_class = 'clear_match' THEN 'rules' ELSE 'llm' END AS stage,\n         CASE WHEN m.stage2_class = 'clear_match' THEN m.stage2_reason ELSE m.stage3_reason END AS reason\n  FROM match_candidates m\n  WHERE m.run_id = $1::bigint\n    AND (m.stage2_class = 'clear_match' OR m.stage3_outcome = 'eligible')\n),\ninserted AS (\n  INSERT INTO matches (user_id, product_id, stage, reason, batch_id)\n  SELECT user_id, product_id, stage, reason, $2::uuid\n  FROM qualifying\n  ON CONFLICT (user_id, product_id) DO NOTHING\n  RETURNING 1\n)\nSELECT $1::bigint::text AS run_id, $2::uuid::text AS batch_id,\n       statement_timestamp() AS persist_started_at,\n       (SELECT count(*) FROM qualifying) AS qualifying,\n       (SELECT count(*) FROM inserted) AS inserted",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000030",
+        "name": "Persist · Insert matches",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          5500,
+          -360
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH landed AS (\n  SELECT count(*) AS matches_found\n  FROM match_candidates c\n  JOIN matches x ON x.user_id = c.user_id AND x.product_id = c.product_id\n  WHERE c.run_id = $1::bigint\n    AND (c.stage2_class = 'clear_match' OR c.stage3_outcome = 'eligible')\n),\nclosed AS (\n  UPDATE pipeline_runs r\n  SET final_matches = l.matches_found,\n      finished_at = coalesce(r.finished_at, now()),\n      stage_ms = CASE WHEN r.stage_ms ? 'persist' THEN r.stage_ms\n                 ELSE r.stage_ms || jsonb_build_object(\n                   'persist', round(extract(epoch FROM clock_timestamp() - $3::timestamptz) * 1000)::int)\n                 END\n  FROM landed l\n  WHERE r.id = $1::bigint AND r.batch_id = $2::uuid\n  RETURNING r.id::text AS run_id, r.batch_id::text AS batch_id, r.total_pairs, r.stage1_pairs,\n            r.stage2_clear, r.stage2_borderline, r.stage2_reject, r.llm_cohorts, r.cache_hits,\n            r.llm_calls, r.llm_tokens, r.stage3_eligible, r.stage3_not_eligible,\n            r.unresolved_budget, r.unresolved_error, r.final_matches,\n            (r.stage_ms ->> 'persist')::int AS persist_ms\n),\nmarked AS (\n  UPDATE upload_batches\n  SET status = 'matched'\n  WHERE id = $2::uuid AND status = 'matching'\n  RETURNING 1\n)\nSELECT closed.*, (SELECT count(*) FROM marked) AS batch_marked\nFROM closed",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id, $json.persist_started_at] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000031",
+        "name": "Persist · Finalize run + mark matched",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          5740,
+          -360
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH failed AS (\n  UPDATE upload_batches\n  SET status = 'failed', error = left('matching persist failed: ' || $3, 1000)\n  WHERE id = $2::uuid AND status = 'matching'\n  RETURNING id\n)\nUPDATE pipeline_runs r\nSET finished_at = now()\nFROM failed f\nWHERE r.id = $1::bigint AND r.batch_id = f.id AND r.finished_at IS NULL\nRETURNING r.id::text AS run_id, f.id::text AS batch_id",
+          "options": {
+            "queryReplacement": "={{ [$('Claim · processed to matching + create run').first().json.run_id, $('Claim · processed to matching + create run').first().json.batch_id, String($json.error?.message ?? $json.message ?? $json.error ?? 'unknown error')] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000032",
+        "name": "Fail · Mark batch failed (Persist)",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          5740,
+          60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        }
       }
     ],
     "connections": {
@@ -1022,10 +1099,46 @@
       },
       "Record · Stage 3 funnel": {
         "main": [
-          [],
+          [
+            {
+              "node": "Persist · Insert matches",
+              "type": "main",
+              "index": 0
+            }
+          ],
           [
             {
               "node": "Fail · Mark batch failed (Stage 3)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Persist · Insert matches": {
+        "main": [
+          [
+            {
+              "node": "Persist · Finalize run + mark matched",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Persist)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Persist · Finalize run + mark matched": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Fail · Mark batch failed (Persist)",
               "type": "main",
               "index": 0
             }
