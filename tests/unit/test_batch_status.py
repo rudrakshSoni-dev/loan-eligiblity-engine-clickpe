@@ -96,28 +96,27 @@ def test_known_batch_returns_progress_without_a_funnel(monkeypatch: pytest.Monke
 def test_funnel_is_passed_through_with_unmeasured_counters_as_null(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    funnel_row: list[Any] = [
-        500,
-        200,
-        120,
-        80,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        {},
-        CREATED,
-        None,
-    ]
+    measured = {
+        "total_pairs": 500,
+        "stage1_pairs": 200,
+        "stage1_near_miss": 90,
+        "stage2_clear": 100,
+        "stage2_borderline": 80,
+        "stage2_reject": 20,
+        "stage_ms": {},
+        "started_at": CREATED,
+    }
+    funnel_row: list[Any] = [measured.get(column) for column in status.FUNNEL_COLUMNS]
     install_runtime(monkeypatch, FakeConnection(funnel=funnel_row))
 
     body = json.loads(module.handler(get_event(), None)["body"])
 
+    assert set(body["funnel"]) == set(status.FUNNEL_COLUMNS)
     assert body["funnel"]["total_pairs"] == 500
-    assert body["funnel"]["stage2_borderline"] == 80
+    assert body["funnel"]["stage1_near_miss"] == 90
+    assert body["funnel"]["stage2_reject"] == 20
     assert body["funnel"]["llm_calls"] is None
+    assert body["funnel"]["stage3_eligible"] is None
     assert body["funnel"]["started_at"] == CREATED.isoformat()
     assert body["funnel"]["finished_at"] is None
 

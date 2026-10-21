@@ -23,26 +23,29 @@ REJECTS_SQL = (
     "SELECT line_no, reason FROM rejected_rows WHERE batch_id = :id ORDER BY line_no LIMIT :limit"
 )
 MATCHES_SQL = "SELECT count(*), count(notified_at) FROM matches WHERE batch_id = :id"
-FUNNEL_SQL = (
-    "SELECT total_pairs, stage1_pairs, stage2_clear, stage2_borderline, llm_cohorts, cache_hits,"
-    " llm_calls, llm_tokens, unresolved_budget, final_matches, stage_ms, started_at, finished_at"
-    " FROM pipeline_runs WHERE batch_id = :id ORDER BY id DESC LIMIT 1"
-)
-
 FUNNEL_COLUMNS = (
     "total_pairs",
     "stage1_pairs",
+    "stage1_near_miss",
     "stage2_clear",
     "stage2_borderline",
+    "stage2_reject",
     "llm_cohorts",
     "cache_hits",
     "llm_calls",
     "llm_tokens",
+    "stage3_eligible",
+    "stage3_not_eligible",
     "unresolved_budget",
+    "unresolved_error",
     "final_matches",
     "stage_ms",
     "started_at",
     "finished_at",
+)
+FUNNEL_SQL = (
+    f"SELECT {', '.join(FUNNEL_COLUMNS)}"
+    " FROM pipeline_runs WHERE batch_id = :id ORDER BY id DESC LIMIT 1"
 )
 
 

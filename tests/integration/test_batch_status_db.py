@@ -110,6 +110,29 @@ def test_matches_notified_and_latest_funnel_run(connect_db: Any) -> None:
     json.dumps(document)
 
 
+def test_completed_run_exposes_every_stage_counter(connect_db: Any) -> None:
+    conn = connect_db()
+    batch_id = loaded_batch(conn)
+    conn.run(
+        "INSERT INTO pipeline_runs (batch_id, total_pairs, stage1_pairs, stage1_near_miss,"
+        " stage2_clear, stage2_borderline, stage2_reject, llm_cohorts, cache_hits, llm_calls,"
+        " llm_tokens, stage3_eligible, stage3_not_eligible, unresolved_budget, unresolved_error,"
+        " final_matches, finished_at) VALUES (:id, 1000, 400, 150, 250, 100, 50, 12, 4, 2, 3100,"
+        " 60, 30, 6, 4, 310, now())",
+        id=batch_id,
+    )
+
+    document = batch_status(conn, batch_id)
+
+    assert document is not None
+    stages = document["funnel"]
+    assert (stages["stage1_near_miss"], stages["stage2_reject"]) == (150, 50)
+    assert (stages["stage3_eligible"], stages["stage3_not_eligible"]) == (60, 30)
+    assert (stages["unresolved_budget"], stages["unresolved_error"]) == (6, 4)
+    assert stages["final_matches"] == stages["stage2_clear"] + stages["stage3_eligible"]
+    assert stages["finished_at"] is not None
+
+
 def test_counts_are_scoped_to_the_requested_batch(connect_db: Any) -> None:
     conn = connect_db()
     first = loaded_batch(conn)
