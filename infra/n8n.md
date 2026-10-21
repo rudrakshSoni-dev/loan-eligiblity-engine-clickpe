@@ -153,3 +153,22 @@ answers 404. Like the earlier probes it stays inactive in the n8n database until
 (202, batch `failed` with `matching stage 2 failed: division by zero`), then unpublished with a restart; the path
 answers 404. The throwaway batch and its run row were deleted. Like the earlier probes the workflow stays
 inactive in the n8n database until it is deleted in the editor.
+
+## Stage 3 (T35)
+
+Migration `0004_stage3_cohorts` was applied with `infra/ec2/migrate.sh` (the `db/` files shipped as a tarball
+through SSM Run Command; password read from SSM on the instance; file SHA-256 `1a879933…4fb0` identical on both
+sides). Workflow B was re-imported and published as in T32. Stage 3 calls Groq with the existing `groq-api`
+credential; no new credential.
+
+`t35drill000001` is a copy of Workflow B on path `t35-drill`, imported twice with the same id: first with a
+1-token budget and `verdict_version` `drill` (every cohort `unresolved_budget`, 0 calls), then with
+`Stage 3 · Store verdicts + fan out` replaced by `SELECT 1/0` (batch `failed`). It was then unpublished with a
+restart; the path answers 404. Like the earlier drills it stays inactive in the n8n database until it is deleted
+in the editor.
+
+Reading a saved execution's per-node timings (read-only, on the instance): open
+`/var/lib/docker/volumes/n8n_n8n_data/_data/database.sqlite` with `mode=ro`, take `execution_data.data` for the
+execution id and decode it with the `flatted` format (every string and nested object is an index into the
+top-level array); `resultData.runData[node][i]` holds `startTime`, `executionTime` and the output items.
+

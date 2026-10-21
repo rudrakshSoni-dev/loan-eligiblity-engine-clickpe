@@ -41,6 +41,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 27. [Workflow B entry: claim, count and record in one statement](#workflow-b-entry-claim-count-and-record-in-one-statement)
 28. [Workflow B Stage 1: SQL pre-filter that keeps near misses](#workflow-b-stage-1-sql-pre-filter-that-keeps-near-misses)
 29. [Workflow B Stage 2: rule cards in code, classification in SQL](#workflow-b-stage-2-rule-cards-in-code-classification-in-sql)
+30. [Workflow B Stage 3: cohort verdicts on the lender's wording](#workflow-b-stage-3-cohort-verdicts-on-the-lenders-wording)
 
 ---
 
@@ -628,7 +629,8 @@ columns cannot answer, such as "a credit score of 700 and above is **preferred**
 
 **Counterfactual for the README (derived from measured limits).** One LLM call per pair for 10,000
 users × 3 products is 30,000 calls, or 30 days of the 1,000-requests/day quota for a single batch. The
-engine's actual call count is reported only from a measured run (T36/T37).
+engine's actual call count is reported only from a measured run (T36/T37). Measured in T35 on the sample batch: 2 calls and 3,655 tokens for 2,221 borderline pairs, and 0 calls on
+the next run (section "Workflow B Stage 3").
 
 ## Crawl targets
 
@@ -1283,3 +1285,116 @@ The drill batch and its run were deleted afterwards and the drill workflow unpub
 `clear_match`. The fix belongs in
 Workflow A (per-employment age fields), not in a Stage 2 special case.
 
+## Workflow B Stage 3: cohort verdicts on the lender's wording
+
+**Choice (T35, five decisions approved by the user).** Stage 3 asks the LLM only the questions the columns
+cannot answer, once per *cohort* of similar pairs, and never twice for the same lender text. The 2,221
+borderline pairs of the sample are all near misses on a threshold that the lender words softly or firmly
+somewhere in its text: ICICI says "a credit score of 700 and above is **preferred**", HDFC says both "above
+720 is **ideal**" and "you **need** a minimum credit score of 720". Whether a near miss is still eligible is a
+reading of that wording, which is what an LLM is for.
+
+1. **Cohort key (decision A).** `verdict version | product | borderline reason | employment | one band per
+   missed criterion`, with credit scores in 10-point bands and income in ₹1,000 bands, each labelled with the
+   lender's figure, for example
+   `v1|product 11|near_miss:min_credit_score|Salaried|credit score 690-699 vs minimum 700`. A pair that misses
+   two criteria gets both bands. The model is asked about the **worst value** of each band (690 here, or the
+   top of the band for a maximum), so one verdict is safe for every member. Measured on the 2,221 borderline
+   pairs of run 10:
+
+   | Key | Cohorts |
+   |---|---|
+   | Exact values | 32 (and unbounded for income at scale) |
+   | **Bands (chosen)** | **20** |
+   | Reason only, no band | 7 (one verdict would cover scores 665 to 699) |
+
+   The key carries the threshold, so a re-structured product with a new threshold gets new keys (T31 open item 6).
+2. **Packing (decision B).** One request per product with up to 16 cohorts, so the lender text (1.3–2 KB) is
+   sent once per request. The response is strict Structured Outputs: `{verdicts: [{cohort_id, eligible,
+   reason}]}` with `cohort_id` an enum of exactly the ids in that request; `temperature 0`, `reasoning_effort
+   low`, `max_completion_tokens` = 600 + 100 per cohort. Measured with a probe of the two real requests before
+   building: 16 cohorts → 1,493 prompt + 762 completion tokens, 4 cohorts → 1,017 + 294. The budget estimate
+   (prompt characters ÷ 3 plus the completion cap) gave 4,042 and 2,386, about 1.8× the actual, which is the
+   intended side to err on.
+3. **Cross-run cache (decision C).** `cohort_verdicts` is keyed by `(cohort_key, product content_hash)`. A new
+   batch with users in the same bands costs zero calls; a changed lender page (new hash) or a new prompt
+   (`verdict_version`, set in the `Form cohorts` statement) asks again. The first verdict stored wins
+   (`ON CONFLICT DO NOTHING`), so two concurrent runs cannot overwrite each other.
+4. **No guessing (decision D).**
+   - *Budget guard*: before anything is sent, the Code node reads the tokens this model used in the last
+     24 h from `llm_calls` and sends a request only if its estimate fits 150,000 tokens (of Groq's 200,000 per
+     day, leaving room for Workflow A) and the run stays within 30 calls. Cohorts that do not fit become
+     `unresolved_budget` with the arithmetic in their reason.
+   - *Pacing*: requests go out one at a time, 20 s apart. Tokens per minute (8,000) bind, not requests, and a
+     packed request measured up to 2,366 tokens.
+   - *Failures*: HTTP 429 (reason includes `retry-after`), any other HTTP status, no response, non-JSON,
+     no verdicts array, a missing or duplicated `cohort_id` → that cohort is `unresolved_error` with the
+     reason. Waiting out a 429 and falling back to `gpt-oss-20b` are the LLM Gateway's job (T26, not built).
+   - Unresolved pairs are never matched; they keep their reason, and the next run asks for them again because
+     nothing was cached for them.
+5. **Storage and completeness (decision E).** Migration `0004` adds `cohort_key`, `stage3_outcome`
+   (`eligible`, `not_eligible`, `unresolved_budget`, `unresolved_error`) and `stage3_reason` to
+   `match_candidates`, three counters to `pipeline_runs`, and a CHECK that the four outcomes add up to
+   `stage2_borderline`, as Stage 2 does. A pair the fan-out missed fails the run instead of disappearing
+   (tested). `llm_calls` gains `run_id`, so the ledger shows exactly which run spent which tokens.
+
+**Nodes.** `Stage 3 · Form cohorts` (one SQL statement: label pairs, list cohorts with member counts and cache
+state, lender texts, 24 h usage) → `Stage 3 · Build LLM requests` (Code: pack, budget) → `Check · Any cohort to
+ask Groq` → `Stage 3 · One item per request` → `LLM · Judge cohorts (Groq)`, with `Log · llm_calls (Stage 3)` on
+a side branch → `Stage 3 · Read verdicts` (Code: validate) → `Stage 3 · Store verdicts + fan out` (one statement)
+→ `Record · Stage 3 funnel`. The only join of two branches is the IF's false output and the Groq path meeting at
+`Read verdicts`, and exactly one of them carries an item, so no Merge node is needed (T31 found that Merge does
+not wait). SQL nodes are idempotent and retry 3 × 2 s; any error marks the batch `failed` with
+`matching stage 3 failed: <message>`.
+
+**Finding: stale planner statistics (measured, fixed).** In the first live run (run 12) `Stage 3 · Form cohorts`
+took **16,061 ms**; the same statement under `EXPLAIN ANALYZE` a few minutes later took 147 ms. Stage 1 had just
+inserted the run's 14,165 pairs, and autovacuum analyzed `match_candidates` only at 12:26:18, 55 s later, so the
+planner still saw almost no rows for the run and chose a nested loop that rescanned the run's pairs for each of
+the 2,221 borderline pairs. T33 had already recorded a 313-row estimate for 14,165. Fix: a new node,
+`Stage 1 · Refresh planner statistics`, runs `ANALYZE match_candidates` right after the Stage 1 insert (184 ms).
+n8n returns one `{success: true}` item for a statement without rows (checked in its source, `utils.js`), so the
+chain continues; `Stage 2 · Load product rules` now reads `run_id` from `Record · Stage 1 funnel` by name. With
+the fix: Form 168 ms (run 13).
+
+**Measured (2026-10-21, RDS PostgreSQL 16.9, sample batch `9d278e88…`, n8n 2.44.4, `openai/gpt-oss-120b`).**
+
+| Run | What | Cohorts | Cache hits | Calls | Tokens | Eligible | Not eligible | Unresolved | `stage3` |
+|---|---|---|---|---|---|---|---|---|---|
+| 12 | first live run | 20 | 0 | 2 | 3,655 | 1,436 | 785 | 0 | 38,138 ms (16.1 s Form before the fix, 21.7 s Groq incl. 20 s pacing) |
+| 13 | same batch again, statistics fix in | 20 | 20 | 0 | 0 | 1,436 | 785 | 0 | 422 ms |
+| 14 | drill: budget 1 token, version `drill` | 20 | 0 | 0 | 0 | 0 | 0 | 2,221 budget | 407 ms |
+| 15 | drill: Store replaced by `SELECT 1/0` | | | | | | | | batch `failed`, run closed after 6.0 s (3 tries) |
+| 16 | final state for T36 | 20 | 20 | 0 | 0 | 1,436 | 785 | 0 | 417 ms |
+
+Funnel for the sample: 30,000 pairs → 14,165 candidates (Stage 1) → 10,405 clear match / 1,539 clear reject /
+2,221 borderline (Stage 2) → 20 cohorts → **2 LLM calls, 3,655 tokens** → 1,436 eligible / 785 not eligible.
+Asking per borderline pair would have been 2,221 calls (2.2 days of the 1,000-requests/day quota); per pair of
+the whole batch, 30,000.
+
+**What the model decided.** All 8 ICICI cohorts that miss only the score are eligible ("700 and above is
+preferred" is a preference, not a minimum), down to the 660–669 band. Every cohort that misses ICICI's income
+(₹29,000 vs ₹30,000) is not eligible ("Minimum monthly income of ₹30,000" is a requirement), including the 6 that
+also miss the score. All 4 HDFC cohorts are not eligible: the firm sentence "you need a minimum credit score of
+720 to be eligible" outweighs "above 720 is ideal", as the prompt's rule 2 asks. The verdicts are indicative, like
+everything this engine sends; a stricter reading of "preferred" would be a prompt change and a new
+`verdict_version`.
+
+**Cross-check (run 16, independent SQL).** For all 2,221 borderline pairs the key's product, reason and
+employment equal the pair's, the score and income bands re-derived from the user's raw values contain the user,
+and the stored outcome and reason equal the cached verdict for `(cohort_key, content_hash)`: 2,221 of 2,221 each.
+
+**Rejected.**
+- *One call per borderline pair*: 2,221 calls for the sample, and the answers would repeat.
+- *Bands on raw income × score × age* (the original plan): 1,028–5,528 cohorts per product (section "Matching
+  and the Optimization Treasure Hunt").
+- *Asking about the band as a whole*: a "yes" for 690–699 could then cover a 690 the model would have refused.
+- *A loop with Merge to wait out 429s inline*: the retry and model fallback belong in the reusable LLM Gateway
+  (T26); building them here would be thrown away, and pacing keeps the sample far from the limit.
+- *A fixed `ANALYZE` schedule or waiting for autovacuum*: the statement that needs the statistics runs one
+  second after the insert.
+
+**Known gaps.**
+- No live 429 for Stage 3: the branch is tested with the real 429 body and `retry-after` header observed in T30.
+- The two probe calls made from a laptop before building (3,566 tokens) are not in `llm_calls`.
+- When the prompt changes, `verdict_version` in `Form cohorts` must be bumped by hand; nothing enforces it.
