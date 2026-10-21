@@ -5,7 +5,6 @@ Expected EMIs are computed here with the standard amortisation formula, independ
 JavaScript, so a wrong formula in the Code node fails a test.
 """
 
-import json
 import os
 import uuid
 from collections.abc import Callable
@@ -19,11 +18,13 @@ from tests.workflow_b_helpers import (
     NODE_BINARY,
     add_product,
     add_user,
+    build_cards,
+    classify_and_record,
     new_batch,
     new_run,
     node_query,
-    run_code_node,
-    single_row,
+    run_stage1,
+    run_stage2,
 )
 
 pytestmark = [
@@ -31,16 +32,7 @@ pytestmark = [
     pytest.mark.skipif(NODE_BINARY is None, reason="node not installed"),
 ]
 
-STAGE1_NODE = "Stage 1 · SQL pre-filter"
-STAGE1_RECORD_NODE = "Record · Stage 1 funnel"
-LOAD_NODE = "Stage 2 · Load product rules"
-CARDS_NODE = "Stage 2 · Build rule cards"
-CLASSIFY_NODE = "Stage 2 · Classify pairs"
-RECORD_NODE = "Record · Stage 2 funnel"
 FAIL_NODE = "Fail · Mark batch failed (Stage 2)"
-RUN_PARAMS = {"$1": ":run_id", "$2": ":batch_id"}
-TIMED_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":started_at"}
-CLASSIFY_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":cards", "$4": ":started_at"}
 FAIL_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":message"}
 
 LOAN_RUPEES = 500_000
@@ -52,53 +44,6 @@ def amortised_emi(annual_rate_pct: float) -> float:
     monthly = annual_rate_pct / 1200
     growth = (1 + monthly) ** TENURE_MONTHS
     return round(LOAN_RUPEES * monthly * growth / (growth - 1), 2)
-
-
-def run_stage1(conn: Any, run_id: int, batch_id: uuid.UUID) -> None:
-    params = {"run_id": str(run_id), "batch_id": batch_id}
-    started = single_row(conn, conn.run(node_query(STAGE1_NODE, RUN_PARAMS), **params))
-    conn.run(
-        node_query(STAGE1_RECORD_NODE, TIMED_PARAMS),
-        **params,
-        started_at=started["stage1_started_at"],
-    )
-
-
-def build_cards(conn: Any, run_id: int, batch_id: uuid.UUID) -> dict[str, Any]:
-    params = {"run_id": str(run_id), "batch_id": batch_id}
-    loaded = single_row(conn, conn.run(node_query(LOAD_NODE, RUN_PARAMS), **params))
-    output = run_code_node(CARDS_NODE, loaded)
-    assert len(output) == 1
-    item: dict[str, Any] = output[0]["json"]
-    return item
-
-
-def classify_and_record(conn: Any, item: dict[str, Any], cards: list[Any]) -> dict[str, Any]:
-    params = {"run_id": item["run_id"], "batch_id": uuid.UUID(item["batch_id"])}
-    classified = single_row(
-        conn,
-        conn.run(
-            node_query(CLASSIFY_NODE, CLASSIFY_PARAMS),
-            **params,
-            cards=json.dumps(cards),
-            started_at=item["stage2_started_at"],
-        ),
-    )
-    recorded = single_row(
-        conn,
-        conn.run(
-            node_query(RECORD_NODE, TIMED_PARAMS),
-            **params,
-            started_at=classified["stage2_started_at"],
-        ),
-    )
-    return {**classified, **recorded}
-
-
-def run_stage2(conn: Any, run_id: int, batch_id: uuid.UUID) -> dict[str, Any]:
-    """Chain the four Stage 2 nodes exactly as n8n does, each fed with the previous output."""
-    item = build_cards(conn, run_id, batch_id)
-    return {**classify_and_record(conn, item, item["cards"]), "cards": item["cards"]}
 
 
 def outcomes(conn: Any, run_id: int) -> dict[tuple[uuid.UUID, int], dict[str, Any]]:

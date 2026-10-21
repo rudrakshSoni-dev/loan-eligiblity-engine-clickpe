@@ -78,7 +78,7 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         if e["stage"] in {"migrations_done", "seed_done"}
     ]
     assert done == [
-        ("migrations_done", 3),
+        ("migrations_done", 4),
         ("seed_done", 5),
         ("migrations_done", 0),
         ("seed_done", 0),
@@ -88,6 +88,7 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         ["0001_schema"],
         ["0002_match_candidates"],
         ["0003_stage2_rules"],
+        ["0004_stage3_cohorts"],
     ]
     tables = conn.run(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
@@ -125,12 +126,12 @@ def test_edited_migration_is_refused_and_nothing_changes(db_env: dict[str, str],
     edited = [Migration(m.version, m.sql + "\nSELECT 1;") for m in load_migrations()]
     with pytest.raises(MigrationError, match="edited after it was applied"):
         migrate(conn, edited)
-    assert conn.run("SELECT count(*) FROM schema_migrations") == [[3]]
+    assert conn.run("SELECT count(*) FROM schema_migrations") == [[4]]
 
 
 def test_failed_migration_rolls_back_completely(db_env: dict[str, str], conn: Any) -> None:
-    """The real migrations and a half-done 0004 share one transaction, so none leaves anything."""
-    broken = [*load_migrations(), Migration("0004_broken", "CREATE TABLE ok_t (id int); SELEC 1;")]
+    """The real migrations and a half-done 0005 share one transaction, so none leaves anything."""
+    broken = [*load_migrations(), Migration("0005_broken", "CREATE TABLE ok_t (id int); SELEC 1;")]
     with pytest.raises(DatabaseError, match="syntax error"):
         migrate(conn, broken)
     assert conn.run("SELECT to_regclass('users'), to_regclass('schema_migrations')") == [
