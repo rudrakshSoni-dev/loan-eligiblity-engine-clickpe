@@ -20,7 +20,7 @@ custom:
   loadChunkConcurrency: 3
   maxUploadBytes: "20971520"
   dbName: clickpe
-  dbUser: clickpe
+  dbUser: app_ingest
   logGroupPrefix: arn:aws:logs:${aws:region}:${self:custom.accountId}:log-group:/aws/lambda/${self:service}-${sls:stage}
   pythonRequirements:
     fileName: infra/requirements-lambda.txt
@@ -64,7 +64,7 @@ functions:
       DB_PORT: "5432"
       DB_NAME: ${self:custom.dbName}
       DB_USER: ${self:custom.dbUser}
-      DB_PASSWORD: ${ssm:/clickpe/db/password}
+      DB_PASSWORD: ${ssm:/clickpe/db/app_ingest_password}
     url:
       cors:
         allowedOrigins:
@@ -103,7 +103,7 @@ functions:
       DB_PORT: "5432"
       DB_NAME: ${self:custom.dbName}
       DB_USER: ${self:custom.dbUser}
-      DB_PASSWORD: ${ssm:/clickpe/db/password}
+      DB_PASSWORD: ${ssm:/clickpe/db/app_ingest_password}
       N8N_WEBHOOK_URL: ${ssm:/clickpe/n8n/webhook_url}
       N8N_WEBHOOK_SECRET: ${ssm:/clickpe/n8n/webhook_secret}
     events:
@@ -123,7 +123,7 @@ functions:
       DB_PORT: "5432"
       DB_NAME: ${self:custom.dbName}
       DB_USER: ${self:custom.dbUser}
-      DB_PASSWORD: ${ssm:/clickpe/db/password}
+      DB_PASSWORD: ${ssm:/clickpe/db/app_ingest_password}
     url:
       cors:
         allowedOrigins:

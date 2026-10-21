@@ -8,10 +8,17 @@ import json
 import re
 from typing import Any
 
-from tests.workflow_b_helpers import WORKFLOW
+import pytest
+
+from tests.workflow_b_helpers import NODE_BINARY, WORKFLOW, run_code_node
 from tests.workflow_c_helpers import WORKFLOW_C_ID
 
 NODE_REFERENCE = re.compile(r"\$\('([^']+)'\)")
+TRIGGER_NODE = "Trigger · Batch processed (match-batch)"
+READ_BATCH_NODE = "Check · Read batch_id"
+BATCH = "00000000-0000-4000-8000-0000000000aa"
+OTHER_BATCH = "00000000-0000-4000-8000-0000000000bb"
+needs_node = pytest.mark.skipif(NODE_BINARY is None, reason="node not installed")
 COMMENT_LINE = re.compile(r"^\s*(//|/\*|--)", re.MULTILINE)
 
 
@@ -94,3 +101,35 @@ def test_workflow_c_hand_off_names_the_exported_workflow_and_does_not_wait() -> 
     assert notify["type"] == "n8n-nodes-base.executeWorkflow"
     assert notify["parameters"]["workflowId"]["value"] == WORKFLOW_C_ID
     assert notify["parameters"]["options"] == {"waitForSubWorkflow": False}
+
+
+def test_the_trigger_takes_only_a_signed_token_from_inside_the_vpc() -> None:
+    trigger = next(n for n in workflow()["nodes"] if n["name"] == TRIGGER_NODE)
+    assert trigger["typeVersion"] >= 2
+    assert trigger["parameters"]["authentication"] == "jwtAuth"
+    assert trigger["parameters"]["options"]["ipWhitelist"] == "172.31.0.0/16"
+    assert trigger["credentials"] == {"jwtAuth": {"id": "WebhookJwtHs256A", "name": "webhook-jwt"}}
+    assert "httpHeaderAuth" not in json.dumps(workflow())
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("jwt_payload", "body", "valid"),
+    [
+        ({"batch_id": BATCH}, {"batch_id": BATCH}, True),
+        ({"batch_id": OTHER_BATCH}, {"batch_id": BATCH}, False),
+        ({}, {"batch_id": BATCH}, False),
+        (None, {"batch_id": BATCH}, False),
+        ({"batch_id": BATCH.upper()}, {"batch_id": BATCH.upper()}, False),
+        ({"batch_id": ""}, {}, False),
+    ],
+)
+def test_the_body_batch_id_must_be_the_one_the_token_was_signed_for(
+    jwt_payload: dict[str, str] | None, body: dict[str, str], valid: bool
+) -> None:
+    request: dict[str, Any] = {"headers": {}, "body": body}
+    if jwt_payload is not None:
+        request["jwtPayload"] = jwt_payload
+    [output] = run_code_node(READ_BATCH_NODE, request)
+    assert output["json"]["batch_id_valid"] is valid
+    assert output["json"]["batch_id"] == body.get("batch_id", "")
