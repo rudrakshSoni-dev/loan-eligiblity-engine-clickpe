@@ -22,7 +22,8 @@ Sophistication, robustness, efficiency, creative nodes, Optimization Treasure Hu
 | ✅ | Funnel and cost tables in the schema: `pipeline_runs` (per-stage counts, NULL until measured), `cohort_verdicts` (cache keyed by product content hash), `llm_calls` (per-call token ledger) | `db/schema.sql` | T08 |
 | ⬜ | Global error workflow (Workflow E) | `n8n/workflows/` | T25 |
 | ⬜ | Reusable LLM Gateway sub-workflow | `n8n/workflows/` | T26 |
-| ⬜ | Crawl + change detection + structuring (Workflow A) | `n8n/workflows/` | T27–T31 |
+| 🟡 | Workflow A part 1 (fetch + extract), imported into n8n and run on the EC2 instance: config-driven site list, HTTP Request with User-Agent / 30 s timeout / 3 tries / 2 s spacing / continue on fail, per-site CSS selector, text-anchored normalisation, explicit failure branch, sticky note, descriptive node names. Run on 3 lenders: HTTP 200 for all, 13 / 18 / 6 criteria lines; with the spare plus a 404 and a DNS failure added, 4 sites extracted and 2 failures routed to `Mark · Fetch failed` without stopping the others. Change detection, LLM structuring and upsert are T29–T31 | `n8n/workflows/workflow-a-product-discovery.json`, `docs/decisions.md` → "Crawl targets"; `PROGRESS.md` T28 | T28 |
+| ⬜ | Workflow A change detection, structuring, upsert | `n8n/workflows/` | T29–T31 |
 | ⬜ | Multi-stage matching funnel with measured numbers (Workflow B) | `n8n/workflows/`, `pipeline_runs` | T32–T36 |
 | ⬜ | Benchmark at 100k rows | `scripts/benchmark.md` | T37 |
 | ⬜ | Notification with recipient guard (Workflow C) | `n8n/workflows/` | T38–T39 |

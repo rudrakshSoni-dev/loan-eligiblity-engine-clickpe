@@ -649,16 +649,28 @@ Three primary targets plus one spare. Each serves its criteria text in static HT
   text. IDFC FIRST and Kotak print "9.99% p.a." / "10.99%" in prose. Products without a rate keep
   `interest_rate_min/max` NULL and a lower `parse_confidence` in T30; that is the honest input to
   Stage 2's borderline rule, not something to guess.
-- Credit score floors are only on ICICI ("700 and above is preferred") and IDFC FIRST (710) here.
-  HDFC publishes none, so its `min_credit_score` stays NULL (unconstrained).
+- Credit score floors: ICICI ("700 and above is preferred"), IDFC FIRST (710) and, found by T28's
+  extraction, HDFC (FAQ text: "minimum credit score of 720"; "above 720 is ideal"). The T27 probe had
+  missed HDFC's because it lives in an accordion FAQ, not the eligibility list. HDFC's 720 is
+  worded as a requirement in one line and as "ideal" in another, which makes it a natural borderline
+  case for Stage 2/3.
 
-**Selectors (T28 refines them against the live DOM).**
-- ICICI: `li > span.step-bullet` (the key-criteria list).
-- HDFC: `li > span.description` under the eligibility block.
-- IDFC FIRST: `li` items whose text starts with "Age:", "CIBIL Score:" or "Occupation:".
-- BankBazaar: `table tr`, label in the first `td p`, value in the second.
-Because class names on these sites are generated and can change, extraction is text-anchored (keep
-lines containing income, age, score, employment, rate) rather than depending on one class.
+**Selectors (confirmed in T28 against the live DOM, from the EC2 IP).** Each site has one CSS selector
+in the workflow's `Config · Crawl targets` node; the HTML Extract node reads it per item.
+
+| Site | Selector | Lines kept (2026-10-21 run) |
+|---|---|---|
+| ICICI | `span.step-bullet` | 13 |
+| HDFC | `span.description, span.accordion-faq_description, div.accordion-faq_description p` | 18 |
+| IDFC FIRST | `h1.hd1, li.eligi-hover-content, div.gsa-ir-desc p, div.gfnfnb-desc p.txt` | 6 |
+| BankBazaar (spare, disabled) | `table.w-full tr` | 23 |
+
+Class names on these sites are generated and can change, so a selector only narrows the page to the
+eligibility region. The decision of what counts as a criterion is text-anchored in the
+`Normalize · Criteria lines` node: keep lines with income, age, score, employment or rate wording that
+also contain a number or an employment word, drop bracketed image paths, bullets, boilerplate
+("disclaimer", "terms and conditions") and month/year strings, then de-duplicate and sort. If a
+redesign breaks a selector the run does not fail silently: the site gets `status = no_criteria_found`.
 
 **Rejected.**
 - Kotak: the personal-loan page (820,923 bytes) has the rate ("Starting at 10.99% p.a.") and the

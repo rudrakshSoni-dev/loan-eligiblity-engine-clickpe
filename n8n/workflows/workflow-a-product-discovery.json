@@ -1,0 +1,351 @@
+[
+  {
+    "id": "wfaproductdisc01",
+    "name": "A · Product discovery",
+    "active": false,
+    "nodes": [
+      {
+        "parameters": {
+          "content": "## Workflow A · Product discovery (part 1: fetch + extract)\n\n**Purpose.** Collect the published personal-loan eligibility criteria of each lender as clean, comparable text.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled. Add or disable a site there; nothing else changes.\n\n**Stages.**\n1. Fetch each page (real browser User-Agent, redirects followed, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s).\n2. Non-200 or network error -> `Mark · Fetch failed` (the other sites carry on).\n3. `Extract · Criteria blocks` takes the site's selector.\n4. `Normalize · Criteria lines` keeps lines that mention income, age, score, employment or rate, strips bullets and month/year strings, removes duplicates, sorts them.\n\n**Output.** One item per site: `criteria_lines`, `criteria_text`, `status` (`ok` / `no_criteria_found` / `fetch_failed`), `http_status`.\n\n**Next.** T29 hashes `criteria_text` to skip unchanged pages, T30 structures it with the LLM, T31 upserts `loan_products`.",
+          "height": 560,
+          "width": 520,
+          "color": 4
+        },
+        "id": "a0000000-0000-4000-8000-000000000001",
+        "name": "Note · Workflow A overview",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -200,
+          -140
+        ]
+      },
+      {
+        "parameters": {
+          "rule": {
+            "interval": [
+              {
+                "field": "days",
+                "daysInterval": 1,
+                "triggerAtHour": 6,
+                "triggerAtMinute": 0
+              }
+            ]
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000002",
+        "name": "Trigger · Daily 06:00 IST",
+        "type": "n8n-nodes-base.scheduleTrigger",
+        "typeVersion": 1.2,
+        "position": [
+          400,
+          80
+        ]
+      },
+      {
+        "parameters": {},
+        "id": "a0000000-0000-4000-8000-000000000003",
+        "name": "Trigger · Manual run",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          400,
+          260
+        ]
+      },
+      {
+        "parameters": {
+          "jsCode": "const sites = [\n  {\n    source: 'ICICI Bank',\n    product_name: 'Personal Loan',\n    url: 'https://www.icici.bank.in/personal-banking/loans/personal-loan/eligibility',\n    selector: 'span.step-bullet',\n    role: 'primary',\n    enabled: true,\n  },\n  {\n    source: 'HDFC Bank',\n    product_name: 'Personal Loan',\n    url: 'https://www.hdfc.bank.in/personal-loan/eligibility-criteria',\n    selector: 'span.description, span.accordion-faq_description, div.accordion-faq_description p',\n    role: 'primary',\n    enabled: true,\n  },\n  {\n    source: 'IDFC FIRST Bank',\n    product_name: 'Personal Loan',\n    url: 'https://www.idfcfirst.bank.in/personal-banking/loans/personal-loan',\n    selector: 'h1.hd1, li.eligi-hover-content, div.gsa-ir-desc p, div.gfnfnb-desc p.txt',\n    role: 'primary',\n    enabled: true,\n  },\n  {\n    source: 'BankBazaar',\n    product_name: 'Personal Loan',\n    url: 'https://www.bankbazaar.com/personal-loan-eligibility.html',\n    selector: 'table.w-full tr',\n    role: 'spare',\n    enabled: false,\n  },\n];\n\nreturn sites.filter((site) => site.enabled).map((site) => ({ json: site }));"
+        },
+        "id": "a0000000-0000-4000-8000-000000000004",
+        "name": "Config · Crawl targets",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          640,
+          160
+        ]
+      },
+      {
+        "parameters": {
+          "method": "GET",
+          "url": "={{ $json.url }}",
+          "sendHeaders": true,
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "User-Agent",
+                "value": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+              },
+              {
+                "name": "Accept",
+                "value": "text/html,application/xhtml+xml"
+              },
+              {
+                "name": "Accept-Language",
+                "value": "en-IN,en;q=0.9"
+              }
+            ]
+          },
+          "options": {
+            "redirect": {
+              "redirect": {
+                "followRedirects": true,
+                "maxRedirects": 5
+              }
+            },
+            "timeout": 30000,
+            "batching": {
+              "batch": {
+                "batchSize": 1,
+                "batchInterval": 2000
+              }
+            },
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true,
+                "responseFormat": "text",
+                "outputPropertyName": "data"
+              }
+            }
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000005",
+        "name": "Fetch · Crawl page",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          880,
+          160
+        ],
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 5000,
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "fetch-ok",
+                "leftValue": "={{ $json.statusCode === 200 && !$json.error }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "a0000000-0000-4000-8000-000000000006",
+        "name": "Check · Page fetched OK",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          1120,
+          160
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "extractHtmlContent",
+          "dataPropertyName": "data",
+          "extractionValues": {
+            "values": [
+              {
+                "key": "blocks",
+                "cssSelector": "={{ $('Config · Crawl targets').item.json.selector }}",
+                "returnValue": "text",
+                "returnArray": true
+              }
+            ]
+          },
+          "options": {
+            "trimValues": true,
+            "cleanUpText": false
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000007",
+        "name": "Extract · Criteria blocks",
+        "type": "n8n-nodes-base.html",
+        "typeVersion": 1.2,
+        "position": [
+          1360,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const CRITERIA_WORDS = /(income|salary|age\\b|years|cibil|credit score|score|employ|salaried|self-employed|business|interest|p\\.a\\.|p\\.m|₹|rs\\.)/i;\nconst MONTH_YEAR = /(?:\\s+(?:in|on|as of))?\\s*\\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\s*['’]?\\s*\\d{2,4}\\b/gi;\nconst HAS_NUMBER_OR_PROFILE = /(\\d|salaried|self-employed|employee|business)/i;\nconst BOILERPLATE = /(disclaimer|terms and conditions|click here)/i;\nconst MIN_LINE_LENGTH = 20;\nconst MAX_LINE_LENGTH = 400;\n\nfunction cleanLine(raw) {\n  return String(raw)\n    .replace(/[\\u00a0\\u200b]/g, ' ')\n    .replace(/\\[[^\\]]*\\]/g, ' ')\n    .replace(/[•*]+/g, ' ')\n    .replace(MONTH_YEAR, '')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction criteriaLines(blocks) {\n  const lines = blocks\n    .map(cleanLine)\n    .filter((line) => line.length >= MIN_LINE_LENGTH && line.length <= MAX_LINE_LENGTH)\n    .filter((line) => CRITERIA_WORDS.test(line))\n    .filter((line) => HAS_NUMBER_OR_PROFILE.test(line))\n    .filter((line) => !BOILERPLATE.test(line));\n  return [...new Set(lines)].sort();\n}\n\nconst target = $('Config · Crawl targets').item.json;\nconst fetched = $('Fetch · Crawl page').item.json;\nconst lines = criteriaLines($input.item.json.blocks || []);\n\nreturn {\n  json: {\n    source: target.source,\n    product_name: target.product_name,\n    source_url: target.url,\n    role: target.role,\n    status: lines.length > 0 ? 'ok' : 'no_criteria_found',\n    http_status: fetched.statusCode,\n    html_bytes: String(fetched.data || '').length,\n    line_count: lines.length,\n    criteria_lines: lines,\n    criteria_text: lines.join('\\n'),\n    fetched_at: new Date().toISOString(),\n  },\n};"
+        },
+        "id": "a0000000-0000-4000-8000-000000000008",
+        "name": "Normalize · Criteria lines",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1600,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "f1",
+                "name": "source",
+                "type": "string",
+                "value": "={{ $('Config · Crawl targets').item.json.source }}"
+              },
+              {
+                "id": "f2",
+                "name": "product_name",
+                "type": "string",
+                "value": "={{ $('Config · Crawl targets').item.json.product_name }}"
+              },
+              {
+                "id": "f3",
+                "name": "source_url",
+                "type": "string",
+                "value": "={{ $('Config · Crawl targets').item.json.url }}"
+              },
+              {
+                "id": "f4",
+                "name": "role",
+                "type": "string",
+                "value": "={{ $('Config · Crawl targets').item.json.role }}"
+              },
+              {
+                "id": "f5",
+                "name": "status",
+                "type": "string",
+                "value": "fetch_failed"
+              },
+              {
+                "id": "f6",
+                "name": "http_status",
+                "type": "number",
+                "value": "={{ $json.statusCode ?? 0 }}"
+              },
+              {
+                "id": "f7",
+                "name": "error",
+                "type": "string",
+                "value": "={{ String($json.error?.message ?? $json.error ?? ('HTTP ' + $json.statusCode)) }}"
+              },
+              {
+                "id": "f8",
+                "name": "fetched_at",
+                "type": "string",
+                "value": "={{ $now.toISO() }}"
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "a0000000-0000-4000-8000-000000000009",
+        "name": "Mark · Fetch failed",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          1360,
+          280
+        ]
+      }
+    ],
+    "connections": {
+      "Trigger · Daily 06:00 IST": {
+        "main": [
+          [
+            {
+              "node": "Config · Crawl targets",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Trigger · Manual run": {
+        "main": [
+          [
+            {
+              "node": "Config · Crawl targets",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Config · Crawl targets": {
+        "main": [
+          [
+            {
+              "node": "Fetch · Crawl page",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Fetch · Crawl page": {
+        "main": [
+          [
+            {
+              "node": "Check · Page fetched OK",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check · Page fetched OK": {
+        "main": [
+          [
+            {
+              "node": "Extract · Criteria blocks",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Mark · Fetch failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Extract · Criteria blocks": {
+        "main": [
+          [
+            {
+              "node": "Normalize · Criteria lines",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Kolkata",
+      "saveManualExecutions": true
+    },
+    "pinData": {}
+  }
+]

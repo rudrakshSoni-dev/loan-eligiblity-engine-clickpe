@@ -102,3 +102,22 @@ Created in the editor by name; workflows reference only these names. Screenshots
 SES role chain: instance role `clickpe-n8n-ec2-role` (inline policy `assume-n8n-ses-role`, `sts:AssumeRole` on one ARN) assumes `clickpe-n8n-ses-role` (trust: that instance role only; policy `ses-send-test-identities`: `ses:SendEmail` and `ses:SendRawEmail` on the three verified identities). Policy documents are in `infra/iam/`. From the instance, `aws sts assume-role` returned `assumed-role/clickpe-n8n-ses-role/t24check`. No static keys exist.
 
 First attempt on `rds-postgres` failed with `self-signed certificate in certificate chain` (the RDS CA is not in Node's trust store); the fix was the `NODE_EXTRA_CA_CERTS` mount above, not the Ignore SSL Issues toggle.
+
+## Importing and running a workflow (T28)
+
+The public API is disabled, so workflows are imported with the n8n CLI inside the container through SSM
+Run Command. `n8n execute` starts a second n8n process, so its task-broker and HTTP ports are moved
+(otherwise it exits with "Task Broker's port 5679 is already in use"). Imports are keyed by the workflow
+`id`, so importing the same file again overwrites the workflow. The run is saved as an execution with mode
+`cli` and is visible in the editor's Executions list.
+
+```bash
+export AWS_PROFILE=clickpe AWS_REGION=ap-southeast-2 AWS_PAGER=""
+I=i-02ffa9d08e8403a4a
+B64=$(base64 -w0 n8n/workflows/workflow-a-product-discovery.json)
+aws ssm send-command --instance-ids $I --document-name AWS-RunShellScript --timeout-seconds 300 \
+  --parameters "commands=[\"echo $B64 | base64 -d > /tmp/wf.json && docker cp /tmp/wf.json n8n:/tmp/wf.json && docker exec n8n n8n import:workflow --input=/tmp/wf.json && docker exec -e N8N_RUNNERS_BROKER_PORT=5680 -e N8N_PORT=5681 n8n n8n execute --id=wfaproductdisc01 > /dev/null; rm -f /tmp/wf.json\"]"
+```
+
+`n8n execute` prints the whole run data to stdout and cuts it off inside the first multi-megabyte page,
+so results are read from the saved execution in `database.sqlite` (read-only) instead.

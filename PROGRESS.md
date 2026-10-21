@@ -29,7 +29,7 @@
 | T25 | P1 | Workflow E — global error handler | TODO | |  |
 | T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | |  |
 | T27 | P0 | Crawl targets ⚖️ | DONE | 2026-10-21 | ICICI, HDFC, IDFC FIRST primary + BankBazaar spare; criteria in static HTML from the EC2 IP; robots allow all 4 paths; banks moved to `bank.in` (301) |
-| T28 | P0 | Workflow A: fetch + extract | TODO | |  |
+| T28 | P0 | Workflow A: fetch + extract | DONE | 2026-10-21 | 3 lenders HTTP 200 → 13 / 18 / 6 criteria lines; spare + 404 + DNS failure variant: 4 extracted, 2 routed to the failure branch; imported and run on EC2 via the n8n CLI |
 | T29 | P1 | Workflow A: change detection | TODO | |  |
 | T30 | P0 | Workflow A: structuring via LLM Gateway | TODO | |  |
 | T31 | P0 | Workflow A: upsert + lifecycle | TODO | |  |
@@ -661,3 +661,23 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why not crawl all five candidates? A: Kotak has no criteria in static HTML and BankBazaar is an aggregator, not a lender's product; three real lenders give distinct thresholds (₹25k/₹30k income, 700/710 score) without extra maintenance.
   - Q: What if a site blocks the EC2 IP or changes its layout? A: The site list is config-driven, each site has its own error branch (T31) so the others still update, and BankBazaar is a ready spare.
   - Q: Why extract text lines instead of relying on CSS classes? A: The sites use generated class names that can change; anchoring on income/age/score/rate wording survives redesigns and also gives a stable text to hash for change detection.
+
+### T28 — Workflow A: fetch + extract (2026-10-21)
+- Files: n8n/workflows/workflow-a-product-discovery.json (new), docs/decisions.md ("Crawl targets": selectors confirmed, HDFC score floor corrected), docs/rubric-evidence.md, infra/n8n.md (import/run commands).
+- Workflow: id `wfaproductdisc01`, 8 nodes + sticky note, inactive. `Trigger · Daily 06:00 IST` and `Trigger · Manual run` → `Config · Crawl targets` (Code, 4 sites, `enabled` flag, BankBazaar spare disabled) → `Fetch · Crawl page` (HTTP Request: browser User-Agent, redirects, 30 s timeout, Retry On Fail 3 × 5 s, 1 request / 2 s, full response, never error, continue on error) → `Check · Page fetched OK` → true: `Extract · Criteria blocks` (HTML Extract, per-site selector) → `Normalize · Criteria lines` (Code, per item); false: `Mark · Fetch failed` (Set).
+- Evidence (n8n 2.44.4 on `i-02ffa9d08e8403a4a`, execution ids from `execution_entity`):
+  - DOM probe from the EC2 IP found real selectors for all 4 pages (ICICI `span.step-bullet`, HDFC `span.description`, IDFC `li.eligi-hover-content`, BankBazaar `table.w-full tr`).
+  - First run (execution 11): every node `success`, 3 items through; criteria text had glued words ("forself-employed"), image paths and advice lines. Fixed (`cleanUpText` off, bracket strip, number-or-employment and boilerplate filters).
+  - Final run (execution 14): `Config` 3 items → `Fetch` 3 × HTTP 200 (1,233,541 / 1,095,978 / 2,666,718 chars, 6.2 s total) → `Extract` 1.5 s → `Normalize` 0.25 s; ICICI 13, HDFC 18, IDFC FIRST 6 `criteria_lines`, all `status: ok`. Same counts as execution 12, so the output is stable between runs.
+  - Failure/spare drill (execution 13, temporary config, same workflow id; final file re-imported afterwards): 6 sites in → `Fetch` 6 items → 4 to Extract/Normalize (ICICI 13, HDFC 18, IDFC 6, BankBazaar 23 lines) and 2 to `Mark · Fetch failed`: `HTTP 404` (status 404) and `getaddrinfo ENOTFOUND no-such-host.invalid` (status 0). Execution status stayed `success`.
+  - Secrets scan of the JSON: clean; `pinData` empty.
+- Quality gates: no Python in the repo touched, so ruff/mypy/pytest not re-run. Scratch scripts (generator, SSM runner, execution reader) are in the session scratchpad only.
+- Found: HDFC's FAQ states "minimum credit score of 720" (T27's probe had said HDFC publishes none) → decisions.md corrected; it is a natural borderline case. `n8n execute` needs `N8N_RUNNERS_BROKER_PORT`/`N8N_PORT` overrides and truncates its stdout, so results are read from the saved execution.
+- Open: Error Workflow = Workflow E is not set yet (Workflow E is T25); T25 must point A at it. No credentials are used by this part. The workflow stays inactive until T31 so the daily schedule does not run before change detection exists. Executions 11–14 (mode `cli`) remain in the editor list until pruned (168 h).
+- Rubric: n8n Workflow Design (config-driven fetch, retry + explicit error branch, per-item robustness, descriptive nodes and sticky note).
+- Explain it back:
+  - Built: the first half of Workflow A: it fetches each lender's page and reduces it to normalised, sorted criteria lines, with a separate output for pages that failed.
+  - Why this over the obvious alternative (one HTML Extract per site, or hash the raw HTML): one generic fetch → extract → normalise chain driven by a site list means adding a lender is a config edit; narrowing by selector but deciding by wording keeps extraction alive through class-name changes, and the output is the stable text T29 will hash.
+  - Q: What happens if a site changes layout so the selector matches nothing? A: `Normalize` emits `status: no_criteria_found` with 0 lines rather than failing the run, so later steps (and `crawl_runs`, T29/T31) can flag it without losing the other sites.
+  - Q: Why `neverError` plus an IF instead of letting the HTTP node fail? A: A 404/403 is data (a site-level outcome), not a workflow error; routing it keeps the other sites running, and only genuine network errors use continue-on-fail. Drill: a 404 and a DNS failure both reached `Mark · Fetch failed` while 4 other sites were extracted.
+  - Q: Why sort and de-duplicate the lines and strip month/year text? A: The page carries repeated and date-bearing text ("in Oct'26"); sorting and stripping make the text identical across days when criteria are unchanged, which is what the T29 content hash needs. Two runs gave identical line counts per site.
