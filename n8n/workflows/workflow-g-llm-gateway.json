@@ -1,0 +1,462 @@
+[
+  {
+    "id": "wfllmgateway01",
+    "name": "G · LLM Gateway",
+    "active": false,
+    "nodes": [
+      {
+        "parameters": {
+          "content": "## G · LLM Gateway (sub-workflow used by A and B)\n\n**Purpose.** The only place in the system that talks to Groq. It turns one prompt plus a JSON schema into a checked JSON answer, records every HTTP attempt in `llm_calls`, and handles rate limits, outages and bad replies the same way for every caller.\n\n**Trigger.** Execute Workflow Trigger with typed inputs. Workflow A (`LLM · Structure criteria (LLM Gateway)`) and Workflow B (`LLM · Judge cohorts (LLM Gateway)`) call it with Execute Workflow, mode \"Run once for each item\", and wait for the answer. One request per execution; more than one input item is refused with an error.\n\n**Input.** `purpose` (ledger label, e.g. `crawl_structuring`, `cohort_verdict`), `model` (`openai/gpt-oss-120b` or `openai/gpt-oss-20b`), `system`, `user`, `schema_name`, `json_schema` (root type object), `max_tokens` (1-4,000), optional `batch_id` and `run_id` for the ledger.\n\n**Output.** One item: `ok`, `data` (the parsed answer, only when `ok`), `error_kind` (`bad_request`, `budget`, `rate_limited`, `http_error`, `network`, `invalid_reply`), `error`, `status`, `model` (the model that answered), `requested_model`, `fallback_used`, `fallback_reason`, `tokens`, `prompt_tokens`, `completion_tokens`, `latency_ms` (Groq's server time), `attempts` (= ledger rows written), `rate_limit_waits`, `waited_seconds`, `estimated_tokens`. A failure is an answer with `ok = false`, never a thrown error, so callers decide (A logs `crawl_runs`; B marks cohorts unresolved).\n\n**Stages.**\n1. `Budget` sums the last 24 h of `llm_calls` per model. `Prepare` checks the inputs, estimates tokens (characters / 3 + `max_tokens`), refuses a request larger than Groq's 8,000 tokens per minute, and picks the first model with room in the daily budget (190,000 tokens and 950 calls per model, under Groq's 200,000 / 1,000). If the ledger cannot be read it refuses: it never spends blind.\n2. `Attempt` builds the Groq body: strict JSON-schema Structured Outputs, temperature 0, `reasoning_effort` low, reasoning not returned. `LLM · Groq chat completion` sends it (30 s timeout, full response, never error on HTTP status, Retry On Fail 3 x 5 s, which therefore only repeats network failures).\n3. `Read` classifies the reply. 200: `finish_reason` must be `stop`, the content must parse as JSON and match the caller's schema (types, required, no extra keys, enums). 429: wait `retry-after` + 1 s if that is at most 60 s, up to 3 times per model, then switch once to `gpt-oss-20b` (separate Groq quota); no retry-after header = 10 s. 5xx: switch to the 20b model at once. Other status or no response: answer with the error.\n4. `Log · llm_calls` writes one row per attempt (purpose, model, tokens, status, server latency, batch, run). It has no Retry On Fail, because a retried INSERT duplicated rows in T30.\n5. `Route` loops through `Wait · Rate-limit backoff` back to `Attempt`, or ends at `Return`, which emits only the public fields. Waits stay at or under 60 s, below n8n's 65 s offload point for waiting sub-workflows.\n\n**Error workflow.** Workflow E.",
+          "height": 900,
+          "width": 760,
+          "color": 4
+        },
+        "id": "90000000-0000-4000-8000-000000000001",
+        "name": "Note · LLM Gateway overview",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -160,
+          -620
+        ]
+      },
+      {
+        "parameters": {
+          "inputSource": "workflowInputs",
+          "workflowInputs": {
+            "values": [
+              {
+                "name": "purpose",
+                "type": "string"
+              },
+              {
+                "name": "model",
+                "type": "string"
+              },
+              {
+                "name": "system",
+                "type": "string"
+              },
+              {
+                "name": "user",
+                "type": "string"
+              },
+              {
+                "name": "schema_name",
+                "type": "string"
+              },
+              {
+                "name": "json_schema",
+                "type": "object"
+              },
+              {
+                "name": "max_tokens",
+                "type": "number"
+              },
+              {
+                "name": "batch_id",
+                "type": "string"
+              },
+              {
+                "name": "run_id",
+                "type": "number"
+              }
+            ]
+          }
+        },
+        "id": "90000000-0000-4000-8000-000000000002",
+        "name": "Trigger · Called by A or B",
+        "type": "n8n-nodes-base.executeWorkflowTrigger",
+        "typeVersion": 1.1,
+        "position": [
+          700,
+          200
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT coalesce(jsonb_object_agg(model, jsonb_build_object('tokens', tokens, 'calls', calls)), '{}'::jsonb) AS usage\nFROM (\n  SELECT model,\n         sum(coalesce(prompt_tokens, 0) + coalesce(completion_tokens, 0))::bigint AS tokens,\n         count(*)::bigint AS calls\n  FROM llm_calls\n  WHERE created_at > now() - interval '24 hours'\n  GROUP BY model\n) AS used",
+          "options": {}
+        },
+        "id": "90000000-0000-4000-8000-000000000003",
+        "name": "Budget · Usage last 24 h",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          940,
+          200
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "jsCode": "const MODELS = {\n  'openai/gpt-oss-120b': { fallback: 'openai/gpt-oss-20b' },\n  'openai/gpt-oss-20b': { fallback: null },\n};\nconst DAILY_TOKEN_BUDGET = 190000;\nconst DAILY_REQUEST_BUDGET = 950;\nconst TOKENS_PER_MINUTE_LIMIT = 8000;\nconst MAX_COMPLETION_TOKENS = 4000;\nconst CHARS_PER_TOKEN_ESTIMATE = 3;\nconst PURPOSE_PATTERN = /^[a-z][a-z0-9_]{2,39}$/;\nconst SCHEMA_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;\nconst UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\n\nconst requests = $('Trigger · Called by A or B').all();\nif (requests.length !== 1) {\n  throw new Error(\n    `LLM Gateway takes exactly one request per execution, got ${requests.length}. Call it with Execute Workflow mode \"Run once for each item\".`,\n  );\n}\nconst input = requests[0].json;\nconst ledger = $input.first().json;\n\nfunction isBlank(value) {\n  return value === null || value === undefined || value === '';\n}\n\nfunction isPlainObject(value) {\n  return value !== null && typeof value === 'object' && !Array.isArray(value);\n}\n\nfunction normalised(raw) {\n  return {\n    purpose: raw.purpose,\n    model: raw.model,\n    system: raw.system,\n    user: raw.user,\n    schema_name: raw.schema_name,\n    json_schema: raw.json_schema,\n    max_tokens: Number(raw.max_tokens),\n    batch_id: isBlank(raw.batch_id) ? null : String(raw.batch_id),\n    run_id: isBlank(raw.run_id) ? null : Number(raw.run_id),\n  };\n}\n\nfunction problems(request) {\n  const found = [];\n  if (typeof request.purpose !== 'string' || !PURPOSE_PATTERN.test(request.purpose)) {\n    found.push('purpose must be a lower-case name such as cohort_verdict');\n  }\n  if (!(request.model in MODELS)) {\n    found.push(`model must be one of ${Object.keys(MODELS).join(', ')}`);\n  }\n  for (const field of ['system', 'user']) {\n    if (typeof request[field] !== 'string' || request[field].trim() === '') {\n      found.push(`${field} must be a non-empty string`);\n    }\n  }\n  if (typeof request.schema_name !== 'string' || !SCHEMA_NAME_PATTERN.test(request.schema_name)) {\n    found.push('schema_name must be 1-64 letters, digits, _ or -');\n  }\n  if (!isPlainObject(request.json_schema) || request.json_schema.type !== 'object') {\n    found.push('json_schema must be a JSON schema whose root type is object');\n  }\n  if (!Number.isInteger(request.max_tokens) || request.max_tokens < 1 || request.max_tokens > MAX_COMPLETION_TOKENS) {\n    found.push(`max_tokens must be a whole number from 1 to ${MAX_COMPLETION_TOKENS}`);\n  }\n  if (request.batch_id !== null && !UUID_PATTERN.test(request.batch_id)) {\n    found.push('batch_id must be a UUID or empty');\n  }\n  if (request.run_id !== null && !(Number.isInteger(request.run_id) && request.run_id > 0)) {\n    found.push('run_id must be a positive whole number or empty');\n  }\n  if (request.run_id !== null && request.batch_id === null) {\n    found.push('run_id needs a batch_id');\n  }\n  return found;\n}\n\nfunction estimatedTokens(request) {\n  const promptChars = request.system.length + request.user.length + JSON.stringify(request.json_schema).length;\n  return Math.ceil(promptChars / CHARS_PER_TOKEN_ESTIMATE) + request.max_tokens;\n}\n\nfunction fitsBudget(usage, model, estimate) {\n  const used = usage[model] || {};\n  return Number(used.tokens ?? 0) + estimate <= DAILY_TOKEN_BUDGET && Number(used.calls ?? 0) < DAILY_REQUEST_BUDGET;\n}\n\nfunction state(request, fields) {\n  return {\n    request,\n    requested_model: request.model,\n    model: request.model,\n    fallback_model: null,\n    fallback_used: false,\n    fallback_reason: null,\n    estimated_tokens: null,\n    attempt: 0,\n    waits_on_model: 0,\n    rate_limit_waits: 0,\n    waited_seconds: 0,\n    tokens: { prompt: 0, completion: 0 },\n    next: 'call',\n    wait_seconds: null,\n    outcome: null,\n    ...fields,\n  };\n}\n\nfunction refused(request, kind, message, fields = {}) {\n  return state(request, {\n    ...fields,\n    next: 'return',\n    outcome: { ok: false, data: null, status: null, error_kind: kind, error: message, finish_reason: null, model: null, latency_ms: null },\n  });\n}\n\nfunction planned(request) {\n  const found = problems(request);\n  if (found.length > 0) {\n    return refused(request, 'bad_request', `LLM Gateway refused the request: ${found.join('; ')}`);\n  }\n  const estimate = estimatedTokens(request);\n  if (estimate > TOKENS_PER_MINUTE_LIMIT) {\n    return refused(\n      request,\n      'bad_request',\n      `LLM Gateway refused the request: it needs an estimated ${estimate} tokens, more than Groq's ${TOKENS_PER_MINUTE_LIMIT} tokens per minute, so Groq could never serve it`,\n      { estimated_tokens: estimate },\n    );\n  }\n  if (!isPlainObject(ledger.usage)) {\n    return refused(request, 'budget', 'LLM Gateway refused the request: the llm_calls ledger could not be read, so the daily budget cannot be checked', {\n      estimated_tokens: estimate,\n    });\n  }\n  const fallback = MODELS[request.model].fallback;\n  const candidates = [request.model, fallback].filter((model) => model && fitsBudget(ledger.usage, model, estimate));\n  if (candidates.length === 0) {\n    return refused(\n      request,\n      'budget',\n      `LLM Gateway refused the request: the daily budget (${DAILY_TOKEN_BUDGET} tokens, ${DAILY_REQUEST_BUDGET} calls per model in 24 h) has no room for an estimated ${estimate} tokens`,\n      { estimated_tokens: estimate },\n    );\n  }\n  const model = candidates[0];\n  return state(request, {\n    model,\n    fallback_model: candidates.find((candidate) => candidate !== model && candidate === fallback) ?? null,\n    fallback_used: model !== request.model,\n    fallback_reason: model !== request.model ? 'budget' : null,\n    estimated_tokens: estimate,\n  });\n}\n\nreturn [{ json: planned(normalised(input)) }];"
+        },
+        "id": "90000000-0000-4000-8000-000000000004",
+        "name": "Prepare · Check request + budget",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1180,
+          200
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "request-accepted",
+                "leftValue": "={{ $json.next === 'call' }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "90000000-0000-4000-8000-000000000005",
+        "name": "Check · Request accepted",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          1420,
+          200
+        ]
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const call = $input.item.json;\nconst { request } = call;\n\nreturn {\n  json: {\n    ...call,\n    attempt: call.attempt + 1,\n    groq_request: {\n      model: call.model,\n      temperature: 0,\n      reasoning_effort: 'low',\n      include_reasoning: false,\n      max_completion_tokens: request.max_tokens,\n      messages: [\n        { role: 'system', content: request.system },\n        { role: 'user', content: request.user },\n      ],\n      response_format: {\n        type: 'json_schema',\n        json_schema: { name: request.schema_name, strict: true, schema: request.json_schema },\n      },\n    },\n  },\n};"
+        },
+        "id": "90000000-0000-4000-8000-000000000006",
+        "name": "Attempt · Build Groq body",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1660,
+          100
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.groq.com/openai/v1/chat/completions",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpHeaderAuth",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ $json.groq_request }}",
+          "options": {
+            "timeout": 30000,
+            "response": {
+              "response": {
+                "fullResponse": true,
+                "neverError": true,
+                "responseFormat": "json"
+              }
+            }
+          }
+        },
+        "id": "90000000-0000-4000-8000-000000000007",
+        "name": "LLM · Groq chat completion",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.2,
+        "position": [
+          1900,
+          100
+        ],
+        "credentials": {
+          "httpHeaderAuth": {
+            "id": "pgrgkUiUod78DwXh",
+            "name": "groq-api"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 5000,
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const MAX_WAITS_PER_MODEL = 3;\nconst MAX_WAIT_SECONDS = 60;\nconst DEFAULT_WAIT_SECONDS = 10;\nconst WAIT_MARGIN_SECONDS = 1;\nconst SWITCH_WAIT_SECONDS = 1;\nconst MAX_ERROR_CHARS = 300;\nconst MAX_SCHEMA_ERRORS = 5;\n\nconst { groq_request: sentRequest, ...call } = $('Attempt · Build Groq body').item.json;\nconst response = $input.item.json;\nconst status = typeof response.statusCode === 'number' ? response.statusCode : 0;\nconst body = response.body !== null && typeof response.body === 'object' ? response.body : {};\nconst usage = body.usage || {};\nconst promptTokens = Number.isInteger(usage.prompt_tokens) ? usage.prompt_tokens : null;\nconst completionTokens = Number.isInteger(usage.completion_tokens) ? usage.completion_tokens : null;\nconst latencyMs = typeof usage.total_time === 'number' ? Math.round(usage.total_time * 1000) : null;\n\nfunction clip(text) {\n  return String(text).slice(0, MAX_ERROR_CHARS);\n}\n\nfunction groqMessage() {\n  const message = body.error && body.error.message;\n  return message ? `: ${message}` : '';\n}\n\nfunction typeOf(value) {\n  if (value === null) return 'null';\n  if (Array.isArray(value)) return 'array';\n  if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';\n  return typeof value;\n}\n\nfunction typeMatches(value, expected) {\n  const actual = typeOf(value);\n  return actual === expected || (expected === 'number' && actual === 'integer');\n}\n\nfunction schemaErrors(value, schema, path, errors) {\n  if (errors.length >= MAX_SCHEMA_ERRORS || schema === null || typeof schema !== 'object') return errors;\n  if (schema.type !== undefined) {\n    const types = [].concat(schema.type);\n    if (!types.some((type) => typeMatches(value, type))) {\n      errors.push(`${path} should be ${types.join(' or ')}, got ${typeOf(value)}`);\n      return errors;\n    }\n  }\n  if (Array.isArray(schema.enum) && !schema.enum.some((option) => option === value)) {\n    errors.push(`${path} is not one of the allowed values`);\n  }\n  if (typeOf(value) === 'object' && schema.properties) {\n    for (const key of schema.required || []) {\n      if (!(key in value)) errors.push(`${path}.${key} is missing`);\n    }\n    if (schema.additionalProperties === false) {\n      for (const key of Object.keys(value)) {\n        if (!(key in schema.properties)) errors.push(`${path}.${key} is not allowed`);\n      }\n    }\n    for (const [key, child] of Object.entries(schema.properties)) {\n      if (key in value) schemaErrors(value[key], child, `${path}.${key}`, errors);\n    }\n  }\n  if (typeOf(value) === 'array' && schema.items) {\n    value.forEach((element, index) => schemaErrors(element, schema.items, `${path}[${index}]`, errors));\n  }\n  return errors.slice(0, MAX_SCHEMA_ERRORS);\n}\n\nfunction finish(outcome) {\n  return { next: 'return', wait_seconds: null, outcome: { latency_ms: latencyMs, ...outcome } };\n}\n\nfunction failure(kind, message) {\n  return finish({ ok: false, data: null, status, error_kind: kind, error: clip(message), finish_reason: null, model: call.model });\n}\n\nfunction retry(waitSeconds, changes) {\n  return {\n    next: 'retry',\n    wait_seconds: waitSeconds,\n    waited_seconds: call.waited_seconds + waitSeconds,\n    outcome: null,\n    ...changes,\n  };\n}\n\nfunction switchToFallback(reason) {\n  return retry(SWITCH_WAIT_SECONDS, {\n    model: call.fallback_model,\n    fallback_model: null,\n    fallback_used: true,\n    fallback_reason: reason,\n    waits_on_model: 0,\n  });\n}\n\nfunction retryAfterSeconds() {\n  const raw = response.headers && response.headers['retry-after'];\n  const seconds = Number(raw);\n  return raw === undefined || raw === null || raw === '' || !Number.isFinite(seconds) ? null : seconds;\n}\n\nfunction onRateLimit() {\n  const retryAfter = retryAfterSeconds();\n  const wait = retryAfter === null ? DEFAULT_WAIT_SECONDS : Math.max(0, Math.ceil(retryAfter)) + WAIT_MARGIN_SECONDS;\n  if (call.waits_on_model < MAX_WAITS_PER_MODEL && wait <= MAX_WAIT_SECONDS) {\n    return retry(wait, { waits_on_model: call.waits_on_model + 1, rate_limit_waits: call.rate_limit_waits + 1 });\n  }\n  if (call.fallback_model) return switchToFallback('rate_limited');\n  return failure(\n    'rate_limited',\n    `Groq rate limited (HTTP 429) on ${call.model} after ${call.rate_limit_waits} waits, retry-after ${retryAfter ?? 'not sent'} s${groqMessage()}`,\n  );\n}\n\nfunction onServerError() {\n  if (call.fallback_model) return switchToFallback('server_error');\n  return failure('http_error', `Groq HTTP ${status}${groqMessage()}`);\n}\n\nfunction onNoResponse() {\n  const error = response.error;\n  const message = typeof error === 'string' ? error : (error && error.message) || 'unknown error';\n  return failure('network', `No response from Groq: ${message}`);\n}\n\nfunction onSuccess() {\n  const choice = Array.isArray(body.choices) ? body.choices[0] : undefined;\n  if (!choice) return failure('invalid_reply', 'Groq answer rejected: the reply has no choices');\n  if (choice.finish_reason !== 'stop') {\n    return failure('invalid_reply', `Groq answer rejected: finish_reason=${choice.finish_reason}, so the JSON may be cut off`);\n  }\n  const content = choice.message && choice.message.content;\n  if (typeof content !== 'string') return failure('invalid_reply', 'Groq answer rejected: the reply has no message content');\n  let data;\n  try {\n    data = JSON.parse(content);\n  } catch {\n    return failure('invalid_reply', 'Groq answer rejected: the message content is not JSON');\n  }\n  const errors = schemaErrors(data, call.request.json_schema, '$', []);\n  if (errors.length > 0) {\n    return failure('invalid_reply', `Groq answer rejected: it does not match the schema: ${errors.join('; ')}`);\n  }\n  return finish({ ok: true, data, status, error_kind: null, error: null, finish_reason: 'stop', model: body.model || call.model });\n}\n\nfunction decide() {\n  if (status === 200) return onSuccess();\n  if (status === 429) return onRateLimit();\n  if (status >= 500) return onServerError();\n  if (status === 0) return onNoResponse();\n  return failure('http_error', `Groq HTTP ${status}${groqMessage()}`);\n}\n\nreturn {\n  json: {\n    ...call,\n    tokens: {\n      prompt: call.tokens.prompt + (promptTokens ?? 0),\n      completion: call.tokens.completion + (completionTokens ?? 0),\n    },\n    log: {\n      purpose: call.request.purpose,\n      model: call.model,\n      prompt_tokens: promptTokens,\n      completion_tokens: completionTokens,\n      status,\n      latency_ms: latencyMs,\n      batch_id: call.request.batch_id,\n      run_id: call.request.run_id,\n    },\n    ...decide(),\n  },\n};"
+        },
+        "id": "90000000-0000-4000-8000-000000000008",
+        "name": "Read · Classify reply",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2140,
+          100
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "INSERT INTO llm_calls (purpose, model, prompt_tokens, completion_tokens, status, latency_ms, batch_id, run_id)\nVALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8::bigint)\nRETURNING id::text AS id",
+          "options": {
+            "queryReplacement": "={{ [$json.log.purpose, $json.log.model, $json.log.prompt_tokens, $json.log.completion_tokens, $json.log.status, $json.log.latency_ms, $json.log.batch_id, $json.log.run_id] }}"
+          }
+        },
+        "id": "90000000-0000-4000-8000-000000000009",
+        "name": "Log · llm_calls",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2380,
+          100
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "return { json: $('Read · Classify reply').item.json };"
+        },
+        "id": "90000000-0000-4000-8000-000000000010",
+        "name": "Restore · Reply state",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2620,
+          100
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "should-retry",
+                "leftValue": "={{ $json.next === 'retry' }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "90000000-0000-4000-8000-000000000011",
+        "name": "Route · Retry or return",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          2860,
+          100
+        ]
+      },
+      {
+        "parameters": {
+          "amount": "={{ $json.wait_seconds }}",
+          "unit": "seconds"
+        },
+        "id": "90000000-0000-4000-8000-000000000012",
+        "name": "Wait · Rate-limit backoff",
+        "type": "n8n-nodes-base.wait",
+        "typeVersion": 1.1,
+        "position": [
+          3100,
+          -100
+        ],
+        "webhookId": "90000000-0000-4000-8000-0000000000a1"
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const call = $input.item.json;\nconst outcome = call.outcome;\n\nreturn {\n  json: {\n    ok: outcome.ok,\n    data: outcome.data,\n    error_kind: outcome.error_kind,\n    error: outcome.error,\n    status: outcome.status,\n    finish_reason: outcome.finish_reason,\n    model: outcome.model,\n    requested_model: call.requested_model,\n    fallback_used: call.fallback_used,\n    fallback_reason: call.fallback_reason,\n    tokens: call.tokens.prompt + call.tokens.completion,\n    prompt_tokens: call.tokens.prompt,\n    completion_tokens: call.tokens.completion,\n    latency_ms: outcome.latency_ms,\n    attempts: call.attempt,\n    rate_limit_waits: call.rate_limit_waits,\n    waited_seconds: call.waited_seconds,\n    estimated_tokens: call.estimated_tokens,\n  },\n};"
+        },
+        "id": "90000000-0000-4000-8000-000000000013",
+        "name": "Return · Gateway result",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          3100,
+          320
+        ]
+      }
+    ],
+    "connections": {
+      "Trigger · Called by A or B": {
+        "main": [
+          [
+            {
+              "node": "Budget · Usage last 24 h",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Budget · Usage last 24 h": {
+        "main": [
+          [
+            {
+              "node": "Prepare · Check request + budget",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Prepare · Check request + budget": {
+        "main": [
+          [
+            {
+              "node": "Check · Request accepted",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check · Request accepted": {
+        "main": [
+          [
+            {
+              "node": "Attempt · Build Groq body",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Return · Gateway result",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Attempt · Build Groq body": {
+        "main": [
+          [
+            {
+              "node": "LLM · Groq chat completion",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LLM · Groq chat completion": {
+        "main": [
+          [
+            {
+              "node": "Read · Classify reply",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Read · Classify reply": {
+        "main": [
+          [
+            {
+              "node": "Log · llm_calls",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Log · llm_calls": {
+        "main": [
+          [
+            {
+              "node": "Restore · Reply state",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Restore · Reply state": {
+        "main": [
+          [
+            {
+              "node": "Route · Retry or return",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route · Retry or return": {
+        "main": [
+          [
+            {
+              "node": "Wait · Rate-limit backoff",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Return · Gateway result",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Wait · Rate-limit backoff": {
+        "main": [
+          [
+            {
+              "node": "Attempt · Build Groq body",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Kolkata",
+      "saveManualExecutions": true,
+      "errorWorkflow": "wferrorhandler01"
+    },
+    "pinData": {}
+  }
+]

@@ -4,7 +4,7 @@ A change made in the n8n editor and exported is what the tests check. n8n passes
 parameters ($1, $2, ...); `node_query` rewrites them to named pg8000 parameters.
 `run_code_node` executes a Code node under Node.js with a stub `$input` (one or more items), as
 n8n's "run once for all items" mode does, and a stub `$('Node name')` that returns the outputs given
-for earlier nodes.
+for earlier nodes. `.item` is the first item, so "run once for each item" nodes run on one item.
 """
 
 import json
@@ -35,6 +35,7 @@ const { items, nodes } = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const wrap = (list) => ({
   first: () => ({ json: list[0] }),
   all: () => list.map((json) => ({ json })),
+  item: { json: list[0] },
 });
 const $input = wrap(items);
 const $ = (name) => {

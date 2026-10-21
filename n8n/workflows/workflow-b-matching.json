@@ -14,7 +14,7 @@
           -140
         ],
         "parameters": {
-          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel: SQL, rules, cohort LLM)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates`, each classified by Stage 2 and, if borderline, judged by Stage 3 (`stage3_outcome`), the funnel counts in `pipeline_runs`, and the eligible pairs in `matches` with the batch moved to `matched`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n`Stage 1 · Refresh planner statistics` then runs `ANALYZE match_candidates`. Stage 1 has just inserted the run's pairs, and autovacuum analyzes the table only about a minute later, so without it every later statement planned with an estimate of almost no rows for the run (measured: Stage 3 cohort forming took 16 s instead of about 0.15 s).\n6. `Stage 2 · Load product rules` returns one item: the products that have candidates in this run (confidence and published rates) and the Stage 2 start time.\n7. `Stage 2 · Build rule cards` (Code) turns each product into a rule card: products with `parse_confidence` >= 0.7 are fully structured, so their near misses are `clear_reject`; below 0.7 the near misses are `borderline` for Stage 3. It also computes an indicative EMI for Rs 5,00,000 over 60 months at the product's top published rate (else its starting rate; no rate = affordability not checked) and the 65%-of-income affordability cap.\n8. `Stage 2 · Classify pairs` applies the cards to every pair in one set-based UPDATE: unaffordable EMI -> `clear_reject`; strict pass -> `clear_match`; near miss -> the card's policy. Borderline pairs get `borderline_reason` (`near_miss:<criteria>`) and the triggering feature and value, which Stage 3 uses as its cohort key. Every pair gets a readable `stage2_reason`.\n9. `Record · Stage 2 funnel` stores `stage2_clear` / `stage2_borderline` / `stage2_reject` and `stage_ms.stage2`. A CHECK requires the three to add up to `stage1_pairs`, so a pair left unclassified fails the run instead of disappearing.\n\nStage 2 nodes are idempotent too (unchanged pairs are not rewritten; the first `stage2` time is kept), so they also use Retry On Fail; any error marks the batch `failed` with `matching stage 2 failed: <message>`.\n\n10. `Stage 3 · Form cohorts` (SQL) gives every borderline pair a `cohort_key`: verdict version, product, borderline reason, employment, and a fixed band per missed criterion (credit score in 10-point bands, income in Rs 1,000 bands) labelled with the lender's figure. It returns one item: the cohorts with member counts and whether `cohort_verdicts` already holds a verdict for the key and the product's current `content_hash`, the lender texts, and the Groq tokens used in the last 24 h from `llm_calls`.\n11. `Stage 3 · Build LLM requests` (Code) packs the uncached cohorts of each product into one request (at most 16 cohorts; the lender text is sent once) with a strict JSON schema whose `cohort_id` is an enum of the ids in that request. Budget guard: a request is sent only if its estimated tokens fit the Stage 3 daily budget (150,000 tokens minus the last 24 h) and the run stays within 30 calls; otherwise its cohorts become `unresolved_budget`. The model judges the worst value of each band, so one verdict covers every member.\n12. `Check · Any cohort to ask Groq` skips the call when everything is cached. Otherwise `LLM · Judge cohorts (Groq)` sends the requests one at a time, 20 s apart (tokens per minute bind, not requests), and `Log · llm_calls (Stage 3)` records every call with its tokens, run and batch.\n13. `Stage 3 · Read verdicts` (Code) accepts a verdict only from HTTP 200 with exactly one well-formed answer per cohort. HTTP 429 (with `retry-after`), other HTTP errors, no response, non-JSON or missing / duplicate answers make those cohorts `unresolved_error` with the reason. Nothing is guessed. Waiting out a 429 and falling back to the 20b model belong to the LLM Gateway (T26), not built.\n14. `Stage 3 · Store verdicts + fan out` stores new verdicts in `cohort_verdicts` (first verdict wins) and gives every borderline pair its cohort's outcome and reason (`eligible`, `not_eligible`, `unresolved_budget`, `unresolved_error`). `Record · Stage 3 funnel` stores the outcome counts, `llm_cohorts`, `cache_hits`, `llm_calls`, `llm_tokens` and `stage_ms.stage3`; a CHECK requires the four outcomes to add up to `stage2_borderline`.\n\nStage 3 SQL nodes are idempotent (verdicts insert-or-skip, pairs rewritten only when the outcome changes, first measurements kept), so they use Retry On Fail; the Groq call retries only network errors. Any error marks the batch `failed` with `matching stage 3 failed: <message>`. \n\n15. `Persist · Insert matches` copies every `clear_match` pair (`stage` = `rules`, reason from Stage 2) and every Stage 3 `eligible` pair (`stage` = `llm`, reason from the cohort verdict) into `matches` with `ON CONFLICT (user_id, product_id) DO NOTHING`. `clear_reject`, `not_eligible` and both `unresolved_*` outcomes are never stored: an unanswered pair is not a match. An existing match keeps its `batch_id` and its `notified_at`, so a user who appears in two batches is never emailed twice for the same product.\n16. `Persist · Finalize run + mark matched` is one statement: `final_matches` is the number of qualifying pairs that really have a row in `matches` (a CHECK requires `final_matches = stage2_clear + stage3_eligible`), `stage_ms.persist` is measured from the start of the insert to after its commit, the run gets `finished_at`, and the batch moves `matching -> matched`. All three happen or none does.\n\nBoth persist nodes are idempotent (a re-run inserts 0 rows, keeps the first `persist` time and `finished_at`, and the batch update only fires from `matching`), so they use Retry On Fail. Any error marks the batch `failed` with `matching persist failed: <message>`.\n\n17. `Notify · Run Workflow C` hands the batch to Workflow C (compose, recipient guard) without waiting for it, so a slow or failing notification never changes how the matching run is reported. It runs only after the batch is `matched`.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
+          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel: SQL, rules, cohort LLM)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates`, each classified by Stage 2 and, if borderline, judged by Stage 3 (`stage3_outcome`), the funnel counts in `pipeline_runs`, and the eligible pairs in `matches` with the batch moved to `matched`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n`Stage 1 · Refresh planner statistics` then runs `ANALYZE match_candidates`. Stage 1 has just inserted the run's pairs, and autovacuum analyzes the table only about a minute later, so without it every later statement planned with an estimate of almost no rows for the run (measured: Stage 3 cohort forming took 16 s instead of about 0.15 s).\n6. `Stage 2 · Load product rules` returns one item: the products that have candidates in this run (confidence and published rates) and the Stage 2 start time.\n7. `Stage 2 · Build rule cards` (Code) turns each product into a rule card: products with `parse_confidence` >= 0.7 are fully structured, so their near misses are `clear_reject`; below 0.7 the near misses are `borderline` for Stage 3. It also computes an indicative EMI for Rs 5,00,000 over 60 months at the product's top published rate (else its starting rate; no rate = affordability not checked) and the 65%-of-income affordability cap.\n8. `Stage 2 · Classify pairs` applies the cards to every pair in one set-based UPDATE: unaffordable EMI -> `clear_reject`; strict pass -> `clear_match`; near miss -> the card's policy. Borderline pairs get `borderline_reason` (`near_miss:<criteria>`) and the triggering feature and value, which Stage 3 uses as its cohort key. Every pair gets a readable `stage2_reason`.\n9. `Record · Stage 2 funnel` stores `stage2_clear` / `stage2_borderline` / `stage2_reject` and `stage_ms.stage2`. A CHECK requires the three to add up to `stage1_pairs`, so a pair left unclassified fails the run instead of disappearing.\n\nStage 2 nodes are idempotent too (unchanged pairs are not rewritten; the first `stage2` time is kept), so they also use Retry On Fail; any error marks the batch `failed` with `matching stage 2 failed: <message>`.\n\n10. `Stage 3 · Form cohorts` (SQL) gives every borderline pair a `cohort_key`: verdict version, product, borderline reason, employment, and a fixed band per missed criterion (credit score in 10-point bands, income in Rs 1,000 bands) labelled with the lender's figure. It returns one item: the cohorts with member counts and whether `cohort_verdicts` already holds a verdict for the key and the product's current `content_hash`, the lender texts, and the Groq tokens used in the last 24 h from `llm_calls`.\n11. `Stage 3 · Build LLM requests` (Code) packs the uncached cohorts of each product into one request (at most 16 cohorts; the lender text is sent once) with a strict JSON schema whose `cohort_id` is an enum of the ids in that request. Budget guard: a request is sent only if its estimated tokens fit the Stage 3 daily budget (150,000 tokens minus the last 24 h) and the run stays within 30 calls; otherwise its cohorts become `unresolved_budget`. The model judges the worst value of each band, so one verdict covers every member.\n12. `Check · Any cohort to ask Groq` skips the call when everything is cached. Otherwise `LLM · Judge cohorts (LLM Gateway)` sends the requests one at a time through the LLM Gateway sub-workflow, which checks each answer against the schema, waits out a 429 (`retry-after`, at most 60 s, 3 times) and then falls back to `gpt-oss-20b`, and records every attempt with its tokens, run and batch in `llm_calls`. There is no fixed gap between requests: the gateway waits only when Groq says so.\n13. `Stage 3 · Read verdicts` (Code) accepts verdicts only from a gateway answer with `ok = true`, and only exactly one well-formed verdict per cohort. A gateway refusal for budget makes the request's cohorts `unresolved_budget`; a rate limit that outlasted the waits and the fallback, other HTTP errors, no response, a reply that failed the schema, a gateway failure, or missing / duplicate answers make them `unresolved_error` with the reason. Nothing is guessed. `llm_calls` in the funnel counts HTTP attempts, so it equals the run's rows in the `llm_calls` table.\n14. `Stage 3 · Store verdicts + fan out` stores new verdicts in `cohort_verdicts` (first verdict wins) and gives every borderline pair its cohort's outcome and reason (`eligible`, `not_eligible`, `unresolved_budget`, `unresolved_error`). `Record · Stage 3 funnel` stores the outcome counts, `llm_cohorts`, `cache_hits`, `llm_calls`, `llm_tokens` and `stage_ms.stage3`; a CHECK requires the four outcomes to add up to `stage2_borderline`.\n\nStage 3 SQL nodes are idempotent (verdicts insert-or-skip, pairs rewritten only when the outcome changes, first measurements kept), so they use Retry On Fail; the gateway retries only network errors and rate limits. Any error marks the batch `failed` with `matching stage 3 failed: <message>`. \n\n15. `Persist · Insert matches` copies every `clear_match` pair (`stage` = `rules`, reason from Stage 2) and every Stage 3 `eligible` pair (`stage` = `llm`, reason from the cohort verdict) into `matches` with `ON CONFLICT (user_id, product_id) DO NOTHING`. `clear_reject`, `not_eligible` and both `unresolved_*` outcomes are never stored: an unanswered pair is not a match. An existing match keeps its `batch_id` and its `notified_at`, so a user who appears in two batches is never emailed twice for the same product.\n16. `Persist · Finalize run + mark matched` is one statement: `final_matches` is the number of qualifying pairs that really have a row in `matches` (a CHECK requires `final_matches = stage2_clear + stage3_eligible`), `stage_ms.persist` is measured from the start of the insert to after its commit, the run gets `finished_at`, and the batch moves `matching -> matched`. All three happen or none does.\n\nBoth persist nodes are idempotent (a re-run inserts 0 rows, keeps the first `persist` time and `finished_at`, and the batch update only fires from `matching`), so they use Retry On Fail. Any error marks the batch `failed` with `matching persist failed: <message>`.\n\n17. `Notify · Run Workflow C` hands the batch to Workflow C (compose, recipient guard) without waiting for it, so a slow or failing notification never changes how the matching run is reported. It runs only after the batch is `matched`.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E (`wferrorhandler01`), set in this workflow's settings.",
           "height": 1900,
           "width": 820,
           "color": 4
@@ -443,7 +443,7 @@
       },
       {
         "parameters": {
-          "jsCode": "const MODEL = 'openai/gpt-oss-120b';\nconst MAX_COHORTS_PER_REQUEST = 16;\nconst DAILY_TOKEN_BUDGET = 150000;\nconst MAX_CALLS_PER_RUN = 30;\nconst CHARS_PER_TOKEN_ESTIMATE = 3;\nconst COMPLETION_TOKENS_BASE = 600;\nconst COMPLETION_TOKENS_PER_COHORT = 100;\n\nconst SYSTEM_PROMPT = [\n  \"You review borderline personal-loan applicants against one lender's published eligibility text.\",\n  'Each cohort is a group of applicants who meet every structured criterion of this product except the shortfall described for the cohort, which is within 5% of the figure the lender states.',\n  \"For each cohort decide whether the lender's own wording still allows an applicant at the cohort's worst value.\",\n  '1. Use only the lender text in the message. Do not use outside knowledge about the lender.',\n  '2. If any sentence states the figure as a requirement (for example minimum, must, you need, at least, to be eligible), the shortfall is not allowed: eligible = false, even when another sentence sounds softer.',\n  '3. If the text presents the figure only as a preference or a favourable factor (for example preferred, ideal, favourable, may improve), decide whether the wording leaves room for an applicant at the worst value given.',\n  '4. The verdict covers every applicant in the cohort, so judge the worst value, not the band as a whole.',\n  \"5. reason: one sentence of at most 200 characters that quotes the lender's words you relied on.\",\n  '6. Return exactly one verdict for every cohort id in the message and no other ids.',\n].join('\\n');\n\nconst FEATURE_LABELS = { credit_score: 'credit score', monthly_income: 'net monthly income' };\nconst SIDE_OF_FIGURE = { minimum: 'below', maximum: 'above' };\n\nfunction describeValue(feature, value) {\n  const number = Number(value).toLocaleString('en-IN');\n  return feature === 'monthly_income' ? `Rs ${number}` : number;\n}\n\nfunction describeShortfall(shortfall) {\n  const label = FEATURE_LABELS[shortfall.feature];\n  const value = (v) => describeValue(shortfall.feature, v);\n  const band = `${value(shortfall.band_low)} to ${value(shortfall.band_high)}`;\n  return `${label} ${band}, ${SIDE_OF_FIGURE[shortfall.bound]} the lender's figure of ${value(shortfall.threshold)} (worst value ${value(shortfall.worst_value)})`;\n}\n\nfunction cohortLine(cohort, cohortId) {\n  const shortfalls = cohort.shortfalls.map(describeShortfall).join('; and ');\n  return `${cohortId}: ${cohort.employment_status} applicants; ${shortfalls}.`;\n}\n\nfunction responseSchema(cohortIds) {\n  return {\n    type: 'object',\n    properties: {\n      verdicts: {\n        type: 'array',\n        items: {\n          type: 'object',\n          properties: {\n            cohort_id: { type: 'string', enum: cohortIds },\n            eligible: { type: 'boolean' },\n            reason: { type: 'string' },\n          },\n          required: ['cohort_id', 'eligible', 'reason'],\n          additionalProperties: false,\n        },\n      },\n    },\n    required: ['verdicts'],\n    additionalProperties: false,\n  };\n}\n\nfunction groqRequest(product, members) {\n  const cohortIds = members.map((m) => m.cohort_id);\n  const userContent = [\n    `Lender: ${product.source}`,\n    `Product: ${product.product_name}`,\n    'Lender eligibility text:',\n    product.criteria_text,\n    '',\n    'Cohorts:',\n    ...members.map((m) => cohortLine(m.cohort, m.cohort_id)),\n  ].join('\\n');\n  return {\n    model: MODEL,\n    temperature: 0,\n    reasoning_effort: 'low',\n    include_reasoning: false,\n    max_completion_tokens: COMPLETION_TOKENS_BASE + COMPLETION_TOKENS_PER_COHORT * members.length,\n    messages: [\n      { role: 'system', content: SYSTEM_PROMPT },\n      { role: 'user', content: userContent },\n    ],\n    response_format: {\n      type: 'json_schema',\n      json_schema: { name: 'cohort_verdicts', strict: true, schema: responseSchema(cohortIds) },\n    },\n  };\n}\n\nfunction estimatedTokens(request) {\n  const promptChars = request.messages.reduce((sum, m) => sum + m.content.length, 0)\n    + JSON.stringify(request.response_format).length;\n  return Math.ceil(promptChars / CHARS_PER_TOKEN_ESTIMATE) + request.max_completion_tokens;\n}\n\nfunction chunk(list, size) {\n  const chunks = [];\n  for (let i = 0; i < list.length; i += size) {\n    chunks.push(list.slice(i, i + size));\n  }\n  return chunks;\n}\n\nfunction plannedRequests(cohorts, products) {\n  const productsById = new Map(products.map((p) => [Number(p.product_id), p]));\n  const byProduct = new Map();\n  for (const cohort of cohorts) {\n    const key = Number(cohort.product_id);\n    if (!byProduct.has(key)) {\n      byProduct.set(key, []);\n    }\n    byProduct.get(key).push(cohort);\n  }\n  const requests = [];\n  for (const [productId, productCohorts] of byProduct) {\n    for (const group of chunk(productCohorts, MAX_COHORTS_PER_REQUEST)) {\n      const members = group.map((cohort, i) => ({ cohort, cohort_id: `c${String(i + 1).padStart(2, '0')}` }));\n      const request = groqRequest(productsById.get(productId), members);\n      requests.push({\n        product_id: productId,\n        cohorts: members.map((m) => ({\n          cohort_id: m.cohort_id,\n          cohort_key: m.cohort.cohort_key,\n          content_hash: m.cohort.content_hash,\n          members: Number(m.cohort.members),\n        })),\n        groq_request: request,\n        estimated_tokens: estimatedTokens(request),\n      });\n    }\n  }\n  return requests;\n}\n\nfunction unresolved(cohorts, outcome, reason) {\n  return cohorts.map((c) => ({ cohort_key: c.cohort_key, outcome, reason }));\n}\n\nfunction applyBudget(requests, usedTokens) {\n  let remaining = DAILY_TOKEN_BUDGET - usedTokens;\n  const send = [];\n  const skipped = [];\n  for (const request of requests) {\n    if (send.length >= MAX_CALLS_PER_RUN) {\n      skipped.push(...unresolved(request.cohorts, 'unresolved_budget',\n        `Not asked: the run already planned its maximum of ${MAX_CALLS_PER_RUN} LLM calls.`));\n    } else if (request.estimated_tokens > remaining) {\n      skipped.push(...unresolved(request.cohorts, 'unresolved_budget',\n        `Not asked: the daily Stage 3 token budget has ${Math.max(remaining, 0)} of ${DAILY_TOKEN_BUDGET} tokens left and this request needs an estimated ${request.estimated_tokens}.`));\n    } else {\n      remaining -= request.estimated_tokens;\n      send.push(request);\n    }\n  }\n  return { send, skipped, remaining };\n}\n\nconst run = $input.first().json;\nconst cohorts = run.cohorts || [];\nconst unhashed = cohorts.filter((c) => !c.content_hash);\nconst askable = cohorts.filter((c) => c.content_hash && !c.cached);\nconst usedTokens = Number((run.llm_usage_24h || {})[MODEL]?.tokens ?? 0);\nconst budget = applyBudget(plannedRequests(askable, run.products || []), usedTokens);\n\nreturn [\n  {\n    json: {\n      run_id: run.run_id,\n      batch_id: run.batch_id,\n      stage3_started_at: run.stage3_started_at,\n      model: MODEL,\n      cohort_count: cohorts.length,\n      cache_hits: cohorts.filter((c) => c.cached).length,\n      requests: budget.send.map((request, i) => ({\n        ...request,\n        request_no: i + 1,\n        run_id: run.run_id,\n        batch_id: run.batch_id,\n      })),\n      unresolved: [\n        ...unresolved(unhashed, 'unresolved_error',\n          'The product has no content hash, so a verdict could not be cached against its text.'),\n        ...budget.skipped,\n      ],\n      budget: {\n        daily_token_budget: DAILY_TOKEN_BUDGET,\n        used_tokens_24h: usedTokens,\n        max_calls_per_run: MAX_CALLS_PER_RUN,\n        planned_calls: budget.send.length,\n        estimated_tokens: budget.send.reduce((sum, r) => sum + r.estimated_tokens, 0),\n      },\n    },\n  },\n];"
+          "jsCode": "const MODEL = 'openai/gpt-oss-120b';\nconst MAX_COHORTS_PER_REQUEST = 16;\nconst DAILY_TOKEN_BUDGET = 150000;\nconst MAX_CALLS_PER_RUN = 30;\nconst CHARS_PER_TOKEN_ESTIMATE = 3;\nconst COMPLETION_TOKENS_BASE = 600;\nconst COMPLETION_TOKENS_PER_COHORT = 100;\n\nconst SYSTEM_PROMPT = [\n  \"You review borderline personal-loan applicants against one lender's published eligibility text.\",\n  'Each cohort is a group of applicants who meet every structured criterion of this product except the shortfall described for the cohort, which is within 5% of the figure the lender states.',\n  \"For each cohort decide whether the lender's own wording still allows an applicant at the cohort's worst value.\",\n  '1. Use only the lender text in the message. Do not use outside knowledge about the lender.',\n  '2. If any sentence states the figure as a requirement (for example minimum, must, you need, at least, to be eligible), the shortfall is not allowed: eligible = false, even when another sentence sounds softer.',\n  '3. If the text presents the figure only as a preference or a favourable factor (for example preferred, ideal, favourable, may improve), decide whether the wording leaves room for an applicant at the worst value given.',\n  '4. The verdict covers every applicant in the cohort, so judge the worst value, not the band as a whole.',\n  \"5. reason: one sentence of at most 200 characters that quotes the lender's words you relied on.\",\n  '6. Return exactly one verdict for every cohort id in the message and no other ids.',\n].join('\\n');\n\nconst FEATURE_LABELS = { credit_score: 'credit score', monthly_income: 'net monthly income' };\nconst SIDE_OF_FIGURE = { minimum: 'below', maximum: 'above' };\n\nfunction describeValue(feature, value) {\n  const number = Number(value).toLocaleString('en-IN');\n  return feature === 'monthly_income' ? `Rs ${number}` : number;\n}\n\nfunction describeShortfall(shortfall) {\n  const label = FEATURE_LABELS[shortfall.feature];\n  const value = (v) => describeValue(shortfall.feature, v);\n  const band = `${value(shortfall.band_low)} to ${value(shortfall.band_high)}`;\n  return `${label} ${band}, ${SIDE_OF_FIGURE[shortfall.bound]} the lender's figure of ${value(shortfall.threshold)} (worst value ${value(shortfall.worst_value)})`;\n}\n\nfunction cohortLine(cohort, cohortId) {\n  const shortfalls = cohort.shortfalls.map(describeShortfall).join('; and ');\n  return `${cohortId}: ${cohort.employment_status} applicants; ${shortfalls}.`;\n}\n\nfunction responseSchema(cohortIds) {\n  return {\n    type: 'object',\n    properties: {\n      verdicts: {\n        type: 'array',\n        items: {\n          type: 'object',\n          properties: {\n            cohort_id: { type: 'string', enum: cohortIds },\n            eligible: { type: 'boolean' },\n            reason: { type: 'string' },\n          },\n          required: ['cohort_id', 'eligible', 'reason'],\n          additionalProperties: false,\n        },\n      },\n    },\n    required: ['verdicts'],\n    additionalProperties: false,\n  };\n}\n\nfunction gatewayRequest(product, members) {\n  const cohortIds = members.map((m) => m.cohort_id);\n  const userContent = [\n    `Lender: ${product.source}`,\n    `Product: ${product.product_name}`,\n    'Lender eligibility text:',\n    product.criteria_text,\n    '',\n    'Cohorts:',\n    ...members.map((m) => cohortLine(m.cohort, m.cohort_id)),\n  ].join('\\n');\n  return {\n    purpose: 'cohort_verdict',\n    model: MODEL,\n    system: SYSTEM_PROMPT,\n    user: userContent,\n    schema_name: 'cohort_verdicts',\n    json_schema: responseSchema(cohortIds),\n    max_tokens: COMPLETION_TOKENS_BASE + COMPLETION_TOKENS_PER_COHORT * members.length,\n  };\n}\n\nfunction estimatedTokens(llm) {\n  const promptChars = llm.system.length + llm.user.length + JSON.stringify(llm.json_schema).length;\n  return Math.ceil(promptChars / CHARS_PER_TOKEN_ESTIMATE) + llm.max_tokens;\n}\n\nfunction chunk(list, size) {\n  const chunks = [];\n  for (let i = 0; i < list.length; i += size) {\n    chunks.push(list.slice(i, i + size));\n  }\n  return chunks;\n}\n\nfunction plannedRequests(cohorts, products) {\n  const productsById = new Map(products.map((p) => [Number(p.product_id), p]));\n  const byProduct = new Map();\n  for (const cohort of cohorts) {\n    const key = Number(cohort.product_id);\n    if (!byProduct.has(key)) {\n      byProduct.set(key, []);\n    }\n    byProduct.get(key).push(cohort);\n  }\n  const requests = [];\n  for (const [productId, productCohorts] of byProduct) {\n    for (const group of chunk(productCohorts, MAX_COHORTS_PER_REQUEST)) {\n      const members = group.map((cohort, i) => ({ cohort, cohort_id: `c${String(i + 1).padStart(2, '0')}` }));\n      const llm = gatewayRequest(productsById.get(productId), members);\n      requests.push({\n        product_id: productId,\n        cohorts: members.map((m) => ({\n          cohort_id: m.cohort_id,\n          cohort_key: m.cohort.cohort_key,\n          content_hash: m.cohort.content_hash,\n          members: Number(m.cohort.members),\n        })),\n        llm,\n        estimated_tokens: estimatedTokens(llm),\n      });\n    }\n  }\n  return requests;\n}\n\nfunction unresolved(cohorts, outcome, reason) {\n  return cohorts.map((c) => ({ cohort_key: c.cohort_key, outcome, reason }));\n}\n\nfunction applyBudget(requests, usedTokens) {\n  let remaining = DAILY_TOKEN_BUDGET - usedTokens;\n  const send = [];\n  const skipped = [];\n  for (const request of requests) {\n    if (send.length >= MAX_CALLS_PER_RUN) {\n      skipped.push(...unresolved(request.cohorts, 'unresolved_budget',\n        `Not asked: the run already planned its maximum of ${MAX_CALLS_PER_RUN} LLM calls.`));\n    } else if (request.estimated_tokens > remaining) {\n      skipped.push(...unresolved(request.cohorts, 'unresolved_budget',\n        `Not asked: the daily Stage 3 token budget has ${Math.max(remaining, 0)} of ${DAILY_TOKEN_BUDGET} tokens left and this request needs an estimated ${request.estimated_tokens}.`));\n    } else {\n      remaining -= request.estimated_tokens;\n      send.push(request);\n    }\n  }\n  return { send, skipped, remaining };\n}\n\nconst run = $input.first().json;\nconst cohorts = run.cohorts || [];\nconst unhashed = cohorts.filter((c) => !c.content_hash);\nconst askable = cohorts.filter((c) => c.content_hash && !c.cached);\nconst usedTokens = Number((run.llm_usage_24h || {})[MODEL]?.tokens ?? 0);\nconst budget = applyBudget(plannedRequests(askable, run.products || []), usedTokens);\n\nreturn [\n  {\n    json: {\n      run_id: run.run_id,\n      batch_id: run.batch_id,\n      stage3_started_at: run.stage3_started_at,\n      model: MODEL,\n      cohort_count: cohorts.length,\n      cache_hits: cohorts.filter((c) => c.cached).length,\n      requests: budget.send.map((request, i) => ({\n        ...request,\n        request_no: i + 1,\n        run_id: run.run_id,\n        batch_id: run.batch_id,\n      })),\n      unresolved: [\n        ...unresolved(unhashed, 'unresolved_error',\n          'The product has no content hash, so a verdict could not be cached against its text.'),\n        ...budget.skipped,\n      ],\n      budget: {\n        daily_token_budget: DAILY_TOKEN_BUDGET,\n        used_tokens_24h: usedTokens,\n        max_calls_per_run: MAX_CALLS_PER_RUN,\n        planned_calls: budget.send.length,\n        estimated_tokens: budget.send.reduce((sum, r) => sum + r.estimated_tokens, 0),\n      },\n    },\n  },\n];"
         },
         "id": "b0000000-0000-4000-8000-000000000020",
         "name": "Stage 3 · Build LLM requests",
@@ -505,76 +505,138 @@
       },
       {
         "parameters": {
-          "method": "POST",
-          "url": "https://api.groq.com/openai/v1/chat/completions",
-          "authentication": "genericCredentialType",
-          "genericAuthType": "httpHeaderAuth",
-          "sendBody": true,
-          "specifyBody": "json",
-          "jsonBody": "={{ $json.groq_request }}",
-          "options": {
-            "timeout": 30000,
-            "batching": {
-              "batch": {
-                "batchSize": 1,
-                "batchInterval": 20000
-              }
+          "workflowId": {
+            "__rl": true,
+            "value": "wfllmgateway01",
+            "mode": "id"
+          },
+          "workflowInputs": {
+            "mappingMode": "defineBelow",
+            "value": {
+              "purpose": "={{ $json.llm.purpose }}",
+              "model": "={{ $json.llm.model }}",
+              "system": "={{ $json.llm.system }}",
+              "user": "={{ $json.llm.user }}",
+              "schema_name": "={{ $json.llm.schema_name }}",
+              "json_schema": "={{ $json.llm.json_schema }}",
+              "max_tokens": "={{ $json.llm.max_tokens }}",
+              "batch_id": "={{ $json.batch_id }}",
+              "run_id": "={{ Number($json.run_id) }}"
             },
-            "response": {
-              "response": {
-                "fullResponse": true,
-                "neverError": true,
-                "responseFormat": "json"
+            "matchingColumns": [],
+            "schema": [
+              {
+                "id": "purpose",
+                "displayName": "purpose",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "model",
+                "displayName": "model",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "system",
+                "displayName": "system",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "user",
+                "displayName": "user",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "schema_name",
+                "displayName": "schema_name",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "json_schema",
+                "displayName": "json_schema",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "object",
+                "removed": false
+              },
+              {
+                "id": "max_tokens",
+                "displayName": "max_tokens",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "number",
+                "removed": false
+              },
+              {
+                "id": "batch_id",
+                "displayName": "batch_id",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "run_id",
+                "displayName": "run_id",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "number",
+                "removed": false
               }
-            }
+            ],
+            "attemptToConvertTypes": false,
+            "convertFieldsToString": false
+          },
+          "mode": "each",
+          "options": {
+            "waitForSubWorkflow": true
           }
         },
         "id": "b0000000-0000-4000-8000-000000000023",
-        "name": "LLM · Judge cohorts (Groq)",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4.2,
+        "name": "LLM · Judge cohorts (LLM Gateway)",
+        "type": "n8n-nodes-base.executeWorkflow",
+        "typeVersion": 1.3,
         "position": [
           4540,
           -400
         ],
-        "credentials": {
-          "httpHeaderAuth": {
-            "id": "pgrgkUiUod78DwXh",
-            "name": "groq-api"
-          }
-        },
-        "retryOnFail": true,
-        "maxTries": 3,
-        "waitBetweenTries": 5000,
         "onError": "continueRegularOutput"
       },
       {
         "parameters": {
-          "operation": "executeQuery",
-          "query": "INSERT INTO llm_calls (purpose, model, prompt_tokens, completion_tokens, status, latency_ms, batch_id, run_id) VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8::bigint) RETURNING id, purpose, model, prompt_tokens, completion_tokens, status, latency_ms",
-          "options": {
-            "queryReplacement": "={{ ['cohort_verdict', $('Stage 3 · One item per request').item.json.groq_request.model, $json.body?.usage?.prompt_tokens ?? null, $json.body?.usage?.completion_tokens ?? null, $json.statusCode ?? 0, typeof $json.body?.usage?.total_time === 'number' ? Math.round($json.body.usage.total_time * 1000) : null, $('Stage 3 · One item per request').item.json.batch_id, $('Stage 3 · One item per request').item.json.run_id] }}"
-          }
-        },
-        "id": "b0000000-0000-4000-8000-000000000024",
-        "name": "Log · llm_calls (Stage 3)",
-        "type": "n8n-nodes-base.postgres",
-        "typeVersion": 2.5,
-        "position": [
-          4780,
-          -560
-        ],
-        "credentials": {
-          "postgres": {
-            "id": "tNSuoJ0AbwOkWgJM",
-            "name": "rds-postgres"
-          }
-        },
-        "onError": "continueRegularOutput"
-      },
-      {
-        "parameters": {
-          "jsCode": "const MAX_REASON_CHARS = 300;\nconst MAX_ERROR_CHARS = 300;\n\nconst build = $('Stage 3 · Build LLM requests').first().json;\nconst requests = build.requests || [];\nconst responses = requests.length > 0 ? $input.all().map((item) => item.json) : [];\n\nfunction clip(text, limit) {\n  return String(text).slice(0, limit);\n}\n\nfunction unresolvedAll(request, reason) {\n  return {\n    verdicts: [],\n    unresolved: request.cohorts.map((c) => ({\n      cohort_key: c.cohort_key,\n      outcome: 'unresolved_error',\n      reason: clip(reason, MAX_ERROR_CHARS),\n    })),\n  };\n}\n\nfunction httpFailure(response) {\n  const status = response.statusCode ?? 0;\n  const message = response.body?.error?.message;\n  if (status === 429) {\n    const retryAfter = response.headers?.['retry-after'] ?? 'not sent';\n    return `Groq rate limited (HTTP 429), retry-after ${retryAfter} s${message ? ': ' + message : ''}`;\n  }\n  if (status) {\n    return `Groq HTTP ${status}${message ? ': ' + message : ''}`;\n  }\n  return `No response from Groq: ${response.error?.message ?? response.error ?? 'unknown error'}`;\n}\n\nfunction parsedAnswer(response) {\n  const content = response.body?.choices?.[0]?.message?.content;\n  if (typeof content !== 'string') {\n    throw new Error('the reply has no message content');\n  }\n  let answer;\n  try {\n    answer = JSON.parse(content);\n  } catch {\n    throw new Error('the message content is not JSON');\n  }\n  if (answer === null || typeof answer !== 'object' || !Array.isArray(answer.verdicts)) {\n    throw new Error('the answer has no verdicts array');\n  }\n  return answer.verdicts;\n}\n\nfunction wellFormed(verdict) {\n  return verdict !== null\n    && typeof verdict === 'object'\n    && typeof verdict.cohort_id === 'string'\n    && typeof verdict.eligible === 'boolean'\n    && typeof verdict.reason === 'string'\n    && verdict.reason.trim() !== '';\n}\n\nfunction judged(request, response) {\n  if ((response.statusCode ?? 0) !== 200) {\n    return unresolvedAll(request, httpFailure(response));\n  }\n  let answers;\n  try {\n    answers = parsedAnswer(response);\n  } catch (error) {\n    return unresolvedAll(request, `Groq answer was not valid: ${error.message}`);\n  }\n  const model = response.body.model || request.groq_request.model;\n  const byId = new Map();\n  for (const verdict of answers.filter(wellFormed)) {\n    byId.set(verdict.cohort_id, [...(byId.get(verdict.cohort_id) || []), verdict]);\n  }\n  const result = { verdicts: [], unresolved: [] };\n  for (const cohort of request.cohorts) {\n    const found = byId.get(cohort.cohort_id) || [];\n    if (found.length === 1) {\n      result.verdicts.push({\n        cohort_key: cohort.cohort_key,\n        product_content_hash: cohort.content_hash,\n        eligible: found[0].eligible,\n        reason: clip(found[0].reason.trim(), MAX_REASON_CHARS),\n        model,\n      });\n    } else {\n      result.unresolved.push({\n        cohort_key: cohort.cohort_key,\n        outcome: 'unresolved_error',\n        reason: found.length === 0\n          ? 'Groq returned no well-formed verdict for this cohort.'\n          : `Groq returned ${found.length} verdicts for this cohort, so none is used.`,\n      });\n    }\n  }\n  return result;\n}\n\nfunction usedTokens(response) {\n  const usage = response.body?.usage ?? {};\n  return (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0);\n}\n\nconst results = requests.map((request, i) => judged(request, responses[i] ?? { error: 'no output item for this request' }));\n\nreturn [\n  {\n    json: {\n      run_id: build.run_id,\n      batch_id: build.batch_id,\n      stage3_started_at: build.stage3_started_at,\n      cohort_count: build.cohort_count,\n      cache_hits: build.cache_hits,\n      llm_calls: responses.length,\n      llm_tokens: responses.reduce((sum, response) => sum + usedTokens(response), 0),\n      verdicts: results.flatMap((r) => r.verdicts),\n      unresolved: [...(build.unresolved || []), ...results.flatMap((r) => r.unresolved)],\n    },\n  },\n];"
+          "jsCode": "const MAX_REASON_CHARS = 300;\nconst MAX_ERROR_CHARS = 300;\n\nconst build = $('Stage 3 · Build LLM requests').first().json;\nconst requests = build.requests || [];\nconst results = requests.length > 0 ? $input.all().map((item) => item.json) : [];\n\nfunction clip(text, limit) {\n  return String(text).slice(0, limit);\n}\n\nfunction unresolvedAll(request, outcome, reason) {\n  return {\n    verdicts: [],\n    unresolved: request.cohorts.map((c) => ({\n      cohort_key: c.cohort_key,\n      outcome,\n      reason: clip(reason, MAX_ERROR_CHARS),\n    })),\n  };\n}\n\nfunction gatewayFailure(result) {\n  if (typeof result.ok !== 'boolean') {\n    const error = result.error;\n    const message = typeof error === 'string' ? error : (error && error.message) || 'no result for this request';\n    return { outcome: 'unresolved_error', reason: `LLM Gateway failed: ${message}` };\n  }\n  return {\n    outcome: result.error_kind === 'budget' ? 'unresolved_budget' : 'unresolved_error',\n    reason: result.error || `LLM Gateway returned ${result.error_kind || 'no answer'}`,\n  };\n}\n\nfunction wellFormed(verdict) {\n  return verdict !== null\n    && typeof verdict === 'object'\n    && typeof verdict.cohort_id === 'string'\n    && typeof verdict.eligible === 'boolean'\n    && typeof verdict.reason === 'string'\n    && verdict.reason.trim() !== '';\n}\n\nfunction judged(request, result) {\n  if (result.ok !== true) {\n    const failure = gatewayFailure(result);\n    return unresolvedAll(request, failure.outcome, failure.reason);\n  }\n  const answers = result.data && Array.isArray(result.data.verdicts) ? result.data.verdicts : [];\n  const byId = new Map();\n  for (const verdict of answers.filter(wellFormed)) {\n    byId.set(verdict.cohort_id, [...(byId.get(verdict.cohort_id) || []), verdict]);\n  }\n  const judgedCohorts = { verdicts: [], unresolved: [] };\n  for (const cohort of request.cohorts) {\n    const found = byId.get(cohort.cohort_id) || [];\n    if (found.length === 1) {\n      judgedCohorts.verdicts.push({\n        cohort_key: cohort.cohort_key,\n        product_content_hash: cohort.content_hash,\n        eligible: found[0].eligible,\n        reason: clip(found[0].reason.trim(), MAX_REASON_CHARS),\n        model: result.model || request.llm.model,\n      });\n    } else {\n      judgedCohorts.unresolved.push({\n        cohort_key: cohort.cohort_key,\n        outcome: 'unresolved_error',\n        reason: found.length === 0\n          ? 'Groq returned no well-formed verdict for this cohort.'\n          : `Groq returned ${found.length} verdicts for this cohort, so none is used.`,\n      });\n    }\n  }\n  return judgedCohorts;\n}\n\nfunction count(value) {\n  return Number.isInteger(value) && value > 0 ? value : 0;\n}\n\nconst judgedRequests = requests.map((request, i) => judged(request, results[i] ?? { error: 'no output item for this request' }));\n\nreturn [\n  {\n    json: {\n      run_id: build.run_id,\n      batch_id: build.batch_id,\n      stage3_started_at: build.stage3_started_at,\n      cohort_count: build.cohort_count,\n      cache_hits: build.cache_hits,\n      llm_calls: results.reduce((sum, result) => sum + count(result.attempts), 0),\n      llm_tokens: results.reduce((sum, result) => sum + count(result.tokens), 0),\n      verdicts: judgedRequests.flatMap((r) => r.verdicts),\n      unresolved: [...(build.unresolved || []), ...judgedRequests.flatMap((r) => r.unresolved)],\n    },\n  },\n];"
         },
         "id": "b0000000-0000-4000-8000-000000000025",
         "name": "Stage 3 · Read verdicts",
@@ -1060,23 +1122,7 @@
         "main": [
           [
             {
-              "node": "LLM · Judge cohorts (Groq)",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "LLM · Judge cohorts (Groq)": {
-        "main": [
-          [
-            {
-              "node": "Log · llm_calls (Stage 3)",
-              "type": "main",
-              "index": 0
-            },
-            {
-              "node": "Stage 3 · Read verdicts",
+              "node": "LLM · Judge cohorts (LLM Gateway)",
               "type": "main",
               "index": 0
             }
@@ -1167,6 +1213,17 @@
           [
             {
               "node": "Fail · Mark batch failed (Persist)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LLM · Judge cohorts (LLM Gateway)": {
+        "main": [
+          [
+            {
+              "node": "Stage 3 · Read verdicts",
               "type": "main",
               "index": 0
             }

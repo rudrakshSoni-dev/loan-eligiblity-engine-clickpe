@@ -25,4 +25,4 @@ for file in "$ROOT"/n8n/workflows/*.json; do
 done
 
 docker exec "$NAME" n8n export:workflow --all --output=/tmp/all.json >/dev/null
-docker exec "$NAME" sh -c "grep -o '\"name\": *\"[A-E] · [^\"]*\"' /tmp/all.json | sort -u"
+docker exec "$NAME" sh -c "grep -o '\"name\": *\"[A-G] · [^\"]*\"' /tmp/all.json | sort -u"

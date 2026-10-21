@@ -2,7 +2,8 @@
 chains them, with Groq replaced by fake replies shaped like real ones.
 
 Stages 1 and 2 run first with their own exported nodes, so the borderline pairs Stage 3 sees are
-the ones the workflow would produce.
+the ones the workflow would produce. Each request goes through the exported LLM Gateway nodes
+(`run_gateway`), so `Stage 3 · Read verdicts` is fed exactly what the gateway returns.
 """
 
 import hashlib
@@ -31,6 +32,7 @@ from tests.workflow_b_helpers import (
     single_row,
     workflow_node,
 )
+from tests.workflow_gateway_helpers import gateway_request, prepare, run_gateway, status_reply
 
 pytestmark = [
     pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set"),
@@ -42,7 +44,6 @@ BUILD_NODE = "Stage 3 · Build LLM requests"
 READ_NODE = "Stage 3 · Read verdicts"
 STORE_NODE = "Stage 3 · Store verdicts + fan out"
 RECORD_NODE = "Record · Stage 3 funnel"
-LOG_NODE = "Log · llm_calls (Stage 3)"
 FAIL_NODE = "Fail · Mark batch failed (Stage 3)"
 STORE_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":verdicts", "$4": ":unresolved"}
 RECORD_PARAMS = {
@@ -54,7 +55,6 @@ RECORD_PARAMS = {
     "$6": ":calls",
     "$7": ":tokens",
 }
-LOG_PARAMS = {f"${i}": f":p{i}" for i in range(1, 9)}
 FAIL_PARAMS = {"$1": ":run_id", "$2": ":batch_id", "$3": ":message"}
 
 MODEL = "openai/gpt-oss-120b"
@@ -110,7 +110,12 @@ def groq_reply(
         "headers": {},
         "body": {
             "model": MODEL,
-            "choices": [{"message": {"content": json.dumps({"verdicts": verdicts})}}],
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": json.dumps({"verdicts": verdicts})},
+                }
+            ],
             "usage": {
                 "prompt_tokens": tokens[0],
                 "completion_tokens": tokens[1],
@@ -118,6 +123,12 @@ def groq_reply(
             },
         },
     }
+
+
+def through_gateway(request: dict[str, Any], reply: Reply) -> dict[str, Any]:
+    """What `LLM · Judge cohorts (LLM Gateway)` returns for a request when Groq answers `reply`."""
+    llm = gateway_request(**request["llm"], batch_id=request["batch_id"], run_id=request["run_id"])
+    return run_gateway(llm, lambda _: reply(request)).result
 
 
 def form(conn: Any, run_id: int, batch_id: uuid.UUID) -> dict[str, Any]:
@@ -160,7 +171,7 @@ def run_stage3(
 ) -> dict[str, Any]:
     """Chain the Stage 3 nodes as n8n does; `reply` stands in for Groq, one call per request."""
     built = only_item(run_code_node(BUILD_NODE, form(conn, run_id, batch_id)))
-    responses = [reply(r) for r in built["requests"]] if reply else []
+    responses = [through_gateway(r, reply) for r in built["requests"]] if reply else []
     assert len(responses) == len(built["requests"])
     item = read(built, responses)
     return {"built": built, "read": item, **store(conn, item), **record(conn, item)}
@@ -294,22 +305,30 @@ def test_requests_are_packed_per_product_and_skip_cached_and_unhashed_cohorts() 
     ]
     ids = [c["cohort_id"] for c in requests[0]["cohorts"]]
     assert ids[:2] == ["c01", "c02"] and len(set(ids)) == per_request
-    schema = requests[0]["groq_request"]["response_format"]["json_schema"]
-    assert schema["strict"] is True
-    verdict = schema["schema"]["properties"]["verdicts"]["items"]
+    llm = requests[0]["llm"]
+    assert (llm["purpose"], llm["model"], llm["schema_name"]) == (
+        "cohort_verdict",
+        MODEL,
+        "cohort_verdicts",
+    )
+    verdict = llm["json_schema"]["properties"]["verdicts"]["items"]
     assert verdict["properties"]["cohort_id"]["enum"] == ids
     assert (
-        requests[0]["groq_request"]["max_completion_tokens"]
+        llm["max_tokens"]
         == js_constant("COMPLETION_TOKENS_BASE")
         + js_constant("COMPLETION_TOKENS_PER_COHORT") * per_request
     )
-    user = requests[2]["groq_request"]["messages"][1]["content"]
+    user = requests[2]["llm"]["user"]
     assert user.count("Lender eligibility text:") == 1
     line = "c01: Salaried applicants; credit score 690 to 699, below the lender's figure of 700"
     assert line in user
     assert "(worst value 690)" in user
-    assert requests[2]["groq_request"]["temperature"] == 0
     assert all(r["run_id"] == "7" and r["estimated_tokens"] > 0 for r in requests)
+    accepted = prepare(gateway_request(**llm, batch_id=built["batch_id"], run_id=7), {"usage": {}})
+    assert (accepted["next"], accepted["estimated_tokens"]) == (
+        "call",
+        requests[0]["estimated_tokens"],
+    )
     assert (built["cohort_count"], built["cache_hits"]) == (len(first) + 3, 1)
     assert [(u["cohort_key"], u["outcome"]) for u in built["unresolved"]] == [
         (unhashed["cohort_key"], "unresolved_error")
@@ -352,7 +371,6 @@ def test_budget_guard_caps_calls_per_run() -> None:
 def test_read_accepts_only_one_well_formed_verdict_per_cohort() -> None:
     cohorts = [synthetic_cohort(1, n) for n in range(5)]
     built = only_item(run_code_node(BUILD_NODE, synthetic_form(cohorts, {})))
-    reply = groq_reply(built["requests"][0])
     answers = [
         {"cohort_id": "c01", "eligible": True, "reason": "  preferred  "},
         {"cohort_id": "c02", "eligible": True, "reason": "a"},
@@ -361,9 +379,15 @@ def test_read_accepts_only_one_well_formed_verdict_per_cohort() -> None:
         {"cohort_id": "c04", "eligible": False, "reason": "x" * 400},
         {"cohort_id": "c99", "eligible": True, "reason": "not asked"},
     ]
-    reply["body"]["choices"][0]["message"]["content"] = json.dumps({"verdicts": answers})
+    answer = {
+        "ok": True,
+        "data": {"verdicts": answers},
+        "model": MODEL,
+        "tokens": 180,
+        "attempts": 1,
+    }
 
-    item = read(built, [reply])
+    item = read(built, [answer])
 
     keys = [c["cohort_key"] for c in built["requests"][0]["cohorts"]]
     assert [(v["cohort_key"], v["eligible"], v["model"]) for v in item["verdicts"]] == [
@@ -379,42 +403,74 @@ def test_read_accepts_only_one_well_formed_verdict_per_cohort() -> None:
     assert (item["llm_calls"], item["llm_tokens"]) == (1, 180)
 
 
+def content_reply(content: str) -> dict[str, Any]:
+    return {
+        "statusCode": 200,
+        "body": {"choices": [{"finish_reason": "stop", "message": {"content": content}}]},
+    }
+
+
 @pytest.mark.parametrize(
-    ("reply", "expected"),
+    ("reply", "expected", "attempts"),
     [
         (
-            {
-                "statusCode": 429,
-                "headers": {"retry-after": "21"},
-                "body": {"error": {"message": "TPM limit 8000"}},
-            },
-            "Groq rate limited (HTTP 429), retry-after 21 s: TPM limit 8000",
+            status_reply(429, "21", "TPM limit 8000"),
+            "Groq rate limited (HTTP 429) on openai/gpt-oss-20b after 6 waits, retry-after 21 s:"
+            " TPM limit 8000",
+            8,
         ),
-        ({"statusCode": 500, "body": {"error": {"message": "boom"}}}, "Groq HTTP 500: boom"),
-        ({"error": {"message": "ECONNRESET"}}, "No response from Groq: ECONNRESET"),
+        (status_reply(500, message="boom"), "Groq HTTP 500: boom", 2),
+        ({"error": {"message": "ECONNRESET"}}, "No response from Groq: ECONNRESET", 1),
+        (content_reply("{not json"), "Groq answer rejected: the message content is not JSON", 1),
+        ({"statusCode": 200, "body": {}}, "the reply has no choices", 1),
+        (content_reply("{}"), "it does not match the schema: $.verdicts is missing", 1),
         (
-            {"statusCode": 200, "body": {"choices": [{"message": {"content": "{not json"}}]}},
-            "Groq answer was not valid: the message content is not JSON",
-        ),
-        ({"statusCode": 200, "body": {}}, "the reply has no message content"),
-        (
-            {"statusCode": 200, "body": {"choices": [{"message": {"content": "{}"}}]}},
-            "the answer has no verdicts array",
+            content_reply('{"verdicts": [{"cohort_id": "c99", "eligible": true, "reason": "x"}]}'),
+            "$.verdicts[0].cohort_id is not one of the allowed values",
+            1,
         ),
     ],
 )
 def test_failed_calls_leave_every_cohort_unresolved_with_the_reason(
-    reply: dict[str, Any], expected: str
+    reply: dict[str, Any], expected: str, attempts: int
 ) -> None:
     cohorts = [synthetic_cohort(1, n) for n in range(2)]
     built = only_item(run_code_node(BUILD_NODE, synthetic_form(cohorts, {})))
 
-    item = read(built, [reply])
+    item = read(built, [through_gateway(built["requests"][0], lambda _: reply)])
 
     assert item["verdicts"] == []
     assert [u["outcome"] for u in item["unresolved"]] == ["unresolved_error"] * 2
     assert all(expected in u["reason"] for u in item["unresolved"])
-    assert item["llm_calls"] == 1
+    assert (item["llm_calls"], item["llm_tokens"]) == (attempts, 0)
+
+
+def test_a_gateway_budget_refusal_is_unresolved_budget_and_costs_no_call() -> None:
+    cohorts = [synthetic_cohort(1, n) for n in range(2)]
+    built = only_item(run_code_node(BUILD_NODE, synthetic_form(cohorts, {})))
+    request = built["requests"][0]
+    spent = {
+        MODEL: {"tokens": 0, "calls": 10_000},
+        "openai/gpt-oss-20b": {"tokens": 0, "calls": 10_000},
+    }
+    llm = gateway_request(**request["llm"], batch_id=request["batch_id"], run_id=request["run_id"])
+
+    item = read(built, [run_gateway(llm, [], spent).result])
+
+    assert [u["outcome"] for u in item["unresolved"]] == ["unresolved_budget"] * 2
+    assert "daily budget" in item["unresolved"][0]["reason"]
+    assert (item["llm_calls"], item["llm_tokens"]) == (0, 0)
+
+
+def test_a_failed_gateway_execution_is_unresolved_error_with_its_message() -> None:
+    cohorts = [synthetic_cohort(1, n) for n in range(2)]
+    built = only_item(run_code_node(BUILD_NODE, synthetic_form(cohorts, {})))
+
+    item = read(built, [{"error": "Workflow is not active and cannot be executed"}])
+
+    assert [u["outcome"] for u in item["unresolved"]] == ["unresolved_error"] * 2
+    assert "LLM Gateway failed: Workflow is not active" in item["unresolved"][0]["reason"]
+    assert item["llm_calls"] == 0
 
 
 def test_verdicts_fan_out_to_every_member_and_the_funnel_is_recorded(
@@ -494,7 +550,7 @@ def test_cache_serves_a_later_batch_until_the_product_text_changes(
         1,
         1,
     )
-    asked = rejudged["built"]["requests"][0]["groq_request"]["messages"][1]["content"]
+    asked = rejudged["built"]["requests"][0]["llm"]["user"]
     assert changed in asked
 
 
@@ -604,27 +660,6 @@ def test_run_with_no_borderline_pairs_records_measured_zeros(
     counts = ("llm_cohorts", "cache_hits", "llm_calls", "llm_tokens", "stage3_eligible")
     assert {k: result[k] for k in counts} == dict.fromkeys(counts, 0)
     assert (result["stage3_not_eligible"], result["unresolved_error"]) == (0, 0)
-
-
-def test_log_node_writes_the_ledger_row_with_run_and_batch(connect_db: Callable[[], Any]) -> None:
-    conn = connect_db()
-    batch_id = new_batch(conn)
-    run_id = new_run(conn, batch_id)
-
-    rows = conn.run(
-        node_query(LOG_NODE, LOG_PARAMS),
-        p1="cohort_verdict",
-        p2=MODEL,
-        p3=1493,
-        p4=762,
-        p5=200,
-        p6=1709,
-        p7=str(batch_id),
-        p8=str(run_id),
-    )
-
-    assert rows[0][1:] == ["cohort_verdict", MODEL, 1493, 762, 200, 1709]
-    assert conn.run("SELECT batch_id, run_id FROM llm_calls") == [[batch_id, run_id]]
 
 
 def test_failure_branch_names_stage_3(connect_db: Callable[[], Any]) -> None:

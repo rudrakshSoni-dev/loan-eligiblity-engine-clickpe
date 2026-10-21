@@ -64,10 +64,8 @@ def test_statistics_refresh_and_stage_3_branches_are_wired() -> None:
     assert targets("Record · Stage 2 funnel") == ["Stage 3 · Form cohorts"]
     assert targets("Check · Any cohort to ask Groq", 0) == ["Stage 3 · One item per request"]
     assert targets("Check · Any cohort to ask Groq", 1) == ["Stage 3 · Read verdicts"]
-    assert sorted(targets("LLM · Judge cohorts (Groq)")) == [
-        "Log · llm_calls (Stage 3)",
-        "Stage 3 · Read verdicts",
-    ]
+    assert targets("Stage 3 · One item per request") == ["LLM · Judge cohorts (LLM Gateway)"]
+    assert targets("LLM · Judge cohorts (LLM Gateway)") == ["Stage 3 · Read verdicts"]
 
 
 def test_code_and_sql_carry_no_comment_lines() -> None:

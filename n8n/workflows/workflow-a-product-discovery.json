@@ -6,7 +6,7 @@
     "nodes": [
       {
         "parameters": {
-          "content": "## Workflow A · Product discovery (fetch, extract, structure, store)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row, and retire products that stop being seen.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Prompt` + `LLM` send the lines to Groq (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning). Every call is recorded in `llm_calls`.\n4. `Route` on the HTTP status: 200 -> `Coerce`; 429 -> `Mark · Groq rate limited`; anything else -> `Mark · Groq call failed`. The wait-and-fall-back-to-20b logic is the planned LLM Gateway (T26).\n5. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n6. `Upsert` writes the product on `(source, product_name)` (sets `active`, `last_seen_at`, the SHA-256 `content_hash` of the criteria text) and the success row of `crawl_runs` in one statement, so the two cannot disagree. A database error on one site goes to `Mark · Upsert failed` and the failure log; the other sites carry on.\n7. After every failed site is logged, `Retire` checks that source's last 3 `crawl_runs` rows: all failed -> its non-seed product is set `active = false`. Nothing is deleted; the next good run reactivates it.\n\n**Output.** `loan_products` rows (crawled rows have `is_seed = false`), one `crawl_runs` row per site per run, one `llm_calls` row per Groq call.\n\n**Next.** T29 hashes `criteria_text` to skip the LLM for unchanged pages.",
+          "content": "## Workflow A · Product discovery (fetch, extract, structure, store)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row, and retire products that stop being seen.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Prompt` builds the request and `LLM · Structure criteria (LLM Gateway)` sends it through the LLM Gateway sub-workflow (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning; the gateway checks the answer against the schema, waits out 429s and falls back to `gpt-oss-20b`, and records every attempt in `llm_calls`).\n4. `Route` on the gateway answer: `ok` -> `Coerce`; still rate limited after the gateway's waits and fallback -> `Mark · Groq rate limited`; any other failure -> `Mark · Groq call failed`.\n5. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n6. `Upsert` writes the product on `(source, product_name)` (sets `active`, `last_seen_at`, the SHA-256 `content_hash` of the criteria text) and the success row of `crawl_runs` in one statement, so the two cannot disagree. A database error on one site goes to `Mark · Upsert failed` and the failure log; the other sites carry on.\n7. After every failed site is logged, `Retire` checks that source's last 3 `crawl_runs` rows: all failed -> its non-seed product is set `active = false`. Nothing is deleted; the next good run reactivates it.\n\n**Output.** `loan_products` rows (crawled rows have `is_seed = false`), one `crawl_runs` row per site per run, one `llm_calls` row per Groq attempt (written by the gateway).\n\n**Next.** T29 hashes `criteria_text` to skip the LLM for unchanged pages.",
           "height": 560,
           "width": 640,
           "color": 4
@@ -300,10 +300,10 @@
       },
       {
         "parameters": {
-          "jsCode": "const MODEL = 'openai/gpt-oss-120b';\nconst MAX_COMPLETION_TOKENS = 1000;\nconst EMPLOYMENT_GROUPS = ['Salaried', 'Self-Employed', 'Business'];\n\nconst SYSTEM_PROMPT = [\n  \"You extract one lender's personal-loan eligibility criteria from the text the user sends.\",\n  '1. Use only what the text states. Never infer, compute or convert. If a value is not stated, return null.',\n  '2. min_monthly_income is the lowest net monthly income in rupees as a plain number (₹30,000 -> 30000).',\n  '3. Credit scores are on the 300-900 scale. \"700 and above\" -> min_credit_score 700, even when the text calls it preferred or ideal.',\n  '4. Ages are whole years. \"between 21 and 60\" -> min_age 21, max_age 60.',\n  '5. Interest rates are percent per annum. A monthly rate counts only through its stated annual equivalent. If only a starting rate is stated, set interest_rate_min and leave interest_rate_max null.',\n  '6. allowed_employment lists only the groups the text names, using exactly Salaried, Self-Employed or Business. Null when the text names none.',\n  '7. If thresholds differ by employment type, or the text states conditions these fields cannot express (work experience, business vintage, employer type), use the loosest bound for each field and set has_conditional_criteria to true. Otherwise false.',\n].join('\\n');\n\nconst nullableNumber = { type: ['number', 'null'] };\nconst nullableInteger = { type: ['integer', 'null'] };\n\nconst RESPONSE_SCHEMA = {\n  type: 'object',\n  properties: {\n    min_monthly_income: nullableNumber,\n    min_credit_score: nullableInteger,\n    max_credit_score: nullableInteger,\n    min_age: nullableInteger,\n    max_age: nullableInteger,\n    interest_rate_min: nullableNumber,\n    interest_rate_max: nullableNumber,\n    allowed_employment: {\n      type: ['array', 'null'],\n      items: { type: 'string', enum: EMPLOYMENT_GROUPS },\n    },\n    has_conditional_criteria: { type: 'boolean' },\n  },\n  required: [\n    'min_monthly_income',\n    'min_credit_score',\n    'max_credit_score',\n    'min_age',\n    'max_age',\n    'interest_rate_min',\n    'interest_rate_max',\n    'allowed_employment',\n    'has_conditional_criteria',\n  ],\n  additionalProperties: false,\n};\n\nreturn $input.all().map(({ json }) => ({\n  json: {\n    source: json.source,\n    product_name: json.product_name,\n    source_url: json.source_url,\n    role: json.role,\n    criteria_text: json.criteria_text,\n    line_count: json.line_count,\n    fetched_at: json.fetched_at,\n    groq_request: {\n      model: MODEL,\n      temperature: 0,\n      reasoning_effort: 'low',\n      include_reasoning: false,\n      max_completion_tokens: MAX_COMPLETION_TOKENS,\n      messages: [\n        { role: 'system', content: SYSTEM_PROMPT },\n        {\n          role: 'user',\n          content: `Lender: ${json.source}\\nProduct: ${json.product_name}\\nCriteria text:\\n${json.criteria_text}`,\n        },\n      ],\n      response_format: {\n        type: 'json_schema',\n        json_schema: { name: 'loan_product_criteria', strict: true, schema: RESPONSE_SCHEMA },\n      },\n    },\n  },\n}));"
+          "jsCode": "const MODEL = 'openai/gpt-oss-120b';\nconst MAX_COMPLETION_TOKENS = 1000;\nconst EMPLOYMENT_GROUPS = ['Salaried', 'Self-Employed', 'Business'];\n\nconst SYSTEM_PROMPT = [\n  \"You extract one lender's personal-loan eligibility criteria from the text the user sends.\",\n  '1. Use only what the text states. Never infer, compute or convert. If a value is not stated, return null.',\n  '2. min_monthly_income is the lowest net monthly income in rupees as a plain number (₹30,000 -> 30000).',\n  '3. Credit scores are on the 300-900 scale. \"700 and above\" -> min_credit_score 700, even when the text calls it preferred or ideal.',\n  '4. Ages are whole years. \"between 21 and 60\" -> min_age 21, max_age 60.',\n  '5. Interest rates are percent per annum. A monthly rate counts only through its stated annual equivalent. If only a starting rate is stated, set interest_rate_min and leave interest_rate_max null.',\n  '6. allowed_employment lists only the groups the text names, using exactly Salaried, Self-Employed or Business. Null when the text names none.',\n  '7. If thresholds differ by employment type, or the text states conditions these fields cannot express (work experience, business vintage, employer type), use the loosest bound for each field and set has_conditional_criteria to true. Otherwise false.',\n].join('\\n');\n\nconst nullableNumber = { type: ['number', 'null'] };\nconst nullableInteger = { type: ['integer', 'null'] };\n\nconst RESPONSE_SCHEMA = {\n  type: 'object',\n  properties: {\n    min_monthly_income: nullableNumber,\n    min_credit_score: nullableInteger,\n    max_credit_score: nullableInteger,\n    min_age: nullableInteger,\n    max_age: nullableInteger,\n    interest_rate_min: nullableNumber,\n    interest_rate_max: nullableNumber,\n    allowed_employment: {\n      type: ['array', 'null'],\n      items: { type: 'string', enum: EMPLOYMENT_GROUPS },\n    },\n    has_conditional_criteria: { type: 'boolean' },\n  },\n  required: [\n    'min_monthly_income',\n    'min_credit_score',\n    'max_credit_score',\n    'min_age',\n    'max_age',\n    'interest_rate_min',\n    'interest_rate_max',\n    'allowed_employment',\n    'has_conditional_criteria',\n  ],\n  additionalProperties: false,\n};\n\nreturn $input.all().map(({ json }) => ({\n  json: {\n    source: json.source,\n    product_name: json.product_name,\n    source_url: json.source_url,\n    role: json.role,\n    criteria_text: json.criteria_text,\n    line_count: json.line_count,\n    fetched_at: json.fetched_at,\n    llm: {\n      purpose: 'crawl_structuring',\n      model: MODEL,\n      system: SYSTEM_PROMPT,\n      user: `Lender: ${json.source}\\nProduct: ${json.product_name}\\nCriteria text:\\n${json.criteria_text}`,\n      schema_name: 'loan_product_criteria',\n      json_schema: RESPONSE_SCHEMA,\n      max_tokens: MAX_COMPLETION_TOKENS,\n    },\n  },\n}));"
         },
         "id": "a0000000-0000-4000-8000-000000000021",
-        "name": "Prompt · Build Groq request",
+        "name": "Prompt · Build LLM request",
         "type": "n8n-nodes-base.code",
         "typeVersion": 2,
         "position": [
@@ -313,85 +313,131 @@
       },
       {
         "parameters": {
-          "method": "POST",
-          "url": "https://api.groq.com/openai/v1/chat/completions",
-          "authentication": "genericCredentialType",
-          "genericAuthType": "httpHeaderAuth",
-          "sendBody": true,
-          "specifyBody": "json",
-          "jsonBody": "={{ $json.groq_request }}",
-          "options": {
-            "timeout": 30000,
-            "batching": {
-              "batch": {
-                "batchSize": 1,
-                "batchInterval": 2000
-              }
+          "workflowId": {
+            "__rl": true,
+            "value": "wfllmgateway01",
+            "mode": "id"
+          },
+          "workflowInputs": {
+            "mappingMode": "defineBelow",
+            "value": {
+              "purpose": "={{ $json.llm.purpose }}",
+              "model": "={{ $json.llm.model }}",
+              "system": "={{ $json.llm.system }}",
+              "user": "={{ $json.llm.user }}",
+              "schema_name": "={{ $json.llm.schema_name }}",
+              "json_schema": "={{ $json.llm.json_schema }}",
+              "max_tokens": "={{ $json.llm.max_tokens }}"
             },
-            "response": {
-              "response": {
-                "fullResponse": true,
-                "neverError": true,
-                "responseFormat": "json"
+            "matchingColumns": [],
+            "schema": [
+              {
+                "id": "purpose",
+                "displayName": "purpose",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "model",
+                "displayName": "model",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "system",
+                "displayName": "system",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "user",
+                "displayName": "user",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "schema_name",
+                "displayName": "schema_name",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "json_schema",
+                "displayName": "json_schema",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "object",
+                "removed": false
+              },
+              {
+                "id": "max_tokens",
+                "displayName": "max_tokens",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "number",
+                "removed": false
+              },
+              {
+                "id": "batch_id",
+                "displayName": "batch_id",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "string",
+                "removed": false
+              },
+              {
+                "id": "run_id",
+                "displayName": "run_id",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "canBeUsedToMatch": true,
+                "type": "number",
+                "removed": false
               }
-            }
+            ],
+            "attemptToConvertTypes": false,
+            "convertFieldsToString": false
+          },
+          "mode": "each",
+          "options": {
+            "waitForSubWorkflow": true
           }
         },
         "id": "a0000000-0000-4000-8000-000000000022",
-        "name": "LLM · Structure criteria (Groq)",
-        "type": "n8n-nodes-base.httpRequest",
-        "typeVersion": 4.2,
+        "name": "LLM · Structure criteria (LLM Gateway)",
+        "type": "n8n-nodes-base.executeWorkflow",
+        "typeVersion": 1.3,
         "position": [
           2320,
           60
         ],
-        "credentials": {
-          "httpHeaderAuth": {
-            "id": "pgrgkUiUod78DwXh",
-            "name": "groq-api"
-          }
-        },
-        "retryOnFail": true,
-        "maxTries": 3,
-        "waitBetweenTries": 5000,
-        "onError": "continueRegularOutput"
-      },
-      {
-        "parameters": {
-          "mode": "runOnceForEachItem",
-          "jsCode": "const request = $('Prompt · Build Groq request').item.json.groq_request;\nconst response = $input.item.json;\nconst usage = (response.body && response.body.usage) || {};\nconst serverSeconds = usage.total_time;\n\nreturn {\n  json: {\n    purpose: 'crawl_structuring',\n    model: request.model,\n    prompt_tokens: usage.prompt_tokens ?? null,\n    completion_tokens: usage.completion_tokens ?? null,\n    status: response.statusCode ?? 0,\n    latency_ms: typeof serverSeconds === 'number' ? Math.round(serverSeconds * 1000) : null,\n  },\n};"
-        },
-        "id": "a0000000-0000-4000-8000-000000000023",
-        "name": "Prepare · llm_calls row",
-        "type": "n8n-nodes-base.code",
-        "typeVersion": 2,
-        "position": [
-          2560,
-          -140
-        ]
-      },
-      {
-        "parameters": {
-          "operation": "executeQuery",
-          "query": "INSERT INTO llm_calls (purpose, model, prompt_tokens, completion_tokens, status, latency_ms) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, purpose, model, prompt_tokens, completion_tokens, status, latency_ms",
-          "options": {
-            "queryReplacement": "={{ [$json.purpose, $json.model, $json.prompt_tokens, $json.completion_tokens, $json.status, $json.latency_ms] }}"
-          }
-        },
-        "id": "a0000000-0000-4000-8000-000000000024",
-        "name": "Log · llm_calls",
-        "type": "n8n-nodes-base.postgres",
-        "typeVersion": 2.5,
-        "position": [
-          2800,
-          -140
-        ],
-        "credentials": {
-          "postgres": {
-            "id": "tNSuoJ0AbwOkWgJM",
-            "name": "rds-postgres"
-          }
-        },
         "onError": "continueRegularOutput"
       },
       {
@@ -408,19 +454,20 @@
                   },
                   "conditions": [
                     {
-                      "id": "http-200",
-                      "leftValue": "={{ $json.statusCode ?? 0 }}",
-                      "rightValue": 200,
+                      "id": "gateway-ok",
+                      "leftValue": "={{ $json.ok === true }}",
+                      "rightValue": "",
                       "operator": {
-                        "type": "number",
-                        "operation": "equals"
+                        "type": "boolean",
+                        "operation": "true",
+                        "singleValue": true
                       }
                     }
                   ],
                   "combinator": "and"
                 },
                 "renameOutput": true,
-                "outputKey": "200 OK"
+                "outputKey": "Answer OK"
               },
               {
                 "conditions": {
@@ -432,11 +479,11 @@
                   },
                   "conditions": [
                     {
-                      "id": "http-429",
-                      "leftValue": "={{ $json.statusCode ?? 0 }}",
-                      "rightValue": 429,
+                      "id": "gateway-rate-limited",
+                      "leftValue": "={{ $json.error_kind ?? '' }}",
+                      "rightValue": "rate_limited",
                       "operator": {
-                        "type": "number",
+                        "type": "string",
                         "operation": "equals"
                       }
                     }
@@ -444,17 +491,17 @@
                   "combinator": "and"
                 },
                 "renameOutput": true,
-                "outputKey": "429 rate limited"
+                "outputKey": "Rate limited after waits + fallback"
               }
             ]
           },
           "options": {
             "fallbackOutput": "extra",
-            "renameFallbackOutput": "Other HTTP / network error"
+            "renameFallbackOutput": "Other failure"
           }
         },
         "id": "a0000000-0000-4000-8000-000000000025",
-        "name": "Route · Groq HTTP status",
+        "name": "Route · Gateway outcome",
         "type": "n8n-nodes-base.switch",
         "typeVersion": 3.2,
         "position": [
@@ -470,19 +517,19 @@
                 "id": "m1",
                 "name": "source",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.source }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.source }}"
               },
               {
                 "id": "m2",
                 "name": "product_name",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.product_name }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.product_name }}"
               },
               {
                 "id": "m3",
                 "name": "source_url",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.source_url }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.source_url }}"
               },
               {
                 "id": "m4",
@@ -494,13 +541,13 @@
                 "id": "m5",
                 "name": "error",
                 "type": "string",
-                "value": "={{ 'Groq rate limited (HTTP 429), retry-after ' + ($json.headers?.['retry-after'] ?? 'not sent') + ' s' + ($json.body?.error?.message ? ': ' + $json.body.error.message : '') }}"
+                "value": "={{ $json.ok === false ? $json.error : 'LLM Gateway failed: ' + (typeof $json.error === 'string' ? $json.error : ($json.error?.message ?? 'no result')) }}"
               },
               {
                 "id": "m6",
                 "name": "llm_calls",
                 "type": "number",
-                "value": "={{ $json.statusCode ? 1 : 0 }}"
+                "value": "={{ $json.attempts ?? 0 }}"
               }
             ]
           },
@@ -523,19 +570,19 @@
                 "id": "m1",
                 "name": "source",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.source }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.source }}"
               },
               {
                 "id": "m2",
                 "name": "product_name",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.product_name }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.product_name }}"
               },
               {
                 "id": "m3",
                 "name": "source_url",
                 "type": "string",
-                "value": "={{ $('Prompt · Build Groq request').item.json.source_url }}"
+                "value": "={{ $('Prompt · Build LLM request').item.json.source_url }}"
               },
               {
                 "id": "m4",
@@ -547,13 +594,13 @@
                 "id": "m5",
                 "name": "error",
                 "type": "string",
-                "value": "={{ $json.statusCode ? ('Groq HTTP ' + $json.statusCode + ($json.body?.error?.message ? ': ' + $json.body.error.message : '')) : String($json.error?.message ?? $json.error ?? 'no response from Groq') }}"
+                "value": "={{ $json.ok === false ? $json.error : 'LLM Gateway failed: ' + (typeof $json.error === 'string' ? $json.error : ($json.error?.message ?? 'no result')) }}"
               },
               {
                 "id": "m6",
                 "name": "llm_calls",
                 "type": "number",
-                "value": "={{ $json.statusCode ? 1 : 0 }}"
+                "value": "={{ $json.attempts ?? 0 }}"
               }
             ]
           },
@@ -571,7 +618,7 @@
       {
         "parameters": {
           "mode": "runOnceForEachItem",
-          "jsCode": "const EMPLOYMENT_GROUPS = ['Salaried', 'Self-Employed', 'Business'];\nconst REQUIRED_KEYS = [\n  'min_monthly_income',\n  'min_credit_score',\n  'max_credit_score',\n  'min_age',\n  'max_age',\n  'interest_rate_min',\n  'interest_rate_max',\n  'allowed_employment',\n  'has_conditional_criteria',\n];\nconst LIMITS = {\n  income: [1000, 10000000],\n  score: [300, 900],\n  age: [18, 100],\n  rate: [0.01, 100],\n};\nconst CONFIDENCE_WEIGHTS = { income: 0.3, credit: 0.25, age: 0.2, rate: 0.15, employment: 0.1 };\nconst CONDITIONAL_CONFIDENCE_CAP = 0.6;\nconst UNIT_MULTIPLIERS = { k: 1e3, lakh: 1e5, lakhs: 1e5, lac: 1e5, crore: 1e7, cr: 1e7 };\nconst AMOUNT_WORD = /(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lac|crore|cr)\\b/gi;\nconst PLAIN_NUMBER = /\\d[\\d,]*(?:\\.\\d+)?/g;\n\nfunction coerceNumber(value) {\n  if (value === null || value === undefined) return null;\n  if (typeof value === 'number') return Number.isFinite(value) ? value : NaN;\n  const text = String(value)\n    .toLowerCase()\n    .replace(/,/g, '')\n    .replace(/₹|\\brs\\b\\.?|\\binr\\b|%/g, ' ')\n    .replace(/\\/\\s*(month|year|mo|yr)|per\\s+(month|year)|years?|yrs?|p\\.?a\\.?|p\\.?m\\.?/g, ' ')\n    .trim();\n  const match = text.match(/^(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lac|crore|cr)?$/);\n  if (!match) return NaN;\n  return Number(match[1]) * (match[2] ? UNIT_MULTIPLIERS[match[2]] : 1);\n}\n\nfunction numbersInText(text) {\n  const found = new Set();\n  for (const token of text.match(PLAIN_NUMBER) || []) found.add(Number(token.replace(/,/g, '')));\n  for (const [, amount, unit] of text.matchAll(AMOUNT_WORD)) {\n    found.add(Number(amount) * UNIT_MULTIPLIERS[unit.toLowerCase()]);\n  }\n  return found;\n}\n\nfunction checkNumber(errors, name, raw, [low, high], integer) {\n  const value = coerceNumber(raw);\n  if (value === null) return null;\n  if (Number.isNaN(value)) {\n    errors.push(`${name} is not a number: ${JSON.stringify(raw)}`);\n    return null;\n  }\n  if (integer && !Number.isInteger(value)) errors.push(`${name} must be a whole number, got ${value}`);\n  if (value < low || value > high) errors.push(`${name}=${value} outside ${low}..${high}`);\n  return value;\n}\n\nfunction checkOrder(errors, lowName, low, highName, high) {\n  if (low !== null && high !== null && low > high) errors.push(`${lowName} ${low} exceeds ${highName} ${high}`);\n}\n\nfunction checkEmployment(errors, raw) {\n  if (raw === null) return null;\n  if (!Array.isArray(raw) || raw.length === 0) {\n    errors.push('allowed_employment must be null or a non-empty list');\n    return null;\n  }\n  const unknown = raw.filter((group) => !EMPLOYMENT_GROUPS.includes(group));\n  if (unknown.length > 0) errors.push(`allowed_employment has unknown groups: ${unknown.join(', ')}`);\n  return [...new Set(raw)].sort();\n}\n\nfunction checkGrounded(errors, fields, text) {\n  const present = numbersInText(text);\n  const numeric = [\n    'min_monthly_income',\n    'min_credit_score',\n    'max_credit_score',\n    'min_age',\n    'max_age',\n    'interest_rate_min',\n    'interest_rate_max',\n  ];\n  for (const name of numeric) {\n    if (fields[name] !== null && !present.has(fields[name])) {\n      errors.push(`${name}=${fields[name]} does not appear in the criteria text`);\n    }\n  }\n}\n\nfunction parseConfidence(fields) {\n  const filled = {\n    income: fields.min_monthly_income !== null,\n    credit: fields.min_credit_score !== null || fields.max_credit_score !== null,\n    age: fields.min_age !== null || fields.max_age !== null,\n    rate: fields.interest_rate_min !== null || fields.interest_rate_max !== null,\n    employment: fields.allowed_employment !== null,\n  };\n  const score = Object.keys(filled).reduce((sum, key) => sum + (filled[key] ? CONFIDENCE_WEIGHTS[key] : 0), 0);\n  const capped = fields.has_conditional_criteria ? Math.min(score, CONDITIONAL_CONFIDENCE_CAP) : score;\n  return Math.round(capped * 100) / 100;\n}\n\nfunction parseModelAnswer(response) {\n  const choice = response.body && response.body.choices && response.body.choices[0];\n  if (!choice) return { errors: ['Groq answer has no choices'] };\n  if (choice.finish_reason !== 'stop') {\n    return { errors: [`Groq stopped early: finish_reason=${choice.finish_reason}`], content: choice.message && choice.message.content };\n  }\n  const content = choice.message && choice.message.content;\n  try {\n    const parsed = JSON.parse(content);\n    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {\n      return { errors: ['Groq answer is not a JSON object'], content };\n    }\n    const missing = REQUIRED_KEYS.filter((key) => !(key in parsed));\n    return missing.length > 0 ? { errors: [`Groq answer lacks fields: ${missing.join(', ')}`], content } : { parsed, errors: [] };\n  } catch (error) {\n    return { errors: [`Groq answer is not valid JSON: ${error.message}`], content };\n  }\n}\n\nfunction structure(response, context) {\n  const answer = parseModelAnswer(response);\n  const errors = [...answer.errors];\n  if (errors.length > 0) return { errors, content: answer.content };\n  const raw = answer.parsed;\n  const fields = {\n    min_monthly_income: checkNumber(errors, 'min_monthly_income', raw.min_monthly_income, LIMITS.income, false),\n    min_credit_score: checkNumber(errors, 'min_credit_score', raw.min_credit_score, LIMITS.score, true),\n    max_credit_score: checkNumber(errors, 'max_credit_score', raw.max_credit_score, LIMITS.score, true),\n    min_age: checkNumber(errors, 'min_age', raw.min_age, LIMITS.age, true),\n    max_age: checkNumber(errors, 'max_age', raw.max_age, LIMITS.age, true),\n    interest_rate_min: checkNumber(errors, 'interest_rate_min', raw.interest_rate_min, LIMITS.rate, false),\n    interest_rate_max: checkNumber(errors, 'interest_rate_max', raw.interest_rate_max, LIMITS.rate, false),\n    allowed_employment: checkEmployment(errors, raw.allowed_employment),\n    has_conditional_criteria: raw.has_conditional_criteria === true,\n  };\n  checkOrder(errors, 'min_credit_score', fields.min_credit_score, 'max_credit_score', fields.max_credit_score);\n  checkOrder(errors, 'min_age', fields.min_age, 'max_age', fields.max_age);\n  checkOrder(errors, 'interest_rate_min', fields.interest_rate_min, 'interest_rate_max', fields.interest_rate_max);\n  checkGrounded(errors, fields, context.criteria_text);\n  if (parseConfidence(fields) === 0) errors.push('no criteria were extracted');\n  return { fields, errors, content: answer.content };\n}\n\nconst response = $input.item.json;\nconst context = $('Prompt · Build Groq request').item.json;\nconst usage = (response.body && response.body.usage) || {};\nconst { fields, errors, content } = structure(response, context);\n\nconst base = {\n  source: context.source,\n  product_name: context.product_name,\n  source_url: context.source_url,\n  fetched_at: context.fetched_at,\n  model: response.body && response.body.model,\n  prompt_tokens: usage.prompt_tokens ?? null,\n  completion_tokens: usage.completion_tokens ?? null,\n  llm_calls: 1,\n};\n\nif (errors.length > 0) {\n  return {\n    json: {\n      ...base,\n      status: 'structuring_invalid',\n      error: `Structured output rejected: ${errors.join('; ')}`,\n      raw_model_output: String(content ?? '').slice(0, 500),\n    },\n  };\n}\n\nreturn {\n  json: {\n    ...base,\n    status: 'structured',\n    interest_rate_min: fields.interest_rate_min,\n    interest_rate_max: fields.interest_rate_max,\n    min_monthly_income: fields.min_monthly_income,\n    min_credit_score: fields.min_credit_score,\n    max_credit_score: fields.max_credit_score,\n    min_age: fields.min_age,\n    max_age: fields.max_age,\n    allowed_employment: fields.allowed_employment,\n    has_conditional_criteria: fields.has_conditional_criteria,\n    raw_criteria_text: context.criteria_text,\n    parse_confidence: parseConfidence(fields),\n  },\n};"
+          "jsCode": "const EMPLOYMENT_GROUPS = ['Salaried', 'Self-Employed', 'Business'];\nconst REQUIRED_KEYS = [\n  'min_monthly_income',\n  'min_credit_score',\n  'max_credit_score',\n  'min_age',\n  'max_age',\n  'interest_rate_min',\n  'interest_rate_max',\n  'allowed_employment',\n  'has_conditional_criteria',\n];\nconst LIMITS = {\n  income: [1000, 10000000],\n  score: [300, 900],\n  age: [18, 100],\n  rate: [0.01, 100],\n};\nconst CONFIDENCE_WEIGHTS = { income: 0.3, credit: 0.25, age: 0.2, rate: 0.15, employment: 0.1 };\nconst CONDITIONAL_CONFIDENCE_CAP = 0.6;\nconst UNIT_MULTIPLIERS = { k: 1e3, lakh: 1e5, lakhs: 1e5, lac: 1e5, crore: 1e7, cr: 1e7 };\nconst AMOUNT_WORD = /(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lac|crore|cr)\\b/gi;\nconst PLAIN_NUMBER = /\\d[\\d,]*(?:\\.\\d+)?/g;\n\nfunction coerceNumber(value) {\n  if (value === null || value === undefined) return null;\n  if (typeof value === 'number') return Number.isFinite(value) ? value : NaN;\n  const text = String(value)\n    .toLowerCase()\n    .replace(/,/g, '')\n    .replace(/₹|\\brs\\b\\.?|\\binr\\b|%/g, ' ')\n    .replace(/\\/\\s*(month|year|mo|yr)|per\\s+(month|year)|years?|yrs?|p\\.?a\\.?|p\\.?m\\.?/g, ' ')\n    .trim();\n  const match = text.match(/^(\\d+(?:\\.\\d+)?)\\s*(k|lakhs?|lac|crore|cr)?$/);\n  if (!match) return NaN;\n  return Number(match[1]) * (match[2] ? UNIT_MULTIPLIERS[match[2]] : 1);\n}\n\nfunction numbersInText(text) {\n  const found = new Set();\n  for (const token of text.match(PLAIN_NUMBER) || []) found.add(Number(token.replace(/,/g, '')));\n  for (const [, amount, unit] of text.matchAll(AMOUNT_WORD)) {\n    found.add(Number(amount) * UNIT_MULTIPLIERS[unit.toLowerCase()]);\n  }\n  return found;\n}\n\nfunction checkNumber(errors, name, raw, [low, high], integer) {\n  const value = coerceNumber(raw);\n  if (value === null) return null;\n  if (Number.isNaN(value)) {\n    errors.push(`${name} is not a number: ${JSON.stringify(raw)}`);\n    return null;\n  }\n  if (integer && !Number.isInteger(value)) errors.push(`${name} must be a whole number, got ${value}`);\n  if (value < low || value > high) errors.push(`${name}=${value} outside ${low}..${high}`);\n  return value;\n}\n\nfunction checkOrder(errors, lowName, low, highName, high) {\n  if (low !== null && high !== null && low > high) errors.push(`${lowName} ${low} exceeds ${highName} ${high}`);\n}\n\nfunction checkEmployment(errors, raw) {\n  if (raw === null) return null;\n  if (!Array.isArray(raw) || raw.length === 0) {\n    errors.push('allowed_employment must be null or a non-empty list');\n    return null;\n  }\n  const unknown = raw.filter((group) => !EMPLOYMENT_GROUPS.includes(group));\n  if (unknown.length > 0) errors.push(`allowed_employment has unknown groups: ${unknown.join(', ')}`);\n  return [...new Set(raw)].sort();\n}\n\nfunction checkGrounded(errors, fields, text) {\n  const present = numbersInText(text);\n  const numeric = [\n    'min_monthly_income',\n    'min_credit_score',\n    'max_credit_score',\n    'min_age',\n    'max_age',\n    'interest_rate_min',\n    'interest_rate_max',\n  ];\n  for (const name of numeric) {\n    if (fields[name] !== null && !present.has(fields[name])) {\n      errors.push(`${name}=${fields[name]} does not appear in the criteria text`);\n    }\n  }\n}\n\nfunction parseConfidence(fields) {\n  const filled = {\n    income: fields.min_monthly_income !== null,\n    credit: fields.min_credit_score !== null || fields.max_credit_score !== null,\n    age: fields.min_age !== null || fields.max_age !== null,\n    rate: fields.interest_rate_min !== null || fields.interest_rate_max !== null,\n    employment: fields.allowed_employment !== null,\n  };\n  const score = Object.keys(filled).reduce((sum, key) => sum + (filled[key] ? CONFIDENCE_WEIGHTS[key] : 0), 0);\n  const capped = fields.has_conditional_criteria ? Math.min(score, CONDITIONAL_CONFIDENCE_CAP) : score;\n  return Math.round(capped * 100) / 100;\n}\n\nfunction parseModelAnswer(result) {\n  const parsed = result.data;\n  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {\n    return { errors: ['LLM Gateway answer is not a JSON object'], content: JSON.stringify(parsed ?? null) };\n  }\n  const content = JSON.stringify(parsed);\n  const missing = REQUIRED_KEYS.filter((key) => !(key in parsed));\n  return missing.length > 0 ? { errors: [`LLM Gateway answer lacks fields: ${missing.join(', ')}`], content } : { parsed, errors: [], content };\n}\n\nfunction structure(result, context) {\n  const answer = parseModelAnswer(result);\n  const errors = [...answer.errors];\n  if (errors.length > 0) return { errors, content: answer.content };\n  const raw = answer.parsed;\n  const fields = {\n    min_monthly_income: checkNumber(errors, 'min_monthly_income', raw.min_monthly_income, LIMITS.income, false),\n    min_credit_score: checkNumber(errors, 'min_credit_score', raw.min_credit_score, LIMITS.score, true),\n    max_credit_score: checkNumber(errors, 'max_credit_score', raw.max_credit_score, LIMITS.score, true),\n    min_age: checkNumber(errors, 'min_age', raw.min_age, LIMITS.age, true),\n    max_age: checkNumber(errors, 'max_age', raw.max_age, LIMITS.age, true),\n    interest_rate_min: checkNumber(errors, 'interest_rate_min', raw.interest_rate_min, LIMITS.rate, false),\n    interest_rate_max: checkNumber(errors, 'interest_rate_max', raw.interest_rate_max, LIMITS.rate, false),\n    allowed_employment: checkEmployment(errors, raw.allowed_employment),\n    has_conditional_criteria: raw.has_conditional_criteria === true,\n  };\n  checkOrder(errors, 'min_credit_score', fields.min_credit_score, 'max_credit_score', fields.max_credit_score);\n  checkOrder(errors, 'min_age', fields.min_age, 'max_age', fields.max_age);\n  checkOrder(errors, 'interest_rate_min', fields.interest_rate_min, 'interest_rate_max', fields.interest_rate_max);\n  checkGrounded(errors, fields, context.criteria_text);\n  if (parseConfidence(fields) === 0) errors.push('no criteria were extracted');\n  return { fields, errors, content: answer.content };\n}\n\nconst result = $input.item.json;\nconst context = $('Prompt · Build LLM request').item.json;\nconst { fields, errors, content } = structure(result, context);\n\nconst base = {\n  source: context.source,\n  product_name: context.product_name,\n  source_url: context.source_url,\n  fetched_at: context.fetched_at,\n  model: result.model,\n  prompt_tokens: result.prompt_tokens ?? null,\n  completion_tokens: result.completion_tokens ?? null,\n  llm_calls: result.attempts ?? 1,\n};\n\nif (errors.length > 0) {\n  return {\n    json: {\n      ...base,\n      status: 'structuring_invalid',\n      error: `Structured output rejected: ${errors.join('; ')}`,\n      raw_model_output: String(content ?? '').slice(0, 500),\n    },\n  };\n}\n\nreturn {\n  json: {\n    ...base,\n    status: 'structured',\n    interest_rate_min: fields.interest_rate_min,\n    interest_rate_max: fields.interest_rate_max,\n    min_monthly_income: fields.min_monthly_income,\n    min_credit_score: fields.min_credit_score,\n    max_credit_score: fields.max_credit_score,\n    min_age: fields.min_age,\n    max_age: fields.max_age,\n    allowed_employment: fields.allowed_employment,\n    has_conditional_criteria: fields.has_conditional_criteria,\n    raw_criteria_text: context.criteria_text,\n    parse_confidence: parseConfidence(fields),\n  },\n};"
         },
         "id": "a0000000-0000-4000-8000-000000000028",
         "name": "Coerce · Validate product",
@@ -844,7 +891,7 @@
         "main": [
           [
             {
-              "node": "Prompt · Build Groq request",
+              "node": "Prompt · Build LLM request",
               "type": "main",
               "index": 0
             }
@@ -852,69 +899,6 @@
           [
             {
               "node": "Log · crawl_runs failure",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "Prompt · Build Groq request": {
-        "main": [
-          [
-            {
-              "node": "LLM · Structure criteria (Groq)",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "LLM · Structure criteria (Groq)": {
-        "main": [
-          [
-            {
-              "node": "Prepare · llm_calls row",
-              "type": "main",
-              "index": 0
-            },
-            {
-              "node": "Route · Groq HTTP status",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "Prepare · llm_calls row": {
-        "main": [
-          [
-            {
-              "node": "Log · llm_calls",
-              "type": "main",
-              "index": 0
-            }
-          ]
-        ]
-      },
-      "Route · Groq HTTP status": {
-        "main": [
-          [
-            {
-              "node": "Coerce · Validate product",
-              "type": "main",
-              "index": 0
-            }
-          ],
-          [
-            {
-              "node": "Mark · Groq rate limited",
-              "type": "main",
-              "index": 0
-            }
-          ],
-          [
-            {
-              "node": "Mark · Groq call failed",
               "type": "main",
               "index": 0
             }
@@ -1022,6 +1006,53 @@
           [
             {
               "node": "Retire · Product after 3 failed runs",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Prompt · Build LLM request": {
+        "main": [
+          [
+            {
+              "node": "LLM · Structure criteria (LLM Gateway)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LLM · Structure criteria (LLM Gateway)": {
+        "main": [
+          [
+            {
+              "node": "Route · Gateway outcome",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route · Gateway outcome": {
+        "main": [
+          [
+            {
+              "node": "Coerce · Validate product",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Mark · Groq rate limited",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Mark · Groq call failed",
               "type": "main",
               "index": 0
             }
