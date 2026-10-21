@@ -42,6 +42,8 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 28. [Workflow B Stage 1: SQL pre-filter that keeps near misses](#workflow-b-stage-1-sql-pre-filter-that-keeps-near-misses)
 29. [Workflow B Stage 2: rule cards in code, classification in SQL](#workflow-b-stage-2-rule-cards-in-code-classification-in-sql)
 30. [Workflow B Stage 3: cohort verdicts on the lender's wording](#workflow-b-stage-3-cohort-verdicts-on-the-lenders-wording)
+31. [Workflow B persist: matches written from the database, final count read back](#workflow-b-persist-matches-written-from-the-database-final-count-read-back)
+32. [Workflow C: compose and recipient guard](#workflow-c-compose-and-recipient-guard)
 
 ---
 
@@ -1407,6 +1409,24 @@ and the stored outcome and reason equal the cached verdict for `(cohort_key, con
 
 **Why.** An existing match keeps its `batch_id` and `notified_at`, so a user who shows up in two batches is never emailed twice for the same product (Workflow C reads `notified_at IS NULL`). `unresolved_*` and `not_eligible` pairs are never stored: an unanswered question is not a match. Both nodes are idempotent, so Retry On Fail is safe on them. `persist` is timed from the insert's `statement_timestamp()` to after its commit, so foreign-key checks are included (the Stage 1 lesson).
 
-**Not built.** The hand-off to Workflow C. It does not exist until T38, so Workflow B ends at `matched`.
+**Hand-off.** `Notify · Run Workflow C` (added in T38) follows `Persist · Finalize run + mark matched` and starts Workflow C without waiting for it, so a slow or failing notification never changes how the matching run is reported.
 
 **Measured (RDS, 10,000-user sample, run 17, then run 18 on the same batch).** 11,841 matches = 10,405 `rules` + 1,436 `llm`, for 6,017 distinct users; persist 504 ms the first time, 82 ms the second; the second run inserted 0 rows, made 0 LLM calls and still reports 11,841.
+
+---
+
+## Workflow C: compose and recipient guard
+
+**Choice.** `C · Notification` is a sub-workflow (Execute Workflow Trigger) that Workflow B starts after the batch is `matched`. Stages: read and validate `batch_id` → load and validate the settings → claim `matched → notifying` with one conditional UPDATE → one SQL statement selects the first `max_emails_per_run` users (ordered by `user_id`) that still have unnotified matches in this batch on active products, with all their offers as JSON → a Code node writes subject, HTML and plain text and redirects every user to one of the test inboxes → a second Code node, the guard, throws unless every recipient is exactly one of those inboxes → release `notifying → matched`. Any error after the claim marks the batch `failed` with the message and ends in a Stop and Error node, so the execution itself shows as failed. This task composes and checks; it sends nothing and marks nothing notified. Sending, `notified_at`, the `DRY_RUN` branch and the `notified` status are T39.
+
+**Settings in a table, not `$env`.** Migration `0006_app_config` creates `app_config(key, value jsonb, description, updated_at)` with exactly three keys: `dry_run` (boolean), `test_inbox_aliases` (non-empty array) and `max_emails_per_run` (whole number 1 to 9999). CHECK constraints enforce the types, so a bad value is refused when it is written, and the validate node refuses a missing or malformed row before anything is claimed. There is no default in code: with `DRY_RUN` unreadable, the run stops instead of guessing. Seed values are the safe ones: `dry_run = true`, the three SES-verified identities, 5 emails. `$env` is not used because `N8N_BLOCK_ENV_ACCESS_IN_NODE=true` (the container environment holds the encryption key).
+
+**Redirect and guard are two separate pieces.** The redirect picks `aliases[first 8 hex digits of user_id mod number of aliases]`, so a user always lands in the same inbox and the load spreads over all three. The guard does not trust that code: it re-reads the allowed list from the config node, not from the composed item, and requires every `to` to be a string equal to one of them (so `A@x.com`, `a@x.com,b@y.com` and `"a@x.com "` all fail), no `cc` / `bcc` / `replyTo` on any message and no more messages than the cap. It reports the count of problems and the first five. SES in sandbox is a third, AWS-side layer: it only delivers to the three verified identities.
+
+**Rejected.** (a) One Postgres row per user flowing through n8n items: with zero waiting users no item would reach the release step and the batch would stay `notifying`. The select is an aggregate that always returns one row (an empty list when nothing waits), and the Code nodes keep one "run" item with an `emails` array; T39 splits it for sending. (b) Putting the allowed list into the composed item and letting the guard read it there: a bug in the compose step would then also widen the guard. (c) `waitForSubWorkflow: true` in B: B would be reported as failed because of an email problem, although matching succeeded. (d) Computing the redirect in SQL: the rule would be hidden in a query where it is harder to read and test than in the Code node next to the guard.
+
+**Safety of the content.** Everything that came from a crawl or the CSV (lender, product, reason, user name, original address) is HTML-escaped; links are used only when the stored URL starts with `http://` or `https://`; a reason is cut to 240 characters. The original address appears once, in the `Intended for:` line, never as a recipient. Every subject starts with `[TEST]` and every body says it was redirected. The body carries the indicative-eligibility disclaimer.
+
+**Limits.** Unnotified matches of products that became inactive are not offered (they stay unnotified). The composed run item is about 2 KB per email (one measured email: 1,165 characters of HTML plus the text), so a cap of 6,017 would be about 12 MB (estimate, not run); the demo cap is 5. The sub-workflow must be published, not just imported: n8n 2.44.4 answers an unpublished callee with `Workflow is not active and cannot be executed` (found on the first live run).
+
+**Measured (RDS and the EC2 n8n, batch of the 10,000-user sample with 11,841 matches for 6,017 users).** Compose query execution: 12 ms at the demo cap of 5 and 228 ms at a cap of 6,017 (`EXPLAIN ANALYZE`). A live run composed 5 of 6,017 waiting users in 464 ms of node time plus a 1.5 s start of the first Code node (execution 74), checked all 5 and released the batch. A drill with the compose step addressing the original email was blocked by the guard (2 problems), the batch went `failed` with the message and the execution status was `error` (execution 76); the same batch again ended at `Stop · Nothing to do` with 0 claimed (execution 78). Workflow B then started Workflow C by itself on a throwaway batch (executions 79 and 80). Local: 84 new tests; 15 mutation probes on the exported workflow each fail at least one test.

@@ -178,3 +178,26 @@ top-level array); `resultData.runData[node][i]` holds `startTime`, `executionTim
 Migration `0005_final_matches` was applied with `infra/ec2/migrate.sh` (file SHA-256 `de22a2e7…3090` identical on both sides). Workflow B was re-imported and published as in T32, but the file is now over SSM's 97 KB parameter limit, so it is sent gzipped: `gzip -9c n8n/workflows/workflow-b-matching.json | base64 -w0` and `base64 -d | gunzip` on the instance (remote file SHA-256 `847db5fc…4e24` equals the local one).
 
 To run the funnel again on a batch that is already `matched`, set it back to `processed` and call `scripts/retrigger_batch.sh <batch_id>`; the claim step then creates a new `pipeline_runs` row.
+
+## Workflow C (T38)
+
+Migration `0006_app_config` was applied with `infra/ec2/migrate.sh` (file SHA-256 `11b00549…98bb` identical on both sides; `migrations_done` count 1, seed 0). Workflow C (`wfcnotification01`, `C · Notification`) is a sub-workflow started by Workflow B's `Notify · Run Workflow C` node. In n8n 2.44.4 a callee must be published, not just imported:
+
+```bash
+docker exec n8n n8n import:workflow --input=/tmp/wfc.json
+docker exec n8n n8n publish:workflow --id=wfcnotification01
+```
+
+Import C before B (B refers to it by id), then import and publish B and restart n8n as in T32. `n8n list:workflow --active=true` must list `wfbmatching001` and `wfcnotification01`. Without the publish the first call fails with `Workflow is not active and cannot be executed`.
+
+Settings live in `app_config` (n8n blocks `$env` in nodes). Read and change them on RDS, for example through the migrate image with `infra/ec2/migrate.sh`'s connection settings:
+
+```sql
+SELECT key, value FROM app_config ORDER BY key;
+UPDATE app_config SET value = 'false' WHERE key = 'dry_run';
+UPDATE app_config SET value = '25' WHERE key = 'max_emails_per_run';
+```
+
+Run C by hand on a `matched` batch: import a three-node driver (Manual Trigger, a Set node with `batch_id`, Execute Workflow with `waitForSubWorkflow` true) and `n8n execute --id=<driver>` with the T28 port overrides. Reading a saved execution is as described under "Stage 3 (T35)".
+
+Throwaway workflows from the T38 checks (`t38driver0001` and `t38driver0002` drivers, `t38guarddrill01`, a copy of C whose compose step addresses the original email): all unpublished; they stay in the n8n database until the owner account exists to delete them in the editor. The throwaway batch `7a380000-0000-4000-8000-000000000038`, its synthetic `example.invalid` users, matches, candidates and run row were deleted from RDS afterwards.
