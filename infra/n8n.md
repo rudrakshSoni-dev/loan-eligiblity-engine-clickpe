@@ -56,7 +56,7 @@ The probe workflow remains in the n8n database, inactive; delete it in the edito
 
 ## Batch-processed webhook (T19)
 
-`load-chunk` POSTs `{"batch_id"}` with `X-Webhook-Secret` to `http://172.31.26.164:5678/webhook/match-batch`
+`load-chunk` POSTs `{"batch_id"}` to `http://172.31.26.164:5678/webhook/match-batch` (since T45 with `Authorization: Bearer <HS256 JWT>`; T19 sent `X-Webhook-Secret`)
 (SSM `/clickpe/n8n/webhook_url`, resolved at deploy). Workflow B (`wfbmatching001`, T32) is published on
 exactly this path and starts by moving the batch `processed → matching`, replying 409 when that UPDATE
 claims nothing (replies: 202 / 400 / 409 / 500, see `docs/decisions.md` → "Workflow B entry").
@@ -95,9 +95,10 @@ Created in the editor by name; workflows reference only these names. Screenshots
 
 | Name | Type | Settings | Test |
 |---|---|---|---|
-| `rds-postgres` | Postgres | RDS endpoint from SSM `/clickpe/db/host`, database and user `clickpe`, SSL Require, Ignore SSL Issues off | "Connection tested successfully" |
+| `rds-postgres` | Postgres | RDS endpoint from SSM `/clickpe/db/host`, database `clickpe`, user `app_n8n` (since T45; was the master `clickpe`), SSL `require` (T45 replaced a pasted CA bundle in this field; n8n only checks for `disable`, so behaviour is unchanged), Ignore SSL Issues off | "Connection tested successfully"; T45: A, B, C and E ran as `app_n8n` |
 | `aws-ses-assume-role` | AWS (Assume Role) | `ap-southeast-2`, Use System Credentials on, role `clickpe-n8n-ses-role`, external ID `clickpe-n8n` (the form requires one; the trust policy does not check it) | "Connection tested successfully" |
-| `webhook-secret` | Header Auth | `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` | T32: wrong or missing secret → 403, right secret → 202 / 409 on `match-batch` |
+| `webhook-jwt` | JWT Auth | Passphrase, HS256, secret from SSM `/clickpe/n8n/webhook_secret` (created by CLI in T45, see below) | T45: no token 401, wrong key / expired / `alg none` 403, other batch 400, valid 202 / 409 on `match-batch` |
+| `webhook-secret` | Header Auth | Unused since T45; holds the rotated-out value. Delete it in the editor | T32 |
 | `groq-api` | Header Auth | `Authorization`, value `Bearer <key>` (the prefix is part of the value; T24 first saved the bare key, which Groq rejected with 401, fixed in T30) | `GET https://api.groq.com/openai/v1/models` → 200 from the instance; used by Workflow A |
 
 SES role chain: instance role `clickpe-n8n-ec2-role` (inline policy `assume-n8n-ses-role`, `sts:AssumeRole` on one ARN) assumes `clickpe-n8n-ses-role` (trust: that instance role only; policy `ses-send-test-identities`: `ses:SendEmail` and `ses:SendRawEmail` on the three verified identities). Policy documents are in `infra/iam/`. From the instance, `aws sts assume-role` returned `assumed-role/clickpe-n8n-ses-role/t24check`. No static keys exist.
@@ -261,3 +262,32 @@ Throwaway workflows from the T26 checks, all inactive and left in the n8n databa
 ## Change detection (T29)
 
 No migration and no new credential. Workflow A (27 nodes) was imported and run with the T28 commands; the new nodes use `rds-postgres`. A scratch helper read the newest execution's per-node output counts from `database.sqlite` (read-only, `flatted` decode as in "Stage 3 (T35)"). To force one lender through the LLM again: `UPDATE loan_products SET content_hash = repeat('0', 64) WHERE id = <id> AND NOT is_seed` via `scripts/rds_query.sh`, then run A; the next upsert restores the real hash.
+
+## Security review (T45)
+
+Two changes reached this instance; both were applied through SSM Run Command, with secrets read from SSM on
+the instance and never printed. The full review is in `docs/decisions.md` → "Security review (T45)".
+
+**Signed webhook token.** `/clickpe/n8n/webhook_secret` was rotated (`openssl rand -hex 32` straight into
+`put-parameter --overwrite`, version 2). The `webhook-jwt` credential was created from it with the CLI; the JSON
+exists only as a 0600 file inside the container for the length of the import:
+
+```bash
+export SIGNING_KEY="$(aws ssm get-parameter --region ap-southeast-2 --name /clickpe/n8n/webhook_secret --with-decryption --query Parameter.Value --output text)"
+python3 -c 'import json, os; print(json.dumps([{"id": "WebhookJwtHs256A", "name": "webhook-jwt", "type": "jwtAuth", "data": {"keyType": "passphrase", "secret": os.environ["SIGNING_KEY"], "algorithm": "HS256"}}]))' \
+  | docker exec -i n8n sh -c 'umask 077; cat > /tmp/cred.json'
+unset SIGNING_KEY
+docker exec n8n n8n import:credentials --input=/tmp/cred.json
+docker exec n8n rm -f /tmp/cred.json
+```
+
+Workflow B was then imported gzipped (as in T36), published, n8n restarted, and `sls deploy` shipped the
+Lambda that signs tokens. A file copied in with `docker cp` is owned by root, so remove it with
+`docker exec -u root n8n rm -f /tmp/wfb.json`.
+
+**Database role.** After migration `0009_app_roles` and `scripts/set_db_role_passwords.sh`, the `rds-postgres`
+credential was switched to `app_n8n` the same way: `n8n export:credentials --id=tNSuoJ0AbwOkWgJM --decrypted`
+into a 0600 file in the container, user and password replaced by a `node -e` one-liner that reads the password
+from an environment variable, `import:credentials`, file removed. Workflow B was re-imported in the same step,
+because its `Stage 1 · Refresh planner statistics` node now calls `analyze_match_candidates()`. PostgreSQL 16
+lets only the table owner ANALYZE, and for anyone else it skips with a warning, not an error.

@@ -46,6 +46,10 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 32. [Workflow C: compose and recipient guard](#workflow-c-compose-and-recipient-guard)
 33. [Workflow C sending: SES at the sandbox rate, send then mark](#workflow-c-sending-ses-at-the-sandbox-rate-send-then-mark)
 34. [LLM Gateway (T26)](#llm-gateway-t26)
+35. [DLQ handling (T21)](#dlq-handling-t21)
+36. [Workflow E: global error handler (T25)](#workflow-e-global-error-handler-t25)
+37. [Change detection (T29)](#change-detection-t29)
+38. [Security review (T45)](#security-review-t45)
 
 ---
 
@@ -415,15 +419,21 @@ and 2FA; SQLite on a persistent `.n8n` volume; fixed `N8N_ENCRYPTION_KEY`;
 **Choice.** `load-chunk` calls `http://<n8n-private-ip>:5678/webhook/...`, protected by:
 1. **Security group:** 5678 only from `sg-lambda`.
 2. **Webhook IP allowlist:** the VPC CIDR; anything else gets 403.
-3. **Header Auth credential:** `X-Webhook-Secret`.
+3. **Signed token (since T45):** `Authorization: Bearer <JWT>`, HS256, signed by `load-chunk` with the SSM key,
+   valid 60 s and naming the batch; the Webhook node's JWT Auth credential `webhook-jwt` verifies signature,
+   algorithm and expiry, and Workflow B requires the token's `batch_id` to equal the body's. (T19–T43 sent the
+   key itself as `X-Webhook-Secret` with Header Auth.)
 4. **Idempotent Workflow B:** refuses to run unless the batch is in `processed`, which neutralises replays.
 
 **Why (cited).** The Webhook node supports Basic, Header and JWT auth plus an IP allowlist; HMAC
 verification is not built in ([Webhook node](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/)).
 
-**Rejected for the build.** An HMAC-signed body with a timestamp (custom Raw Body + Code node) or JWT
-with `exp`. They matter for internet-facing webhooks; this one never leaves the VPC. Both are listed
-as upgrades.
+**Revised in T45.** The build first rejected a JWT with `exp` because this webhook never leaves the VPC. T43
+then found that n8n saves the Webhook node's request headers in every execution, so a static header put the
+key into n8n's database 40 times. A signed, expiring token fixes that at the source: what n8n stores is useless
+a minute later and names one batch that the claim has already consumed. The node's built-in JWT Auth does the
+verification (`jsonwebtoken.verify` with the algorithm pinned), so no custom Code node checks signatures. An
+HMAC over the raw body remains the upgrade if the body ever carries more than an id.
 
 ## Browser endpoints: Lambda Function URLs
 
@@ -447,7 +457,10 @@ requests, [pricing](https://aws.amazon.com/api-gateway/pricing/)) — the named 
 **Choice.** Database password, webhook secret and similar values are SSM Parameter Store
 `SecureString` parameters, injected into Lambda environment variables by `serverless.yml`
 (`${ssm:/…}`) at deploy time. n8n keeps its own credentials in its encrypted store
-(`N8N_ENCRYPTION_KEY`). Locally they live in a gitignored `.env`.
+(`N8N_ENCRYPTION_KEY`). Locally they live in a gitignored `.env`. Since T45 there are four: the RDS master
+password (migrations and operator queries only), `app_ingest_password` (Lambdas), `app_n8n_password` (n8n) and
+the webhook signing key. `scripts/set_db_role_passwords.sh` hands PostgreSQL a SCRAM-SHA-256 verifier computed
+on the instance, so not even a logged `ALTER ROLE` statement contains a password.
 
 **Rejected.** Secrets Manager with runtime lookups. From inside a no-NAT VPC a runtime lookup needs a
 paid interface endpoint, and Secrets Manager costs $0.40 per secret per month plus $0.05 per 10,000
@@ -871,7 +884,8 @@ first deploy, by SG reference only:
 ## Completion trigger: one POST from the winner
 
 **Choice (T19).** After its commit, the `load-chunk` invocation whose `try_complete` UPDATE returns a row
-POSTs `{"batch_id": "<uuid>"}` with an `X-Webhook-Secret` header to n8n at
+POSTs `{"batch_id": "<uuid>"}` with a credential header (T19: `X-Webhook-Secret`; since T45 a 60-second HS256
+Bearer token, see [Webhook security](#webhook-security-four-layers)) to n8n at
 `http://172.31.26.164:5678/webhook/match-batch` (SSM `/clickpe/n8n/webhook_url`). Every other caller logs
 `completion_checked` with `won: false` and posts nothing. The client is the standard library's `urllib`, so
 the package gains no dependency (`lambdas/shared/notify.py`).
@@ -922,7 +936,7 @@ mismatch):
 **Open item for T32/T45 (T32 decision: [Workflow B entry](#workflow-b-entry-claim-count-and-record-in-one-statement)).** n8n saves the Webhook node's output, which includes the request headers, so
 `X-Webhook-Secret` lands in execution data on the n8n volume (the same instance and trust boundary as the
 encryption key; pruned after 168 h). A Header Auth credential does not change this. T32 decides how
-Workflow B avoids keeping it.
+Workflow B avoids keeping it. Resolved in T45: the key is no longer sent; see [Security review](#security-review-t45).
 
 ## Product structuring: strict schema, then distrust the answer
 
@@ -1066,7 +1080,7 @@ and for matching the safe answer to both is to stop recommending a product we ca
 
 ## Workflow B entry: claim, count and record in one statement
 
-**Choice (T32).** `POST /webhook/match-batch` is a Webhook node with Header Auth (`webhook-secret`), the
+**Choice (T32).** `POST /webhook/match-batch` is a Webhook node with Header Auth (`webhook-secret`; JWT Auth `webhook-jwt` since T45), the
 VPC-CIDR IP allowlist and a Respond to Webhook node. After `batch_id` is checked against a lower-case UUID
 pattern, one SQL statement does three things: `UPDATE upload_batches SET status = 'matching' WHERE id = $1
 AND status = 'processed'`, count `users_in_batch × active_products`, and `INSERT INTO pipeline_runs`. The
@@ -1110,6 +1124,7 @@ EBS volume and instance as the n8n encryption key, executions are pruned after 1
 accepted from the VPC. Mitigation for the demo: rotate `/clickpe/n8n/webhook_secret` and the `webhook-secret`
 credential after the recording, and never open the Webhook node's output panel on camera. Turning off
 `EXECUTIONS_DATA_SAVE_ON_SUCCESS` for this workflow would remove the exposure and the evidence; listed for T45.
+T45 chose a third way that keeps the evidence: signed 60-second tokens instead of the key, then a key rotation.
 
 **Measured (2026-10-21, n8n 2.44.4 on `i-02ffa9d08e8403a4a`, Lambda `loadChunk` in the VPC).**
 
@@ -1497,3 +1512,69 @@ and the stored outcome and reason equal the cached verdict for `(cohort_key, con
 - **Measured (EC2 n8n 2.44.4, RDS, real Groq, 2026-10-22).** Execution 131: 3 lenders unchanged, `crawl_runs` 80-82 `changed = f, llm_calls = 0`, `llm_calls` ledger 90 before and after. Execution 133 (HDFC hash set to 64 zeros, ICICI set inactive): `Touch` 2, LLM path 1 (ledger row 91, 1,216 tokens), ICICI active again, HDFC hash back to the real value. Execution 135 (lookup replaced by `SELECT 1/0`): all 3 lenders structured by the LLM (ledger rows 92-94), none skipped. Execution 139 (committed workflow restored): 3 unchanged, 0 calls.
 - **Found by the live run.** The first version of `Tag` ran in the default "once for all items" mode: three lookup rows came out as one item (execution 130) and two sites vanished without an error. `runOnceForEachItem` fixed it (execution 131) and a unit test now pins the mode.
 - **Limits.** The hash covers the criteria text only. A changed prompt or model does not re-structure an unchanged page; clear the hash (`UPDATE loan_products SET content_hash = repeat('0', 64) WHERE id = …`) to force it. The `content_hash` CHECK requires 64 hex characters, which also rejects a placeholder like `'drill'`.
+
+
+## Security review (T45)
+
+Run on 2026-10-22 against the live account, the EC2 n8n host, RDS and the repo. Every row was checked with a
+command whose output is in `PROGRESS.md` → T45. Secret values were only ever compared inside a command
+substitution or on the instance, never printed.
+
+### Findings fixed in this task
+
+| # | Finding (measured) | Fix | Proof after the fix |
+|---|---|---|---|
+| F1 | n8n saves the Webhook node's request headers, so `X-Webhook-Secret` sat in plain text in 40 of 139 stored executions (28 Workflow B, 12 drill workflows); the value had also been printed in a T43 session transcript. n8n 2.44.4 has a header-redaction helper, but its Webhook node passes the raw `req.headers` into the item (`Webhook.node.js:267`), so no setting turns it off | `load-chunk` sends `Authorization: Bearer <JWT>`: HS256, `iss`, `batch_id`, `iat`, `exp = iat + 60`, built with the standard library. The Webhook node uses JWT Auth (`webhook-jwt`), and `Check · Read batch_id` requires the token's `batch_id` to equal the body's. The key was rotated (SSM version 2), the Lambda redeployed, `retrigger_batch.sh` mints its own token on the instance | Live upload → `webhook_sent status 202, attempts 1` → `matched`. Drills from inside the VPC: no token 401, old header 401, wrong key 403 `invalid signature`, expired 403 `jwt expired`, `alg none` 403, other batch 400, valid token for an unknown batch 409. Executions saved since contain the current key 0 times; their stored tokens all have `exp` in the past |
+| F2 | All three VPC Lambdas and n8n logged in as the RDS master `clickpe` (member of `rds_superuser`, CREATEROLE, CREATEDB) | Migration `0009_app_roles`: `app_ingest` (13 table grants, connection limit 10) and `app_n8n` (25 grants, limit 20); no DELETE, TRUNCATE, REFERENCES, TRIGGER or DDL for either. Workflow B's ANALYZE goes through `analyze_match_candidates()`, `SECURITY DEFINER`, `search_path` pinned, EXECUTE granted to `app_n8n` only (PostgreSQL 16 lets only the owner ANALYZE and silently skips anyone else) | 39 tests on PostgreSQL 16: exact privilege matrix, refusals (DELETE, TRUNCATE, CREATE TABLE, CREATE ROLE, cross-role reads), every SQL statement of the 5 exported workflows planned as `app_n8n` with `EXPLAIN (GENERIC_PLAN)` (permission checks without execution, so failure branches are covered), the full Lambda path as `app_ingest`; 3 mutation probes each failed a test. Live: upload as `app_ingest`, Workflows A, B, C and E as `app_n8n`, `match_candidates.last_analyze` advanced during B's run |
+| F5 | No account-level S3 Block Public Access (both buckets had it individually) | `s3control put-public-access-block`, all four flags | `get-public-access-block` shows all four `true` |
+| — | `rds-postgres` credential's SSL field held a pasted 174,561-character CA bundle instead of a mode | Set to `require`. n8n's Postgres transport only tests for `disable`, so TLS and verification through `NODE_EXTRA_CA_CERTS` are unchanged | Workflows A, B, C and E ran after the change |
+
+### Checklist
+
+| Item | Result | Evidence |
+|---|---|---|
+| IAM least privilege per function | Pass | Each Lambda role has inline statements only: logs on its own log group ARN, S3 on `uploads/*`, SQS on named queues, the three ENI actions on `*` that VPC Lambdas need; `split-csv` has no EC2 actions. Trust: `lambda.amazonaws.com`. SES role trusts only the EC2 role and allows two actions on three identity ARNs |
+| S3 | Pass (F5 fixed) | Both buckets: BPA on, policy status not public, deny when `aws:SecureTransport` is false, SSE-S3, `BucketOwnerEnforced`; uploads expire after 7 days; CORS allows POST from the UI origin only |
+| RDS private and TLS | Pass | `PubliclyAccessible false`, storage and snapshots encrypted, deletion protection, SG ingress only from the Lambda and n8n SGs; `ssl_min_protocol_version TLSv1.2`, `password_encryption scram-sha-256`; every live client session TLSv1.3 / `TLS_AES_256_GCM_SHA384` in `pg_stat_ssl` |
+| Database least privilege | Pass (F2 fixed) | See above |
+| Every webhook authenticated and allowlisted | Pass (F1 fixed) | One Webhook node across the five workflows (B): JWT Auth + `172.31.0.0/16`. The other triggers are schedule, manual, sub-workflow and error triggers, which have no HTTP endpoint |
+| n8n editor has no inbound internet path | Pass | n8n SG's only inbound rule is 5678 from the Lambda SG; no security group in the account allows `0.0.0.0/0` inbound; IMDSv2 required; EBS encrypted; one owner account with `mfaEnabled = 1`; container user `node`, not privileged; `dnf check-update --security` lists 0 |
+| pg8000 verifies the RDS certificate | Pass | `tls_context` builds `ssl.create_default_context(cafile=<bundled RDS CA>)` (CERT_REQUIRED, hostname check; unit test); `DbConfig.read` can change the CA path but never disable it; Lambda sessions show TLSv1.3 live |
+| Function URLs public, with mitigations | Pass, documented | `AuthType NONE`; CORS origin `http://localhost:8000`, POST / GET only; `InvokeFunction` requires `lambda:InvokedViaFunctionUrl`. Mitigations in [Browser endpoints](#browser-endpoints-lambda-function-urls) |
+| No secrets in repo or history | Pass | 63 commits: the only sensitive-looking files ever tracked are two `.env.example` files and the public RDS CA bundle; `AKIA…`, `gsk_…` and private-key patterns 0 hits; the real DB master password, old and new webhook keys and Groq key 0 hits in `git log --all -p` and in tracked and untracked files |
+| SES cannot reach real users | Pass | Sandbox (`ProductionAccessEnabled false`, 200 per day, 1 per second); SES role limited to 3 verified identities; recipient guard drill from T38; the T45 Workflow E drill alerted a test alias only |
+| Code-level injection paths | Pass | SQL is parameterised (the only f-strings join constant column names); the UI writes with `textContent`, no `innerHTML`; email HTML escapes every value and allows only `http(s)` links; reject CSV neutralises formula cells (T41); LLM output is schema-checked and range-coerced before storage, so a crawled page cannot write outside the product columns |
+| Lambda dependencies | Pass | `pip-audit -r infra/requirements-lambda.txt` → "No known vulnerabilities found" (5 packages) |
+
+### Residual risks (open, with the fix)
+
+- **The n8n host can read every SSM SecureString (Medium).** `AmazonSSMManagedInstanceCore` grants
+  `ssm:GetParameter(s)` on `*` (`simulate-principal-policy` → `allowed` for `/clickpe/db/password`), and IMDS hop
+  limit 2, which n8n's system credentials need, lets the container use the role. An n8n editor user could
+  therefore reach the master password. It stays inside the trust boundary (SSM-only editor, owner with 2FA),
+  and the operator scripts (`rds_query.sh`, `migrate.sh`, `set_db_role_passwords.sh`, `retrigger_batch.sh`)
+  depend on it. Fix: replace the managed policy with a copy without `GetParameter*`, and run operator commands
+  under a separate role or Secrets Manager with resource policies.
+- **Admin IAM user without MFA (Medium, user action).** `clickpe-admin` has AdministratorAccess, an active
+  access key (2026-10-20) and no MFA device. Fix: enable MFA and move CLI access to `aws login` or IAM Identity
+  Center short-lived credentials.
+- **Rotated-out webhook key still at rest (Low).** 40 old executions and the unused `webhook-secret`
+  credential hold the old value, and SSM keeps version 1 in parameter history. It no longer authenticates
+  anything. Executions are pruned at 168 h (the oldest is from 2026-10-20 22:41 UTC); delete the credential in
+  the editor.
+- **No CloudTrail trail; GuardDuty blocked (Low).** Only the 90-day event history exists, and
+  `guardduty:ListDetectors` is denied by the organisation's SCP. Fix: one multi-region trail to an encrypted
+  bucket.
+- **RDS minor-version upgrades off (Low).** `AutoMinorVersionUpgrade false`; backups kept 1 day. Fix:
+  `modify-db-instance --auto-minor-version-upgrade` (applies in the maintenance window).
+- **Secrets also in Lambda environment and the CloudFormation template (Low, documented).** See
+  [Secrets](#secrets-ssm-securestring-resolved-at-deploy). Fix: Secrets Manager read at runtime.
+- **`N8N_SECURE_COOKIE=false` (Low).** The editor is served on `http://localhost` through the SSM tunnel, which
+  is itself encrypted; the n8n section above says the default could stay on, and compose turns it off. Kept as
+  is; recorded so the two places agree.
+- **sshd listens on the host (Info).** Unreachable (no inbound rule) and unused (SSM only); can be disabled.
+
+### Not covered
+
+No penetration test, no fuzzing of the Function URLs, no dependency scan of the n8n image, and no review of
+AWS-managed services beyond their configuration.

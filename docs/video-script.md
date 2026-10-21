@@ -29,7 +29,7 @@ Long steps are done now, so nothing waits on camera.
    6. Gmail, search box already filled with `from:` the sender address, results visible.
    7. `data/users.csv` in the file picker's last-used folder.
 3. **n8n executions to have open** (so you can click, not search): Workflow B execution 94 and Workflow C execution 95 (both from the T42 run). If they were pruned (168 h), open the newest B and C executions instead and read the numbers off the screen, not from this script.
-4. **Phone on silent, notifications off, secrets hidden.** Open the `webhook-secret` and `groq-api` credentials only as screenshots, never live. Do not open a Workflow B execution's trigger node on camera: it stores the `X-Webhook-Secret` header in plain text (known issue, T43 and T45). Rotate the secret after the video.
+4. **Phone on silent, notifications off, secrets hidden.** Open the `webhook-jwt`, `groq-api` and `rds-postgres` credentials only as screenshots, never live. A Workflow B execution's trigger node may be shown: since T45 it holds only an expired, single-batch Bearer token, not the key. Executions older than 2026-10-22 04:19 IST still hold the old `X-Webhook-Secret` value, which was rotated out and no longer authenticates anything; do not open those on camera anyway.
 5. **Rehearse the upload once** with `scripts/smoke_test.sh data/users.csv` so the S3 path is warm. It creates one extra no-op batch and no emails.
 
 Why the live upload will show zeros: re-uploading the identical file is a no-op by design (0 inserted, 0 updated, so 0 users in the new batch, 0 pairs, 0 emails). That is the idempotency result and the script says so out loud. The real funnel is shown from the first-run batch in tab 5. If you want a true first run instead, repeat the T42 reset (backup, delete the data tables, fresh Workflow A run, clear `cohort_verdicts`) before recording; that is destructive and needs a fresh go.
@@ -184,6 +184,6 @@ Every number in the narration comes from a recorded run. If any of them changes,
 
 - No cold-cache figure for 100,000 users (only the warm-cache run in `scripts/benchmark.md` exists), and nothing beyond 100,000 users.
 - No dollar costs (T46 not written).
-- No "security review done" (T45 not run).
+- The security review (T45) is done, but its residual risks are open: do not say the n8n host cannot read SSM SecureStrings, that the admin IAM user has MFA, or that CloudTrail is on.
 - Change detection (T29) is built; do not say it re-runs when the prompt changes. The LLM Gateway is built (T26); its 429 wait was seen live, but the 20b fallback only in a throwaway drill copy, so do not say a production run fell back. The error workflow is built (T25); do not say it catches errors a workflow handles itself. The DLQ alarm is built (T21) but has no notification target.
-- No UI features beyond the deployed page: the grouped reject table and CSV download (T41) are built locally, not deployed.
+- The grouped reject table and CSV download (T41) were deployed with the T45 deploy but not checked live yet; show them only after T41's live check.

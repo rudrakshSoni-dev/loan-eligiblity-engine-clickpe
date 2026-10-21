@@ -65,7 +65,7 @@ flowchart TB
     load -- "ranged GET" --> s3gw
     s3gw --> s3
     load -- "COPY to staging, upsert users, chunk ledger" --> rds
-    load -- "last chunk: HTTP POST :5678<br/>X-Webhook-Secret" --> wfB
+    load -- "last chunk: HTTP POST :5678<br/>Bearer JWT, HS256, 60 s" --> wfB
     user -- "poll GET batch-status" --> status
     status -- "read-only counts, funnel" --> rds
 
@@ -98,7 +98,7 @@ flowchart TB
 | `get-upload-url`, `batch-status` Function URLs | Yes, `AuthType NONE`, CORS pinned to the UI origin | Documented as public; production upgrade is API Gateway with auth and throttling |
 | `split-csv`, `load-chunk` | No URL; invoked by S3 and SQS only | Resource policy for S3, event source mapping for SQS |
 | RDS | No (private address only, `PubliclyAccessible false`) | SG allows 5432 from the Lambda SG and n8n SG only; `rds.force_ssl` on, `verify-full` from clients |
-| n8n webhook `:5678` | No | SG allows it from the Lambda SG only; header-auth secret; Workflow B refuses unless the batch is `processed` |
+| n8n webhook `:5678` | No | SG allows it from the Lambda SG only; VPC-CIDR allowlist; HS256 JWT signed per call (60 s, names the batch); Workflow B refuses unless the batch is `processed` |
 | n8n editor | No (zero inbound rules) | SSM Session Manager port forward to `localhost:5678` |
 
 ## Why there is no NAT Gateway

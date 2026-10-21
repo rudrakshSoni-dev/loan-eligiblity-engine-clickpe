@@ -80,7 +80,7 @@ flowchart TB
     load -- "ranged GET" --> s3gw
     s3gw --> s3
     load -- "COPY to staging, upsert users, chunk ledger" --> rds
-    load -- "last chunk: HTTP POST :5678<br/>X-Webhook-Secret" --> wfB
+    load -- "last chunk: HTTP POST :5678<br/>Bearer JWT, HS256, 60 s" --> wfB
     user -- "poll GET batch-status" --> status
     status -- "read-only counts, funnel" --> rds
 
@@ -145,7 +145,11 @@ aws ssm put-parameter --name /clickpe/db/host --type String --value placeholder 
 aws ssm put-parameter --name /clickpe/db/password --type SecureString --value "$(openssl rand -hex 24)" --no-overwrite
 aws ssm put-parameter --name /clickpe/n8n/webhook_url --type String --value http://placeholder:5678/webhook/match-batch --overwrite
 aws ssm put-parameter --name /clickpe/n8n/webhook_secret --type SecureString --value "$(openssl rand -hex 32)" --no-overwrite
+aws ssm put-parameter --name /clickpe/db/app_ingest_password --type SecureString --value "$(openssl rand -hex 32)" --no-overwrite
+aws ssm put-parameter --name /clickpe/db/app_n8n_password --type SecureString --value "$(openssl rand -hex 32)" --no-overwrite
 ```
+
+`/clickpe/db/password` belongs to the RDS master user `clickpe`, which only runs migrations and operator queries. The Lambdas log in as `app_ingest` and n8n as `app_n8n` (created by migration `0009_app_roles`). `webhook_secret` is the HS256 key that signs the Lambda's 60-second webhook token; it is never sent.
 
 1. **RDS.** Run the commands in [infra/rds.md](infra/rds.md). It creates a private `db.t4g.micro` PostgreSQL 16 instance and writes its endpoint to `/clickpe/db/host`.
 2. **EC2 for n8n.** Launch the `t4g.small` instance with the commands under "Launch commands" in [infra/ec2.md](infra/ec2.md) (rebuilt from the live instance, not re-run), then run `infra/ec2/setup.sh` on it through SSM Run Command (the exact command is in that file). The instance has no inbound rules.
@@ -164,7 +168,13 @@ aws ssm put-parameter --name /clickpe/n8n/webhook_secret --type SecureString --v
     ```
 
 5. **Open the database and n8n ports by security-group reference.** The three `authorize-security-group-ingress` commands (5432 from n8n and from the Lambda group, 5678 from the Lambda group) are at the end of "Launch commands" in [infra/ec2.md](infra/ec2.md).
-6. **Migrate the schema from inside the VPC** with `infra/ec2/migrate.sh`, sent through SSM as described in [infra/ec2.md](infra/ec2.md). Running it twice applies 0 migrations the second time. The 5 seed products are flagged `is_seed` and labelled "Seed ·" in their names.
+6. **Migrate the schema from inside the VPC** with `infra/ec2/migrate.sh`, sent through SSM as described in [infra/ec2.md](infra/ec2.md). Running it twice applies 0 migrations the second time. The 5 seed products are flagged `is_seed` and labelled "Seed ·" in their names. Then give the two application roles their passwords from SSM:
+
+    ```bash
+    scripts/set_db_role_passwords.sh
+    ```
+
+   It sends PostgreSQL a SCRAM-SHA-256 verifier computed on the instance, never the password, and ends with `PASS` once both roles log in over verified TLS.
 7. **Smoke test:**
 
     ```bash
@@ -188,9 +198,9 @@ Browse to `http://localhost:5678`, create the owner account and enable 2FA under
 
 | Credential | Type | Notes |
 |---|---|---|
-| `rds-postgres` | Postgres | RDS host from SSM, database and user `clickpe`, SSL Require, Ignore SSL Issues off. The container trusts the RDS CA through `NODE_EXTRA_CA_CERTS` |
+| `rds-postgres` | Postgres | RDS host from SSM, database `clickpe`, user `app_n8n` with the password from `/clickpe/db/app_n8n_password`, SSL `require`, Ignore SSL Issues off. The container trusts the RDS CA through `NODE_EXTRA_CA_CERTS` |
 | `aws-ses-assume-role` | AWS (Assume Role) | Use System Credentials on; role `clickpe-n8n-ses-role`. The EC2 instance role assumes an SES-only role, so there are no static AWS keys. Policies are in [infra/iam/](infra/iam) |
-| `webhook-secret` | Header Auth | Header `X-Webhook-Secret`, value from SSM `/clickpe/n8n/webhook_secret` |
+| `webhook-jwt` | JWT Auth | Key type Passphrase, algorithm HS256, secret from SSM `/clickpe/n8n/webhook_secret`. [infra/n8n.md](infra/n8n.md) ("Security review (T45)") creates it from SSM with the CLI, so the value is never typed or shown |
 | `groq-api` | Header Auth | Header `Authorization`, value `Bearer <key>` |
 
 ## Import the workflows
@@ -284,14 +294,15 @@ Per-pair asking would be 2,221 calls for the borderline pairs alone. Per-stage t
 ## Security
 
 - **Upload.** Presigned POST pinned to one key, content type and size range, valid 5 minutes. The bucket blocks all public access, enforces TLS and expires uploads after 7 days.
-- **Database.** RDS is not publicly accessible; public DNS resolves only to a private address, and a laptop gets `No route to host`. `rds.force_ssl` is on, `sslmode=disable` is rejected, and clients verify the RDS CA (`verify-full`). Port 5432 is open to the Lambda and n8n security groups by reference only.
-- **n8n.** The security group has zero inbound rules from the internet. The editor is reachable only through an SSM Session Manager port forward, with an owner account. 2FA was turned on by the user in the browser; no screenshot of it was captured. Port 5678 accepts the webhook from the Lambda security group alone.
-- **Webhook, four layers.** Security group, n8n IP allowlist (VPC CIDR), Header Auth secret, and a claim that refuses unless the batch is `processed` (a replay gets 409).
+- **Database.** RDS is not publicly accessible; public DNS resolves only to a private address, and a laptop gets `No route to host`. `rds.force_ssl` is on, `sslmode=disable` is rejected, and clients verify the RDS CA (`verify-full`); every live client session reads TLSv1.3 in `pg_stat_ssl`. Port 5432 is open to the Lambda and n8n security groups by reference only.
+- **Least-privilege database roles (T45).** The Lambdas log in as `app_ingest` and n8n as `app_n8n`, each with only the table privileges its SQL needs (no DELETE, TRUNCATE or DDL, connection limits 10 and 20). Workflow B refreshes planner statistics through a `SECURITY DEFINER` function, because PostgreSQL 16 lets only the table owner ANALYZE. A test plans every SQL statement in the exported workflows as `app_n8n`, so a missing grant fails the build.
+- **n8n.** The security group has zero inbound rules from the internet. The editor is reachable only through an SSM Session Manager port forward, with one owner account that has 2FA on (`mfaEnabled = 1` in n8n's user table, checked in T45). Port 5678 accepts the webhook from the Lambda security group alone. The container runs as the non-root `node` user, unprivileged.
+- **Webhook, four layers.** Security group, n8n IP allowlist (VPC CIDR), a JWT signed by the Lambda (HS256, valid 60 s, naming the batch), and a claim that refuses unless the batch is `processed` (a replay gets 409). Workflow B also refuses a token whose `batch_id` differs from the body's. The key itself never travels, so the request headers n8n saves in each execution hold only an expired, single-batch token.
 - **IAM.** One role per Lambda, no wildcard actions. The only `*` resource is the three network-interface actions every VPC Lambda requires. The EC2 instance role assumes an SES-only role limited to three verified identities, so there are no static AWS keys.
 - **Email safety.** Every recipient is redirected to the verified test aliases, a guard node re-reads the allowed list and throws on any other recipient, any cc, bcc or reply-to, or more messages than the cap. The guard blocked a deliberately wrong address in a drill, and SES would refuse unverified identities anyway.
 - **Secrets.** SSM SecureStrings, resolved at deploy. They are also present as literals in the deployed CloudFormation template, which is documented in `docs/decisions.md` → "Secrets".
 - **Public by design.** The `get-upload-url` and `batch-status` Function URLs are `AuthType NONE`, because the browser has no AWS credentials. CORS is pinned to the UI origin, `lambda:InvokeFunction` requires `InvokedViaFunctionUrl`, and the upload is bounded by the POST policy. API Gateway with auth and throttling is the production upgrade.
-- **Known issue.** n8n stores the incoming `X-Webhook-Secret` header in saved Workflow B execution data (found in the T43 drills). Executions are pruned after 168 hours; rotate the secret after the demo. The formal security review (T45) has not been run.
+- **Security review (T45).** Every item was checked against the live account, with the command and its output recorded in `docs/decisions.md` → "Security review (T45)". It fixed three findings: the webhook secret stored in n8n executions (replaced by signed tokens, key rotated), the Lambdas and n8n logging in as the RDS master user (now separate roles), and the missing account-level S3 Block Public Access (now on). Open residual risks are listed there with their fix. The main ones: the n8n host can read the SSM SecureStrings through `AmazonSSMManagedInstanceCore`; the admin IAM user has an access key and no MFA; there is no CloudTrail trail beyond the 90-day event history.
 
 ## Cost
 
@@ -312,7 +323,7 @@ docker run -d --rm --name pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
 TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_PASSWORD=test make check
 ```
 
-Result of the last run: `All checks passed!`, `96 files already formatted`, `Success: no issues found in 79 source files`, **`618 passed`** and **100.00% coverage** of `lambdas/shared`. Without a database, `425 passed, 193 skipped` and 99.82%.
+Result of the last run (T45): `All checks passed!`, `99 files already formatted`, `Success: no issues found in 82 source files`, **`691 passed`** and **100.00% coverage** of `lambdas/shared`. Without a database, `448 passed, 243 skipped` and 99.82%.
 
 The SQL and Code nodes inside the exported workflows are tested where they live: the exported SQL runs on PostgreSQL 16 and the exported Code nodes run under Node.js inside pytest. Mutation probes (weakening a guard on purpose) were run for the critical paths, and each one failed at least one test.
 
@@ -323,9 +334,9 @@ Stated plainly, because these are known:
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
 - **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
 - **Built, not just designed (T26):** the LLM Gateway sub-workflow is the only caller of Groq. Drilled live: a real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out for 15 s and the retry answered; with waits disabled in a throwaway copy, a 429 switched to `gpt-oss-20b`, which answered; a reply that broke the schema was rejected. Workflow B no longer spaces Stage 3 requests 20 s apart; it waits only when Groq returns 429. A verdict produced by the 20b fallback is cached like any other.
-- **Designed, not implemented:** the cost table (T46) and the security review (T45).
+- **Designed, not implemented:** the cost table (T46).
 - **Change detection is keyed on the criteria text only (T29).** If the prompt or model changes, an unchanged page is not re-structured until its `content_hash` is cleared or the text changes.
-- **UI polish (T41) is built and tested locally but not deployed.** The deployed `batch-status` does not yet return the grouped reject report or the CSV download.
+- **UI polish (T41) is deployed but not yet checked live.** The T45 deploy on 2026-10-22 shipped the T41 code with the rest of the stack; the live check of the grouped reject report and the CSV download is still T41's open step.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
 - **Sandbox email.** SES is in the sandbox and the test emails landed in Spam in the Gmail inbox (screenshot in `docs/screenshots/`); the likely cause is missing DKIM on the sender and the fix is documented.
@@ -334,7 +345,7 @@ Stated plainly, because these are known:
 
 ## Future work
 
-- Finish the designed items above, starting with the security review.
+- Finish the designed items above, starting with the cost table, and close the residual risks of the security review.
 - API Gateway with authentication and throttling in front of the Function URLs.
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.
