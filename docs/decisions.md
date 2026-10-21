@@ -1578,3 +1578,97 @@ substitution or on the instance, never printed.
 
 No penetration test, no fuzzing of the Function URLs, no dependency scan of the n8n image, and no review of
 AWS-managed services beyond their configuration.
+
+## Cost (T46)
+
+Prices are `ap-southeast-2` on-demand list prices read on 2026-10-22 from the AWS Price List API
+(`aws pricing get-products`, endpoint `us-east-1`, service codes `AmazonEC2`, `AmazonRDS`, `AWSLambda`,
+`AWSQueueService`, `AmazonS3`, `AmazonSES`, `AmazonCloudWatch`, `AmazonVPC`). Groq prices are from
+<https://console.groq.com/docs/models>. A month is 730 h. Nothing here is an invoice: Cost Explorer
+(`aws ce get-cost-and-usage`, 2026-10-01 to 2026-10-22) returned 0 for every service, so the account's spend is
+covered by the Free Plan or credits (or not yet posted) and the figures below are list prices.
+
+### Unit prices used
+
+| Item | List price | Used for |
+|---|---|---|
+| EC2 `t4g.small` | $0.0212 / h | n8n host |
+| EBS gp3 | $0.096 / GB-month | 20 GB n8n volume |
+| Public IPv4, in use | $0.005 / h | n8n host outbound address |
+| RDS `db.t4g.micro` PostgreSQL, Single-AZ | $0.025 / h | database |
+| RDS gp3 storage, Single-AZ | $0.138 / GB-month | 20 GB |
+| RDS backup storage beyond the free allocation | $0.095 / GB-month | not reached: 1-day retention, 177 MB database |
+| Lambda arm64 duration (first tier) | $0.0000133334 / GB-s | `split-csv`, `load-chunk` |
+| Lambda requests | $0.20 / million | all four functions |
+| SQS standard requests (first tier) | $0.40 / million | ingest queue |
+| S3 Standard | $0.025 / GB-month (first 50 TB) | 7-day uploads |
+| CloudWatch standard alarm | $0.10 / alarm-month | 2 alarms |
+| CloudWatch Logs ingestion / storage | $0.67 / GB, $0.033 / GB-month | Lambda logs |
+| SES recipients | $0.0001 each ($0.10 per 1,000) | Workflow C |
+| Groq `openai/gpt-oss-120b` | $0.15 in, $0.60 out per 1M tokens | Stage 3 |
+| Groq `openai/gpt-oss-20b` | $0.075 in, $0.30 out per 1M tokens | fallback |
+| NAT Gateway | $0.059 / h | **not used**, priced for comparison |
+| S3 Gateway endpoint | free | used |
+
+### Demo configuration, running all month
+
+| Line | Arithmetic | $ / month |
+|---|---|---|
+| EC2 `t4g.small` | 730 × 0.0212 | 15.48 |
+| EBS 20 GB gp3 | 20 × 0.096 | 1.92 |
+| Public IPv4 | 730 × 0.005 | 3.65 |
+| RDS `db.t4g.micro` | 730 × 0.025 | 18.25 |
+| RDS 20 GB gp3 | 20 × 0.138 | 2.76 |
+| CloudWatch alarms (2) | 2 × 0.10 | 0.20 |
+| Lambda, SQS, S3, SES sandbox, SSM parameters | under $0.01 at demo volume (see below) | ~0.00 |
+| **Total** | | **42.26** |
+
+RDS and the n8n host are 91% of it. They are the fixed cost; everything usage-based is cents.
+
+### 1M users a month (assumption: ten 100,000-row files)
+
+Measured inputs come from `scripts/benchmark.md` (one 100,000-row batch: 20 chunks, `split-csv` 1,764 ms,
+`load-chunk` mean 340 ms, both at 512 MB, database 177 MB for 110,006 users).
+
+| Line | Arithmetic | $ / month |
+|---|---|---|
+| Fixed stack (as above) | | 42.26 |
+| Lambda duration | 10 × (1.764 s + 20 × 0.340 s) × 0.5 GB = 42.8 GB-s × 0.0000133334 | 0.0006 |
+| Lambda requests | about 210 ingest invocations × 0.0000002 | 0.00004 |
+| SQS | 200 messages × 3 requests × 0.0000004 | 0.0002 |
+| S3 | 10 × 10 MB, 7-day expiry, at most 0.1 GB × 0.025 | 0.0025 |
+| RDS storage | 177 MB / 110,006 users = 1.57 KB per user, so 1M users is about 1.6 GB: fits the 20 GB volume | 0 extra |
+| Groq, Stage 3, cohort pipeline | the cohort count depends on the cohort keys, not on the user count; the cold 10,000-user reference was 2 calls and 3,655 tokens, at most 3,655 × $0.60 / 1M | under 0.01 |
+| SES, if every matched user were mailed | 6,017 matched per 10,000 users in the sample, so 601,700 recipients × 0.0001 | 60.17 |
+| **Total with email** | | **about 102.4** |
+| **Total without email** | | **about 42.3** |
+
+The email line is hypothetical: this repository only sends to three test inboxes, in sandbox, five per run,
+and never to a sample address.
+
+### What the design avoids, priced
+
+| Alternative | $ / month |
+|---|---|
+| One NAT Gateway, 730 h, before any data | 43.07 (more than the whole demo stack) |
+| Groq, an LLM call for **every** pair, 3,000,000 pairs at the measured 804 + 124.1 tokens per pair | 585.18 on `gpt-oss-120b` (292.59 on `gpt-oss-20b`), and 30 days of free-tier quota per 30,000 pairs |
+| Groq, an LLM call for every borderline pair only (7.46% of pairs, 223,820) | 43.66 on `gpt-oss-120b` |
+| This pipeline | under 0.01 |
+
+The per-pair token counts are the 10-call measurement in `scripts/benchmark.md`. The 7.46% is 22,382 borderline
+of 300,000 pairs in the 100,000-user benchmark. Both scale linearly in this arithmetic; none of the Groq rows was run
+at 1M users.
+
+### What is not measured or not claimed
+
+- Nothing above 100,000 users was run. At 1M users the matching stages would take roughly ten times the 26.5 s
+  of the benchmark if they scale linearly, and whether a `db.t4g.micro` (1 GB RAM) holds up at that size
+  is untested. The fixed-cost line assumes it does; a bigger instance would raise it, and no price for one is quoted.
+- Not priced: Groq paid-tier rate limits (only the free-tier limits in T04 were measured), data transfer out
+  (about $0.114 per GB beyond the global free allowance; traffic here is a few MB), CloudWatch Logs ingestion
+  (a few MB), domain and DKIM for production email, and CloudTrail.
+- Free coverage: CloudWatch's free tier covers 10 alarms, and Lambda, SQS and S3 have monthly free allowances
+  that this volume does not exceed; none of that is subtracted above. What the Free Plan credits cover on this
+  account was not read from the billing console.
+- A production hardening step costs more: Multi-AZ doubles RDS storage to $0.276 per GB-month; the instance
+  multiplier was not looked up.

@@ -306,7 +306,22 @@ Per-pair asking would be 2,221 calls for the borderline pairs alone. Per-stage t
 
 ## Cost
 
-No NAT Gateway, no Multi-AZ, no provisioned IOPS, no interface VPC endpoints, and nothing larger than `t4g.small`. The resources are: one `db.t4g.micro` with 20 GB gp3, one `t4g.small` with a 20 GB volume, four Lambdas on arm64, one S3 bucket with a 7-day lifecycle, three SQS queues, and SES in the sandbox. Groq is used on its free tier. A priced cost table for the demo and for 1M users a month (T46) has not been written, so no dollar figures are claimed here.
+No NAT Gateway, no Multi-AZ, no provisioned IOPS, no interface VPC endpoints, and nothing larger than `t4g.small`. Prices are `ap-southeast-2` list prices read from the AWS Price List API on 2026-10-22; the arithmetic, every unit price and the sources are in `docs/decisions.md` → "Cost (T46)". Cost Explorer showed $0 for October, so these are list prices, not invoices.
+
+| Line | $ / month |
+|---|---|
+| EC2 `t4g.small` (n8n), 730 h | 15.48 |
+| EBS 20 GB gp3 | 1.92 |
+| Public IPv4 on the n8n host | 3.65 |
+| RDS `db.t4g.micro`, Single-AZ | 18.25 |
+| RDS 20 GB gp3 | 2.76 |
+| 2 CloudWatch alarms | 0.20 |
+| Lambda, SQS, S3, SES sandbox | under 0.01 |
+| **Demo stack, running all month** | **42.26** |
+| Same stack at 1M users a month (ten 100,000-row files), without email | about 42.3 |
+| Plus SES if every matched user were mailed (601,700 recipients at $0.10 per 1,000) | 60.17 |
+
+The fixed cost is the database and the n8n host (91%); usage-based items are cents. The design choices that keep it there, priced: one NAT Gateway would add $43.07 a month before any data; asking Groq about every pair at 1M users would cost $585.18 on `gpt-oss-120b` (measured 804 + 124.1 tokens per pair), and about $43.66 even for borderline pairs only, against under $0.01 for the cohort pipeline. Not run: anything above 100,000 users, so whether a `db.t4g.micro` copes at 1M is untested, and the 1M-user totals assume it does.
 
 ## Testing
 
@@ -334,17 +349,16 @@ Stated plainly, because these are known:
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
 - **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
 - **Built, not just designed (T26):** the LLM Gateway sub-workflow is the only caller of Groq. Drilled live: a real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out for 15 s and the retry answered; with waits disabled in a throwaway copy, a 429 switched to `gpt-oss-20b`, which answered; a reply that broke the schema was rejected. Workflow B no longer spaces Stage 3 requests 20 s apart; it waits only when Groq returns 429. A verdict produced by the 20b fallback is cached like any other.
-- **Designed, not implemented:** the cost table (T46).
 - **Change detection is keyed on the criteria text only (T29).** If the prompt or model changes, an unchanged page is not re-structured until its `content_hash` is cleared or the text changes.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
 - **Sandbox email.** SES is in the sandbox and the test emails landed in Spam in the Gmail inbox (screenshot in `docs/screenshots/`); the likely cause is missing DKIM on the sender and the fix is documented.
 - **Single region.** The account is SCP-locked to `ap-southeast-2`. The production target would be `ap-south-1` for latency and RBI data localisation.
-- **Scale measured only to 10,000 users.** The design is chunked and bounded, but nothing larger has been run.
+- **Scale measured only to 100,000 users** (`scripts/benchmark.md`). The design is chunked and bounded, but nothing larger has been run, and the 1M-user cost figures are arithmetic on those measurements.
 
 ## Future work
 
-- Finish the designed items above, starting with the cost table, and close the residual risks of the security review.
+- Close the residual risks of the security review.
 - API Gateway with authentication and throttling in front of the Function URLs.
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.

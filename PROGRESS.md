@@ -47,7 +47,7 @@
 | T43 | P0 | Idempotency + failure drills | DONE | 2026-10-22 | All 4 drills live: (a) identical re-upload with `dry_run` off → 0 inserted / 0 updated, 0 new matches, 0 emails; (b) malformed CSV → 1 loaded, 10 rejects with line numbers; (c) n8n stopped → `webhook_failed`, batch stays `processed`, retrigger → 202 → 9 matches; (d) one lender unreachable → other 2 upserted, HDFC stays active. Found: n8n stores `X-Webhook-Secret` in execution data (see T45) |
 | T44 | P1 | Test coverage pass | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T45 | P1 | Security review | DONE | 2026-10-22 | 12-item live checklist; fixed: webhook key in n8n executions (signed 60 s HS256 token, key rotated, 7 live drills), master DB user everywhere (`app_ingest` / `app_n8n`, 39 role tests, A/B/C/E + upload live), account S3 BPA; 6 residual risks with fixes; 691 passed |
-| T46 | P1 | Cost table | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T46 | P1 | Cost table | DONE | 2026-10-22 | Demo stack $42.26/month at list prices (RDS + n8n host = 91%); 1M users/month ≈ $42.3 without email, +$60.17 if all matched users were mailed; NAT ($43.07) and per-pair LLM ($585.18) priced as avoided costs |
 | T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
 | T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
 | T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items (T21/T25/T26/T29/T37/T41 deploy/T45/T46) stated plainly; EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
@@ -1245,3 +1245,19 @@ Task T29 complete. Run the commit commands above, then start a new session (`/cl
   - Q: How do you know `app_n8n` has every privilege the workflows need, including failure branches that rarely run? A: `EXPLAIN (GENERIC_PLAN)` on PostgreSQL 16 plans a statement with `$n` parameters and runs the permission checks without executing it. The test does that for all 34 Postgres-node statements as `app_n8n`. A probe that removed one grant failed 3 of them, and the live run of A, B, C and E confirmed it.
   - Q: Why a `SECURITY DEFINER` function instead of making `app_n8n` own `match_candidates`? A: PostgreSQL 16 lets only the owner ANALYZE, and anyone else is skipped with a warning, which would silently bring back the 16 s Stage 3 query from T35. Ownership would also let n8n DROP or ALTER the table. The function does exactly one thing with a pinned `search_path`, and only `app_n8n` may execute it.
 
+### T46 — Cost table (2026-10-22)
+- Files: docs/decisions.md ("Cost (T46)"), README.md (Cost, Limitations, Future work), docs/video-script.md (segment 8, number sources, not-to-claim), docs/rubric-evidence.md
+- Evidence:
+  - Prices: `aws pricing get-products --service-code <AmazonEC2|AmazonRDS|AWSLambda|AWSQueueService|AmazonS3|AmazonSES|AmazonCloudWatch|AmazonVPC> --filters regionCode=ap-southeast-2 …` → t4g.small $0.0212/h, db.t4g.micro $0.025/h, RDS gp3 $0.138/GB-mo, EBS gp3 $0.096/GB-mo, IPv4 $0.005/h, Lambda arm64 $0.0000133334/GB-s, SQS $0.40/M, SES $0.0001/recipient, NAT $0.059/h
+  - Groq: console.groq.com/docs/models → gpt-oss-120b $0.15/$0.60, gpt-oss-20b $0.075/$0.30 per 1M tokens
+  - `aws ce get-cost-and-usage` 2026-10-01..22 → $0 for every service (credits/Free Plan or not yet posted), so all figures are list prices
+  - Live resources checked: RDS `db.t4g.micro` 20 GB gp3 single-AZ, 1-day backup; one 20 GB gp3 EBS volume; 2 alarms in `serverless.yml`
+  - Arithmetic (python): demo 15.476+1.92+3.65+18.25+2.76+0.20 = 42.26; naive per-pair 3M × (804 in, 124.1 out) = $585.18; borderline-only 223,820 pairs = $43.66
+  - Quality gates not run: no Python touched (docs only)
+- Rubric: Docs & Presentation (+ cost table with cited prices and avoided-cost comparison), Cloud (+ no-NAT choice priced)
+- Explain it back:
+  - Built: a cited, reproducible cost table at demo scale and a 1M-users/month scenario, with unmeasured items listed.
+  - Why this approach: prices come from the Price List API rather than memory, usage from the 100,000-user benchmark, so every line is price × measured quantity; the alternative (a calculator screenshot) is not reproducible.
+  - Q: Why is 1M users barely more than the demo? A: Cost is fixed instance-hours (91%); Lambda, SQS and S3 are cents because ingestion takes seconds of compute and the LLM stage depends on cohort count, not user count.
+  - Q: Is $42 what you paid? A: No. Cost Explorer shows $0 (Free Plan/credits or not yet posted); these are list prices, and I did not read what the credits cover.
+  - Q: Would a db.t4g.micro survive 1M users? A: Untested. Storage fits (~1.6 GB) but nothing above 100,000 users was run; the table says so.
