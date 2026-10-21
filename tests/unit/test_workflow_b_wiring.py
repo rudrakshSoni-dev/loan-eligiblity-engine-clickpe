@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from tests.workflow_b_helpers import WORKFLOW
+from tests.workflow_c_helpers import WORKFLOW_C_ID
 
 NODE_REFERENCE = re.compile(r"\$\('([^']+)'\)")
 COMMENT_LINE = re.compile(r"^\s*(//|/\*|--)", re.MULTILINE)
@@ -83,7 +84,15 @@ def test_persist_follows_stage_3_and_every_persist_error_marks_the_batch_failed(
 
     assert targets("Record · Stage 3 funnel") == ["Persist · Insert matches"]
     assert targets("Persist · Insert matches") == ["Persist · Finalize run + mark matched"]
-    assert targets("Persist · Finalize run + mark matched") == []
+    assert targets("Persist · Finalize run + mark matched") == ["Notify · Run Workflow C"]
+    assert "Notify · Run Workflow C" not in connections
     for node in ("Persist · Insert matches", "Persist · Finalize run + mark matched"):
         assert targets(node, 1) == ["Fail · Mark batch failed (Persist)"]
     assert "Fail · Mark batch failed (Persist)" not in connections
+
+
+def test_workflow_c_hand_off_names_the_exported_workflow_and_does_not_wait() -> None:
+    notify = next(n for n in workflow()["nodes"] if n["name"] == "Notify · Run Workflow C")
+    assert notify["type"] == "n8n-nodes-base.executeWorkflow"
+    assert notify["parameters"]["workflowId"]["value"] == WORKFLOW_C_ID
+    assert notify["parameters"]["options"] == {"waitForSubWorkflow": False}

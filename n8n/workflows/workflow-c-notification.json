@@ -1,0 +1,451 @@
+[
+  {
+    "id": "wfcnotification01",
+    "name": "C · Notification",
+    "active": false,
+    "nodes": [
+      {
+        "id": "c0000000-0000-4000-8000-000000000001",
+        "name": "Note · Workflow C overview",
+        "type": "n8n-nodes-base.stickyNote",
+        "typeVersion": 1,
+        "position": [
+          -120,
+          -160
+        ],
+        "parameters": {
+          "content": "## Workflow C · Notification (compose, recipient guard; sending is T39)\n\n**Purpose.** Turn the matches of one batch into personalised emails, prove every one of them goes to a test inbox, and hand the result to the sending step.\n\n**Trigger.** Execute Workflow Trigger, called by Workflow B (`Notify · Run Workflow C`) after the batch is `matched`. It does not wait for this workflow.\n\n**Input.** `batch_id`, a lower-case UUID (any other fields in the item are ignored).\n\n**Output.** One item `{batch_id, dry_run, users_waiting, users_selected, emails[], guard}`. In this version nothing is sent and no match is marked notified: the batch goes `matched -> notifying -> matched`. Sending, `notified_at` and the `notified` status arrive in T39.\n\n**Settings.** `app_config` rows (table, not `$env`: n8n blocks `$env` in nodes because the container env holds the encryption key). `dry_run` (boolean), `test_inbox_aliases` (list of addresses), `max_emails_per_run` (whole number). Missing or malformed values stop the run before anything is claimed; there is no default that could send.\n\n**Stages.**\n1. `Check` reads and validates `batch_id`.\n2. `Config` loads and validates the three settings.\n3. `Claim` is one conditional UPDATE `matched -> notifying`. Only one run can win it, so two runs never compose for the same batch. A batch in any other state ends at `Stop · Nothing to do`.\n4. `Compose · Select recipients` is one statement: the first `max_emails_per_run` users (ordered by `user_id`) that have unnotified matches in this batch on products that are still active, each with all their offers as JSON. It always returns one row (an empty list when nothing is waiting), so the release below always runs.\n5. `Compose · Build emails` (Code) writes subject, HTML and plain text per user. Every crawled or CSV value is HTML-escaped, links must be http(s), and each user is redirected to a test inbox by `user_id` (same user, same inbox). The original address appears only in the `Intended for:` line.\n6. `Guard · Recipients are test inboxes` (Code) re-reads the allowed inboxes from the config node, not from the composed item, and throws unless every `to` is exactly one of them, there is no cc/bcc/reply-to and the count is within the cap. A throw aborts the run.\n7. `Release` moves the batch back to `matched` and reports counts.\n\n**Failures.** Any database or Code error after the claim goes to `Fail · Mark batch failed (Notify)` (batch `failed` with the message) and then `Abort · Stop and error`, so the execution itself shows as failed.\n\n**Safety net outside n8n.** SES stays in sandbox: it only delivers to the three verified identities.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
+          "height": 1180,
+          "width": 760,
+          "color": 4
+        }
+      },
+      {
+        "id": "c0000000-0000-4000-8000-000000000002",
+        "name": "Trigger · Matches ready (called by B)",
+        "type": "n8n-nodes-base.executeWorkflowTrigger",
+        "typeVersion": 1.1,
+        "position": [
+          700,
+          200
+        ],
+        "parameters": {
+          "inputSource": "passthrough"
+        }
+      },
+      {
+        "parameters": {
+          "jsCode": "const batchId = String($input.first().json.batch_id ?? '').trim().toLowerCase();\nconst UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;\nif (!UUID.test(batchId)) {\n  throw new Error('batch_id must be a UUID');\n}\nreturn [{ json: { batch_id: batchId } }];"
+        },
+        "id": "c0000000-0000-4000-8000-000000000003",
+        "name": "Check · Read batch_id",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          960,
+          200
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT coalesce(jsonb_object_agg(key, value), '{}'::jsonb) AS config\nFROM app_config",
+          "options": {}
+        },
+        "id": "c0000000-0000-4000-8000-000000000004",
+        "name": "Config · Load settings",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          1220,
+          200
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000
+      },
+      {
+        "parameters": {
+          "jsCode": "const raw = $input.first().json.config;\nconst batchId = $('Check · Read batch_id').first().json.batch_id;\nconst EMAIL = /^[^@\\s,;<>]+@[^@\\s,;<>]+$/;\n\nconst problems = [];\nif (typeof raw.dry_run !== 'boolean') {\n  problems.push('dry_run must be true or false');\n}\nconst aliases = Array.isArray(raw.test_inbox_aliases) ? raw.test_inbox_aliases : [];\nif (aliases.length === 0 || !aliases.every((a) => typeof a === 'string' && EMAIL.test(a.trim()))) {\n  problems.push('test_inbox_aliases must be a non-empty list of email addresses');\n}\nconst maxEmails = raw.max_emails_per_run;\nif (!Number.isInteger(maxEmails) || maxEmails < 1) {\n  problems.push('max_emails_per_run must be a whole number of at least 1');\n}\nif (problems.length > 0) {\n  throw new Error(`app_config invalid: ${problems.join('; ')}`);\n}\n\nreturn [{\n  json: {\n    batch_id: batchId,\n    dry_run: raw.dry_run,\n    aliases: [...new Set(aliases.map((a) => a.trim().toLowerCase()))],\n    max_emails: maxEmails,\n  },\n}];"
+        },
+        "id": "c0000000-0000-4000-8000-000000000005",
+        "name": "Config · Validate settings",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1480,
+          200
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH claimed AS (\n  UPDATE upload_batches\n  SET status = 'notifying'\n  WHERE id = $1::uuid AND status = 'matched'\n  RETURNING id\n)\nSELECT $1::uuid::text AS batch_id, (SELECT count(*) FROM claimed)::int AS claimed",
+          "options": {
+            "queryReplacement": "={{ [$json.batch_id] }}"
+          }
+        },
+        "id": "c0000000-0000-4000-8000-000000000006",
+        "name": "Claim · matched to notifying",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          1740,
+          200
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "claimed-one",
+                "leftValue": "={{ $json.claimed }}",
+                "rightValue": 1,
+                "operator": {
+                  "type": "number",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "c0000000-0000-4000-8000-000000000007",
+        "name": "Check · Batch was claimed",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          2000,
+          120
+        ]
+      },
+      {
+        "parameters": {},
+        "id": "c0000000-0000-4000-8000-000000000008",
+        "name": "Stop · Nothing to do (batch not matched)",
+        "type": "n8n-nodes-base.noOp",
+        "typeVersion": 1,
+        "position": [
+          2260,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH waiting AS (\n  SELECT m.user_id\n  FROM matches m\n  JOIN loan_products p ON p.id = m.product_id AND p.active\n  WHERE m.batch_id = $1::uuid AND m.notified_at IS NULL\n  GROUP BY m.user_id\n),\npicked AS (\n  SELECT user_id, count(*) OVER () AS users_waiting\n  FROM waiting\n  ORDER BY user_id\n  LIMIT $2::int\n),\nper_user AS (\n  SELECT u.user_id, u.name, u.email AS original_email, k.users_waiting,\n         jsonb_agg(\n           jsonb_build_object(\n             'product_id', p.id,\n             'lender', p.source,\n             'product_name', p.product_name,\n             'rate_min', p.interest_rate_min,\n             'rate_max', p.interest_rate_max,\n             'source_url', p.source_url,\n             'stage', m.stage,\n             'reason', m.reason)\n           ORDER BY p.interest_rate_min NULLS LAST, p.id) AS offers\n  FROM picked k\n  JOIN users u ON u.user_id = k.user_id\n  JOIN matches m ON m.user_id = u.user_id AND m.batch_id = $1::uuid AND m.notified_at IS NULL\n  JOIN loan_products p ON p.id = m.product_id AND p.active\n  GROUP BY u.user_id, u.name, u.email, k.users_waiting\n)\nSELECT $1::uuid::text AS batch_id,\n       coalesce(max(users_waiting), 0)::int AS users_waiting,\n       count(*)::int AS users_selected,\n       coalesce(\n         jsonb_agg(\n           jsonb_build_object(\n             'user_id', user_id,\n             'name', name,\n             'original_email', original_email,\n             'offers', offers)\n           ORDER BY user_id),\n         '[]'::jsonb) AS recipients\nFROM per_user",
+          "options": {
+            "queryReplacement": "={{ [$json.batch_id, $('Config · Validate settings').first().json.max_emails] }}"
+          }
+        },
+        "id": "c0000000-0000-4000-8000-000000000009",
+        "name": "Compose · Select recipients",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2260,
+          40
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "jsCode": "const config = $('Config · Validate settings').first().json;\nconst selected = $input.first().json;\n\nconst MAX_REASON_CHARS = 240;\nconst DISCLAIMER =\n  'These options are indicative only. They are matched against the eligibility criteria ' +\n  'published on each lender\\'s website, not against a credit check. The lender decides ' +\n  'eligibility, rate and amount after its own verification. This is not an offer of credit.';\nconst ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' };\n\nconst escapeHtml = (value) => String(value ?? '').replace(/[&<>\"']/g, (c) => ESCAPES[c]);\nconst safeUrl = (url) => (/^https?:\\/\\//i.test(String(url ?? '')) ? String(url) : null);\nconst shorten = (text) => {\n  const clean = String(text ?? '').replace(/\\s+/g, ' ').trim();\n  return clean.length > MAX_REASON_CHARS ? `${clean.slice(0, MAX_REASON_CHARS - 1)}…` : clean;\n};\n\nconst describeRate = (offer) => {\n  const low = offer.rate_min === null ? null : Number(offer.rate_min);\n  const high = offer.rate_max === null ? null : Number(offer.rate_max);\n  if (low === null && high === null) return 'Interest rate not published on the lender page';\n  if (high === null) return `Interest rate from ${low}% p.a.`;\n  if (low === null) return `Interest rate up to ${high}% p.a.`;\n  if (low === high) return `Interest rate ${low}% p.a.`;\n  return `Interest rate ${low}% to ${high}% p.a.`;\n};\n\nconst aliasFor = (userId) => {\n  const bucket = parseInt(userId.replace(/-/g, '').slice(0, 8), 16);\n  return config.aliases[bucket % config.aliases.length];\n};\n\nconst offerText = (offer, index) => {\n  const link = safeUrl(offer.source_url);\n  const lines = [\n    `${index + 1}. ${offer.lender} - ${offer.product_name}`,\n    `   ${describeRate(offer)}`,\n    `   Why: ${shorten(offer.reason)}`,\n  ];\n  if (link) lines.push(`   Details: ${link}`);\n  return lines.join('\\n');\n};\n\nconst offerHtml = (offer) => {\n  const link = safeUrl(offer.source_url);\n  const details = link ? ` <a href=\"${escapeHtml(link)}\">Lender page</a>` : '';\n  return (\n    '<tr><td style=\"padding:10px 0;border-bottom:1px solid #e5e7eb\">' +\n    `<strong>${escapeHtml(offer.lender)} - ${escapeHtml(offer.product_name)}</strong><br>` +\n    `${escapeHtml(describeRate(offer))}<br>` +\n    `<span style=\"color:#4b5563\">Why: ${escapeHtml(shorten(offer.reason))}</span>${details}` +\n    '</td></tr>'\n  );\n};\n\nconst buildEmail = (recipient) => {\n  const offers = recipient.offers;\n  const count = offers.length;\n  const noun = count === 1 ? 'option' : 'options';\n  const subject = `[TEST] ${count} personal loan ${noun} you may qualify for`;\n  const intendedFor = `${recipient.name} <${recipient.original_email}>`;\n  const text = [\n    `Hello ${recipient.name},`,\n    '',\n    `Based on the details you shared, you may qualify for ${count} personal loan ${noun}:`,\n    '',\n    offers.map(offerText).join('\\n\\n'),\n    '',\n    DISCLAIMER,\n    '',\n    `Intended for: ${intendedFor}`,\n    'This is a test delivery: every message is redirected to a test inbox.',\n  ].join('\\n');\n  const html =\n    '<!doctype html><html><body style=\"font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#111827\">' +\n    `<p>Hello ${escapeHtml(recipient.name)},</p>` +\n    `<p>Based on the details you shared, you may qualify for ${count} personal loan ${noun}:</p>` +\n    `<table style=\"width:100%;border-collapse:collapse\">${offers.map(offerHtml).join('')}</table>` +\n    `<p style=\"color:#4b5563;font-size:13px\">${escapeHtml(DISCLAIMER)}</p>` +\n    `<p style=\"color:#6b7280;font-size:12px\">Intended for: ${escapeHtml(intendedFor)}<br>` +\n    'This is a test delivery: every message is redirected to a test inbox.</p>' +\n    '</body></html>';\n  return {\n    user_id: recipient.user_id,\n    original_email: recipient.original_email,\n    to: aliasFor(recipient.user_id),\n    subject,\n    html,\n    text,\n    offer_count: count,\n  };\n};\n\nreturn [{\n  json: {\n    batch_id: selected.batch_id,\n    dry_run: config.dry_run,\n    users_waiting: selected.users_waiting,\n    users_selected: selected.users_selected,\n    emails: selected.recipients.map(buildEmail),\n  },\n}];"
+        },
+        "id": "c0000000-0000-4000-8000-000000000010",
+        "name": "Compose · Build emails",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2520,
+          40
+        ],
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "jsCode": "const config = $('Config · Validate settings').first().json;\nconst run = $input.first().json;\nconst allowed = new Set(config.aliases);\nconst COPY_FIELDS = ['cc', 'bcc', 'replyTo'];\nconst MAX_REPORTED = 5;\n\nconst problems = [];\nif (allowed.size === 0) {\n  problems.push('the test inbox list is empty');\n}\nif (run.emails.length > config.max_emails) {\n  problems.push(`${run.emails.length} emails exceed the cap of ${config.max_emails}`);\n}\nfor (const email of run.emails) {\n  if (typeof email.to !== 'string' || !allowed.has(email.to)) {\n    problems.push(`user ${email.user_id} would go to ${email.to}, which is not a test inbox`);\n  }\n  if (COPY_FIELDS.some((field) => field in email)) {\n    problems.push(`user ${email.user_id} has a copy or reply-to recipient`);\n  }\n}\nif (problems.length > 0) {\n  const shown = problems.slice(0, MAX_REPORTED).join('; ');\n  throw new Error(`recipient guard blocked the run (${problems.length} problems): ${shown}`);\n}\n\nreturn [{\n  json: { ...run, guard: { checked: run.emails.length, test_inboxes: allowed.size } },\n}];"
+        },
+        "id": "c0000000-0000-4000-8000-000000000011",
+        "name": "Guard · Recipients are test inboxes",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2780,
+          40
+        ],
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH released AS (\n  UPDATE upload_batches\n  SET status = 'matched'\n  WHERE id = $1::uuid AND status = 'notifying'\n  RETURNING id\n)\nSELECT $1::uuid::text AS batch_id,\n       (SELECT count(*) FROM released)::int AS released,\n       $2::int AS emails_composed,\n       $3::int AS users_waiting,\n       $4::boolean AS dry_run,\n       0 AS emails_sent",
+          "options": {
+            "queryReplacement": "={{ [$json.batch_id, $json.emails.length, $json.users_waiting, $json.dry_run] }}"
+          }
+        },
+        "id": "c0000000-0000-4000-8000-000000000012",
+        "name": "Release · notifying back to matched",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          3040,
+          40
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH failed AS (\n  UPDATE upload_batches\n  SET status = 'failed', error = left('notification failed: ' || $2, 1000)\n  WHERE id = $1::uuid AND status = 'notifying'\n  RETURNING id\n)\nSELECT $1::uuid::text AS batch_id,\n       left($2, 1000) AS error,\n       (SELECT count(*) FROM failed)::int AS marked",
+          "options": {
+            "queryReplacement": "={{ [$('Check · Read batch_id').first().json.batch_id, String($json.error?.message ?? $json.message ?? $json.error ?? 'unknown error')] }}"
+          }
+        },
+        "id": "c0000000-0000-4000-8000-000000000013",
+        "name": "Fail · Mark batch failed (Notify)",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2780,
+          300
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "errorType": "errorMessage",
+          "errorMessage": "={{ 'Workflow C aborted, batch ' + $json.batch_id + ' marked failed (' + $json.marked + '): ' + $json.error }}"
+        },
+        "id": "c0000000-0000-4000-8000-000000000014",
+        "name": "Abort · Stop and error",
+        "type": "n8n-nodes-base.stopAndError",
+        "typeVersion": 1,
+        "position": [
+          3040,
+          300
+        ]
+      },
+      {
+        "parameters": {
+          "errorType": "errorMessage",
+          "errorMessage": "={{ 'Workflow C could not claim the batch: ' + String($json.error?.message ?? $json.message ?? $json.error ?? 'unknown error') }}"
+        },
+        "id": "c0000000-0000-4000-8000-000000000015",
+        "name": "Abort · Claim failed",
+        "type": "n8n-nodes-base.stopAndError",
+        "typeVersion": 1,
+        "position": [
+          2000,
+          300
+        ]
+      }
+    ],
+    "connections": {
+      "Trigger · Matches ready (called by B)": {
+        "main": [
+          [
+            {
+              "node": "Check · Read batch_id",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check · Read batch_id": {
+        "main": [
+          [
+            {
+              "node": "Config · Load settings",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Config · Load settings": {
+        "main": [
+          [
+            {
+              "node": "Config · Validate settings",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Config · Validate settings": {
+        "main": [
+          [
+            {
+              "node": "Claim · matched to notifying",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Claim · matched to notifying": {
+        "main": [
+          [
+            {
+              "node": "Check · Batch was claimed",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Abort · Claim failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check · Batch was claimed": {
+        "main": [
+          [
+            {
+              "node": "Compose · Select recipients",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Stop · Nothing to do (batch not matched)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Compose · Select recipients": {
+        "main": [
+          [
+            {
+              "node": "Compose · Build emails",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Notify)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Compose · Build emails": {
+        "main": [
+          [
+            {
+              "node": "Guard · Recipients are test inboxes",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Notify)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Guard · Recipients are test inboxes": {
+        "main": [
+          [
+            {
+              "node": "Release · notifying back to matched",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Notify)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Release · notifying back to matched": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Fail · Mark batch failed (Notify)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Fail · Mark batch failed (Notify)": {
+        "main": [
+          [
+            {
+              "node": "Abort · Stop and error",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "timezone": "Asia/Kolkata",
+      "saveManualExecutions": true
+    },
+    "pinData": {}
+  }
+]

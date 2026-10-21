@@ -48,14 +48,14 @@ process.stdout.write(JSON.stringify(run($input, $)));
 """
 
 
-def workflow_node(name: str) -> dict[str, Any]:
-    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))[0]
+def workflow_node(name: str, workflow_file: Path = WORKFLOW) -> dict[str, Any]:
+    workflow = json.loads(workflow_file.read_text(encoding="utf-8"))[0]
     node: dict[str, Any] = next(n for n in workflow["nodes"] if n["name"] == name)
     return node
 
 
-def node_query(name: str, placeholders: dict[str, str]) -> str:
-    query: str = workflow_node(name)["parameters"]["query"]
+def node_query(name: str, placeholders: dict[str, str], workflow_file: Path = WORKFLOW) -> str:
+    query: str = workflow_node(name, workflow_file)["parameters"]["query"]
     return re.sub(r"\$\d+", lambda m: placeholders[m.group(0)], query)
 
 
@@ -63,11 +63,13 @@ def run_code_node(
     name: str,
     item: dict[str, Any] | list[dict[str, Any]],
     nodes: dict[str, list[dict[str, Any]]] | None = None,
+    workflow_file: Path = WORKFLOW,
 ) -> list[dict[str, Any]]:
     assert NODE_BINARY is not None
     items = item if isinstance(item, list) else [item]
+    js_code = workflow_node(name, workflow_file)["parameters"]["jsCode"]
     completed = subprocess.run(
-        [NODE_BINARY, "-e", CODE_NODE_HARNESS, workflow_node(name)["parameters"]["jsCode"]],
+        [NODE_BINARY, "-e", CODE_NODE_HARNESS, js_code],
         input=json.dumps({"items": items, "nodes": nodes or {}}, default=str),
         capture_output=True,
         text=True,
