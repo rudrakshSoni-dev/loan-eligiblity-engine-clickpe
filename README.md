@@ -105,7 +105,7 @@ flowchart TB
 | [n8n/](n8n) | `docker-compose.yml` and the exported workflows A, B and C |
 | [ui/](ui) | One static page, no framework |
 | [infra/](infra) | Step-by-step records and scripts for RDS, EC2, n8n, and the IAM policy documents |
-| [scripts/](scripts) | `smoke_test.sh`, `retrigger_batch.sh`, `serve_ui.sh`, `verify_workflow_import.sh`, `check_package.py` |
+| [scripts/](scripts) | `smoke_test.sh`, `benchmark_run.sh`, `benchmark.md`, `gen_synthetic_users.py`, `measure_naive_llm.py`, `rds_query.sh`, `retrigger_batch.sh`, `serve_ui.sh`, `verify_workflow_import.sh`, `check_package.py` |
 | [tests/](tests) | Unit tests, PostgreSQL-backed integration tests, CSV fixtures |
 | [docs/](docs) | `decisions.md` (every choice, the rejected option and the evidence), `architecture.md`, `data-notes.md`, `stage1-explain.md`, `rubric-evidence.md`, screenshots |
 | [PROGRESS.md](PROGRESS.md) | Per-task log with commands and trimmed output for every number in this README |
@@ -267,7 +267,7 @@ Measured on the real CSV. Counts and tokens are from the end-to-end run (Workflo
 
 Per-pair asking would be 2,221 calls for the borderline pairs alone. Per-stage timings are stored in `pipeline_runs.stage_ms` and shown in the UI. Finding a stale planner statistic that made cohort forming take 16 s, and adding an `ANALYZE` node that brought it to 168 ms, is in [docs/decisions.md](docs/decisions.md) → "Workflow B Stage 3".
 
-A benchmark at 100,000 rows (T37) has not been run. No scale figure beyond the 10,000-row sample is claimed.
+**At 100,000 users** (synthetic data, [scripts/benchmark.md](scripts/benchmark.md)): the file went from the end of the upload to `processed` in 20.8 s (20 chunks, 3 concurrent loaders, mean 340 ms per chunk) and the batch was `matched` 72.3 s after the upload started. The funnel was 300,000 pairs → 139,918 → 102,371 clear match / 15,165 clear reject / 22,382 borderline → 22 cohorts → **1 Groq call** (20 cohorts came from the cache) → 116,850 matches; Stage 1 took 5,955 ms and Stage 2 5,714 ms, about 10× the 10,000-user times. Asking the LLM about every pair would be 300,000 calls and 278.4 M tokens (1,392 days of the daily token quota), priced from 10 measured single-pair calls at 928.1 tokens each. Re-uploading the same file inserted and updated 0 rows. A cold-cache run at 100,000 users was not made.
 
 ## Security
 
@@ -309,7 +309,7 @@ The SQL and Code nodes inside the exported workflows are tested where they live:
 Stated plainly, because these are known:
 
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
-- **Designed, not implemented:** Workflow E (global error handler, T25), the reusable Groq "LLM Gateway" sub-workflow (T26, so Workflows A and B call Groq with their own HTTP Request nodes), crawl change detection (T29, so Workflow A calls Groq for every site each run), the 100,000-row benchmark (T37), the cost table (T46), and the security review (T45). Workflows A, B and C therefore have no Error Workflow set.
+- **Designed, not implemented:** Workflow E (global error handler, T25), the reusable Groq "LLM Gateway" sub-workflow (T26, so Workflows A and B call Groq with their own HTTP Request nodes), crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45). Workflows A, B and C therefore have no Error Workflow set.
 - **UI polish (T41) is built and tested locally but not deployed.** The deployed `batch-status` does not yet return the grouped reject report or the CSV download.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.

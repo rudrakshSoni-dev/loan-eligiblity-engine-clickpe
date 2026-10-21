@@ -100,7 +100,7 @@ Why the live upload will show zeros: re-uploading the identical file is a no-op 
 
 **Check:** the borderline count is 2,221, not "about two thousand". Per-pair asking for those alone would be 2,221 calls.
 
-**Do not say** any figure for 100,000 rows. The benchmark (T37) has not been run.
+**Optional, only if time allows:** at 100,000 synthetic users the batch was matched 72.3 seconds after the upload started and Stage 3 made one Groq call (20 of 22 cohorts were cached). Say "warm cache" with it. Source: `scripts/benchmark.md`. Do not give a cold-cache figure for 100,000 users; none was measured.
 
 ---
 
@@ -148,7 +148,7 @@ Why the live upload will show zeros: re-uploading the identical file is a no-op 
 
 **Screen:** README, "Limitations" section.
 
-> Plainly: ingestion, the three workflows, the funnel, the guard and the failure drills are built and measured. Designed but not built: a global error workflow, a reusable Groq sub-workflow, change detection and the hundred-thousand-row benchmark. I have measured up to ten thousand users only.
+> Plainly: ingestion, the three workflows, the funnel, the guard and the failure drills are built and measured. Designed but not built: a global error workflow, a reusable Groq sub-workflow, change detection and the cost table. I have measured up to a hundred thousand users.
 >
 > Deliberate trade-offs: Sydney, because the account is locked there; Function URLs instead of API Gateway; a single-AZ database to stay on the cheap tier. The README has every command and every number.
 
@@ -182,7 +182,7 @@ Every number in the narration comes from a recorded run. If any of them changes,
 
 ## Not to claim
 
-- No figure for 100,000 rows or any scale beyond 10,000 users (T37 not run).
+- No cold-cache figure for 100,000 users (only the warm-cache run in `scripts/benchmark.md` exists), and nothing beyond 100,000 users.
 - No dollar costs (T46 not written).
 - No "security review done" (T45 not run).
 - No "error workflow", "LLM gateway" or "change detection" as built (T25, T26, T29). The DLQ alarm is built (T21) but has no notification target.

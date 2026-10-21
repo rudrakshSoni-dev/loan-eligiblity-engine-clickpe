@@ -120,7 +120,7 @@ upserts. After 5 receives a message moves to `ingest-dlq`; a CloudWatch alarm fi
 
 **Honest caveat (estimate).** At 10k–100k rows (≤ ~10 MB) one Lambda would finish well inside
 900 s. The case for fan-out is per-chunk retry and horizontal scale, not need at this size; the
-T37 benchmark carries the scale argument with measured numbers.
+T37 benchmark (`scripts/benchmark.md`) carries the scale argument with measured numbers: 100,000 rows in 20 chunks reached `processed` 20.8 s after the upload finished.
 
 **DLQ settings (cited).** AWS recommends a visibility timeout of at least 6× the function timeout
 and `maxReceiveCount` of at least 5, because throttled invocations also raise the receive count
