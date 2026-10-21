@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Loan Eligibility Engine</title>
 <link rel="icon" href="data:,">
+<script>
+try {
+  const savedTheme = localStorage.getItem("theme");
+  if (savedTheme === "light" || savedTheme === "dark") document.documentElement.dataset.theme = savedTheme;
+} catch (storageBlocked) {}
+</script>
 <style>
   :root {
     --bg: #f6f7f9;
@@ -20,7 +26,7 @@
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0f1216;
       --panel: #171b21;
       --text: #e6e9ee;
@@ -33,6 +39,20 @@
       --track: #262c34;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --text: #e6e9ee;
+    --muted: #9aa4b1;
+    --border: #2c333c;
+    --accent: #4c8dff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --track: #262c34;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] { color-scheme: light; }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -42,6 +62,9 @@
   }
   main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
   h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .page-header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+  .theme-picker { color: var(--muted); font-size: 0.875rem; }
+  select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; margin-left: 6px; }
   h2 { font-size: 1.05rem; margin: 0 0 12px; }
   p.lead { margin: 0 0 20px; color: var(--muted); }
   section {
@@ -63,7 +86,14 @@
     cursor: pointer;
   }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  a { color: var(--accent); }
+  a.button-link { display: inline-block; border: 1px solid var(--accent); border-radius: 6px; padding: 6px 12px; text-decoration: none; font-size: 0.9rem; }
+  a.button-link:hover { background: var(--accent); color: #fff; }
+  .section-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; margin: 16px 0 8px; }
+  .section-head h2 { margin: 0; }
+  .table-scroll { overflow-x: auto; }
+  td.example { overflow-wrap: anywhere; }
   .hint { color: var(--muted); font-size: 0.875rem; margin: 8px 0 0; }
   .message { display: block; margin: 12px 0 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); }
   .message:empty { display: none; }
@@ -123,7 +153,16 @@
 </head>
 <body>
 <main>
-  <h1>Loan Eligibility Engine</h1>
+  <header class="page-header">
+    <h1>Loan Eligibility Engine</h1>
+    <label class="theme-picker">Theme
+      <select id="theme-select">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+  </header>
   <p class="lead">Upload a users CSV. The file goes straight to S3, is loaded into PostgreSQL in parallel chunks, matched against crawled loan products by n8n, and matched users are emailed (test inboxes only).</p>
 
   <section aria-labelledby="upload-heading">
@@ -155,12 +194,18 @@
       <div class="stat"><div class="stat-label">Matches notified (email sent)</div><div class="stat-value" id="notified">–</div></div>
     </div>
     <div id="rejects-block" hidden>
-      <h2 style="margin-top:16px">First rejected rows</h2>
-      <table>
-        <caption class="hint" style="text-align:left">Up to 5 shown; every reject is stored in <span class="mono">rejected_rows</span>.</caption>
-        <thead><tr><th scope="col" class="num">CSV line</th><th scope="col">Reason</th></tr></thead>
-        <tbody id="rejects-body"></tbody>
-      </table>
+      <div class="section-head">
+        <h2 id="rejects-heading">Rejected rows by problem</h2>
+        <a id="rejects-download" class="button-link" href="#" aria-describedby="download-hint">Download rejected rows (CSV)</a>
+      </div>
+      <div class="table-scroll">
+        <table aria-labelledby="rejects-heading">
+          <caption id="rejects-caption" class="hint" style="text-align:left"></caption>
+          <thead><tr><th scope="col">Problem</th><th scope="col" class="num">Rows</th><th scope="col" class="num">First line</th><th scope="col">Example</th></tr></thead>
+          <tbody id="reasons-body"></tbody>
+        </table>
+      </div>
+      <p id="download-hint" class="hint">The CSV has the CSV line number, the reason and the raw row for up to <span id="download-limit"></span> stored rejects. Cells that start like a spreadsheet formula (= + - @) are prefixed with an apostrophe.</p>
     </div>
   </section>
 
@@ -181,6 +226,9 @@
 const REQUIRED_COLUMNS = ["user_id", "name", "email", "monthly_income", "credit_score", "employment_status", "age"];
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const HEADER_SAMPLE_BYTES = 64 * 1024;
+const DOWNLOAD_ROW_LIMIT = 2000;
+const STORED_REJECTS_PER_CHUNK = 100;
+const THEMES = new Set(["light", "dark"]);
 const POLL_INTERVAL_MS = 2000;
 const POLL_GIVE_UP_MS = 20 * 60 * 1000;
 const MATCHED_SETTLE_MS = 60 * 1000;
@@ -319,15 +367,31 @@ function renderCounts(document) {
   el("rows-rejected").textContent = formatCount(document.rows_rejected);
   el("matches").textContent = formatCount(document.matches);
   el("notified").textContent = formatCount(document.notified);
-  el("rejects-block").hidden = document.first_rejects.length === 0;
-  el("rejects-body").replaceChildren(...document.first_rejects.map((reject) => {
+  renderRejects(document);
+}
+
+function cell(text, className) {
+  const td = window.document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  return td;
+}
+
+function rejectsCaption(document) {
+  const stored = formatCount(document.rejects_stored);
+  if (document.rejects_stored >= document.rows_rejected) return `Covers all ${stored} rejected rows. A row with several bad fields counts once under each.`;
+  return `Covers the ${stored} stored rejects out of ${formatCount(document.rows_rejected)} rejected rows (the first ${STORED_REJECTS_PER_CHUNK} of each chunk are stored). A row with several bad fields counts once under each.`;
+}
+
+function renderRejects(document) {
+  const summary = document.reject_summary || [];
+  el("rejects-block").hidden = summary.length === 0;
+  if (summary.length === 0) return;
+  el("rejects-caption").textContent = rejectsCaption(document);
+  el("rejects-download").href = `${config.batchStatusEndpoint}?batch_id=${encodeURIComponent(state.batchId)}&download=rejects`;
+  el("reasons-body").replaceChildren(...summary.map((group) => {
     const row = window.document.createElement("tr");
-    const line = window.document.createElement("td");
-    line.className = "num";
-    line.textContent = reject.line_no;
-    const reason = window.document.createElement("td");
-    reason.textContent = reject.reason;
-    row.append(line, reason);
+    row.append(cell(group.problem), cell(formatCount(group.rows), "num"), cell(group.first_line, "num"), cell(group.example, "example"));
     return row;
   }));
 }
@@ -491,8 +555,25 @@ async function handleSubmit(event) {
   }
 }
 
+function applyTheme(choice) {
+  if (THEMES.has(choice)) window.document.documentElement.dataset.theme = choice;
+  else delete window.document.documentElement.dataset.theme;
+  try {
+    if (THEMES.has(choice)) localStorage.setItem("theme", choice);
+    else localStorage.removeItem("theme");
+  } catch (storageBlocked) {}
+}
+
+function initTheme() {
+  const picker = el("theme-select");
+  picker.value = window.document.documentElement.dataset.theme || "system";
+  picker.addEventListener("change", () => applyTheme(picker.value));
+}
+
 function init() {
+  initTheme();
   el("required-columns").textContent = REQUIRED_COLUMNS.join(", ");
+  el("download-limit").textContent = numberFormat.format(DOWNLOAD_ROW_LIMIT);
   el("max-size").textContent = formatBytes(MAX_UPLOAD_BYTES);
   if (!config || !config.uploadUrlEndpoint || !config.batchStatusEndpoint) {
     showMessage("Missing ui/config.js with the Function URLs. Start the page with scripts/serve_ui.sh.", "error");
