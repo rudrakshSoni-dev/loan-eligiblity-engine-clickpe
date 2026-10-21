@@ -6,8 +6,8 @@
     "nodes": [
       {
         "parameters": {
-          "content": "## Workflow A · Product discovery (fetch, extract, structure, store)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row, and retire products that stop being seen.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Prompt` builds the request and `LLM · Structure criteria (LLM Gateway)` sends it through the LLM Gateway sub-workflow (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning; the gateway checks the answer against the schema, waits out 429s and falls back to `gpt-oss-20b`, and records every attempt in `llm_calls`).\n4. `Route` on the gateway answer: `ok` -> `Coerce`; still rate limited after the gateway's waits and fallback -> `Mark · Groq rate limited`; any other failure -> `Mark · Groq call failed`.\n5. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n6. `Upsert` writes the product on `(source, product_name)` (sets `active`, `last_seen_at`, the SHA-256 `content_hash` of the criteria text) and the success row of `crawl_runs` in one statement, so the two cannot disagree. A database error on one site goes to `Mark · Upsert failed` and the failure log; the other sites carry on.\n7. After every failed site is logged, `Retire` checks that source's last 3 `crawl_runs` rows: all failed -> its non-seed product is set `active = false`. Nothing is deleted; the next good run reactivates it.\n\n**Output.** `loan_products` rows (crawled rows have `is_seed = false`), one `crawl_runs` row per site per run, one `llm_calls` row per Groq attempt (written by the gateway).\n\n**Next.** T29 hashes `criteria_text` to skip the LLM for unchanged pages.",
-          "height": 560,
+          "content": "## Workflow A · Product discovery (fetch, extract, structure, store)\n\n**Purpose.** Turn each lender's published personal-loan eligibility page into one validated `loan_products` row, and retire products that stop being seen.\n\n**Triggers.** Daily 06:00 IST (Schedule) and a Manual trigger for demos.\n\n**Input.** The site list in `Config · Crawl targets`: source, URL, CSS selector, role (primary / spare), enabled.\n\n**Stages.**\n1. Fetch each page (browser User-Agent, redirects, 30 s timeout, 3 tries with a 5 s wait, one request every 2 s). Non-200 or network error -> `Mark · Fetch failed`.\n2. `Extract` + `Normalize` reduce the page to sorted criteria lines. No lines -> logged, no LLM call.\n3. `Lookup` + `Tag` + `Check · Content changed` compare the SHA-256 of the normalised criteria text with the stored `content_hash` (hashed in Postgres, the same function `Upsert` stores). Unchanged -> `Touch` bumps `last_seen_at`, reactivates a retired product and writes `crawl_runs` (`changed = false`, `llm_calls = 0`) with no Groq call; a failed lookup counts as changed.\n4. `Prompt` builds the request and `LLM · Structure criteria (LLM Gateway)` sends it through the LLM Gateway sub-workflow (`gpt-oss-120b`, temperature 0, strict JSON schema, low reasoning; the gateway checks the answer against the schema, waits out 429s and falls back to `gpt-oss-20b`, and records every attempt in `llm_calls`).\n5. `Route` on the gateway answer: `ok` -> `Coerce`; still rate limited after the gateway's waits and fallback -> `Mark · Groq rate limited`; any other failure -> `Mark · Groq call failed`.\n6. `Coerce · Validate product` coerces units, enforces the database ranges, rejects any number that is not in the source text, and computes `parse_confidence` from field completeness (capped at 0.6 when criteria depend on employment type or work experience).\n7. `Upsert` writes the product on `(source, product_name)` (sets `active`, `last_seen_at`, the SHA-256 `content_hash` of the criteria text) and the success row of `crawl_runs` in one statement, so the two cannot disagree. A database error on one site goes to `Mark · Upsert failed` and the failure log; the other sites carry on.\n8. After every failed site is logged, `Retire` checks that source's last 3 `crawl_runs` rows: all failed -> its non-seed product is set `active = false`. Nothing is deleted; the next good run reactivates it.\n\n**Output.** `loan_products` rows (crawled rows have `is_seed = false`), one `crawl_runs` row per site per run, one `llm_calls` row per Groq attempt (written by the gateway).",
+          "height": 620,
           "width": 640,
           "color": 4
         },
@@ -307,7 +307,7 @@
         "type": "n8n-nodes-base.code",
         "typeVersion": 2,
         "position": [
-          2080,
+          2800,
           60
         ]
       },
@@ -435,7 +435,7 @@
         "type": "n8n-nodes-base.executeWorkflow",
         "typeVersion": 1.3,
         "position": [
-          2320,
+          3040,
           60
         ],
         "onError": "continueRegularOutput"
@@ -505,7 +505,7 @@
         "type": "n8n-nodes-base.switch",
         "typeVersion": 3.2,
         "position": [
-          2560,
+          3280,
           160
         ]
       },
@@ -558,7 +558,7 @@
         "type": "n8n-nodes-base.set",
         "typeVersion": 3.4,
         "position": [
-          2800,
+          3520,
           300
         ]
       },
@@ -611,7 +611,7 @@
         "type": "n8n-nodes-base.set",
         "typeVersion": 3.4,
         "position": [
-          2800,
+          3520,
           440
         ]
       },
@@ -625,7 +625,7 @@
         "type": "n8n-nodes-base.code",
         "typeVersion": 2,
         "position": [
-          2800,
+          3520,
           60
         ]
       },
@@ -658,7 +658,7 @@
         "type": "n8n-nodes-base.if",
         "typeVersion": 2.2,
         "position": [
-          3040,
+          3760,
           60
         ]
       },
@@ -675,7 +675,7 @@
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.5,
         "position": [
-          4000,
+          4720,
           300
         ],
         "credentials": {
@@ -695,7 +695,7 @@
         "type": "n8n-nodes-base.code",
         "typeVersion": 2,
         "position": [
-          3280,
+          4000,
           60
         ]
       },
@@ -713,7 +713,7 @@
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.5,
         "position": [
-          3520,
+          4240,
           60
         ],
         "credentials": {
@@ -773,7 +773,7 @@
         "type": "n8n-nodes-base.set",
         "typeVersion": 3.4,
         "position": [
-          3760,
+          4480,
           300
         ]
       },
@@ -791,7 +791,7 @@
         "type": "n8n-nodes-base.postgres",
         "typeVersion": 2.5,
         "position": [
-          4240,
+          4960,
           300
         ],
         "credentials": {
@@ -800,6 +800,157 @@
             "name": "rds-postgres"
           }
         }
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "SELECT COALESCE(\n  (SELECT p.content_hash = encode(sha256(convert_to($3::text, 'UTF8')), 'hex')\n   FROM loan_products p\n   WHERE p.source = $1::text AND p.product_name = $2::text AND NOT p.is_seed),\n  false\n) AS unchanged",
+          "options": {
+            "queryBatching": "independently",
+            "queryReplacement": "={{ [$json.source, $json.product_name, $json.criteria_text] }}"
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000040",
+        "name": "Lookup · Stored content hash",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2080,
+          60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForEachItem",
+          "jsCode": "const page = $('Normalize · Criteria lines').item.json;\n\nreturn {\n  json: {\n    ...page,\n    content_unchanged: $input.item.json.unchanged === true,\n  },\n};"
+        },
+        "id": "a0000000-0000-4000-8000-000000000041",
+        "name": "Tag · Content unchanged",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          2320,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 2
+            },
+            "conditions": [
+              {
+                "id": "content-changed",
+                "leftValue": "={{ !$json.content_unchanged }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "id": "a0000000-0000-4000-8000-000000000042",
+        "name": "Check · Content changed",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.2,
+        "position": [
+          2560,
+          60
+        ]
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH previous AS (\n  SELECT p.id, p.active\n  FROM loan_products p\n  WHERE p.source = $1::text AND p.product_name = $2::text AND NOT p.is_seed\n    AND p.content_hash = encode(sha256(convert_to($3::text, 'UTF8')), 'hex')\n),\ntouched AS (\n  UPDATE loan_products p\n  SET last_seen_at = now(), active = true\n  FROM previous pr\n  WHERE p.id = pr.id\n  RETURNING p.id\n),\nlogged AS (\n  INSERT INTO crawl_runs (source, status, products_found, changed, llm_calls)\n  SELECT $1::text, 'ok', 1, false, 0\n  FROM touched\n  RETURNING id\n)\nSELECT t.id AS product_id, $1::text AS source, $2::text AS product_name,\n       NOT pr.active AS reactivated, false AS changed, 0 AS llm_calls, l.id AS crawl_run_id\nFROM touched t\nJOIN previous pr ON pr.id = t.id\nCROSS JOIN logged l",
+          "options": {
+            "queryBatching": "independently",
+            "queryReplacement": "={{ [$json.source, $json.product_name, $json.criteria_text] }}"
+          }
+        },
+        "id": "a0000000-0000-4000-8000-000000000043",
+        "name": "Touch · last_seen_at + crawl_runs (unchanged)",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2800,
+          -120
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "assignments": {
+            "assignments": [
+              {
+                "id": "t1",
+                "name": "source",
+                "type": "string",
+                "value": "={{ $('Tag · Content unchanged').item.json.source }}"
+              },
+              {
+                "id": "t2",
+                "name": "product_name",
+                "type": "string",
+                "value": "={{ $('Tag · Content unchanged').item.json.product_name }}"
+              },
+              {
+                "id": "t3",
+                "name": "source_url",
+                "type": "string",
+                "value": "={{ $('Tag · Content unchanged').item.json.source_url }}"
+              },
+              {
+                "id": "t4",
+                "name": "status",
+                "type": "string",
+                "value": "touch_failed"
+              },
+              {
+                "id": "t5",
+                "name": "error",
+                "type": "string",
+                "value": "={{ 'Database write failed: ' + String($json.error?.description || $json.error?.name || 'unknown error').slice(0, 300) }}"
+              },
+              {
+                "id": "t6",
+                "name": "llm_calls",
+                "type": "number",
+                "value": 0
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "a0000000-0000-4000-8000-000000000044",
+        "name": "Mark · Touch failed",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 3.4,
+        "position": [
+          3040,
+          -60
+        ]
       }
     ],
     "connections": {
@@ -891,7 +1042,7 @@
         "main": [
           [
             {
-              "node": "Prompt · Build LLM request",
+              "node": "Lookup · Stored content hash",
               "type": "main",
               "index": 0
             }
@@ -1053,6 +1204,69 @@
           [
             {
               "node": "Mark · Groq call failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Lookup · Stored content hash": {
+        "main": [
+          [
+            {
+              "node": "Tag · Content unchanged",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Tag · Content unchanged": {
+        "main": [
+          [
+            {
+              "node": "Check · Content changed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Check · Content changed": {
+        "main": [
+          [
+            {
+              "node": "Prompt · Build LLM request",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Touch · last_seen_at + crawl_runs (unchanged)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Touch · last_seen_at + crawl_runs (unchanged)": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Mark · Touch failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Mark · Touch failed": {
+        "main": [
+          [
+            {
+              "node": "Log · crawl_runs failure",
               "type": "main",
               "index": 0
             }

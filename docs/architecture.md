@@ -119,7 +119,9 @@ flowchart TB
    table and upserts `users` in one transaction. A redelivered chunk finds its ledger row and exits.
 4. The invocation whose conditional `loading → processed` UPDATE returns a row POSTs `{batch_id}` to Workflow B,
    exactly once per batch.
-5. Workflow B: Stage 1 SQL pre-filter, Stage 2 deterministic rules, Stage 3 cohort verdicts (cache first, Groq for
+5. Workflow A, on its own daily schedule, compares each lender page's criteria hash with `loan_products.content_hash`
+   and calls Groq (through the LLM Gateway) only for pages that changed.
+   Workflow B: Stage 1 SQL pre-filter, Stage 2 deterministic rules, Stage 3 cohort verdicts (cache first, Groq for
    misses only, through the LLM Gateway), then inserts `matches`, finalizes `pipeline_runs` and calls Workflow C.
 6. Workflow C composes emails, redirects every recipient to `TEST_INBOX_ALIASES`, aborts if any recipient is outside
    that list, then sends through SES unless `dry_run` is true, and marks `notified_at`.
@@ -132,7 +134,6 @@ These are not in the deployed system and are drawn nowhere above.
 
 | Item | Task | State |
 |---|---|---|
-| Crawl change detection (skip Groq when criteria text is unchanged) | T29 | TODO; Workflow A calls Groq for every site each run |
 | CloudWatch alarm on `ingest-dlq` depth | T21 | Built and drilled: alarm, batch marked `failed` on the 5th receive, `scripts/redrive_dlq.sh` |
 | Transactional outbox for the n8n trigger | n/a | Production upgrade; `scripts/retrigger_batch.sh` is the recovery path |
 | API Gateway in front of the Function URLs, Multi-AZ RDS, Secrets Manager | n/a | Production upgrades only |

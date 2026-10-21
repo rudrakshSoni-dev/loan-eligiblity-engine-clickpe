@@ -78,7 +78,7 @@ Why the live upload will show zeros: re-uploading the identical file is a no-op 
 >
 > `Upsert · loan_products + crawl_runs` is one statement. Products are never deleted: after three failed crawls a product goes inactive, and the next good crawl brings it back.
 
-**Honesty line, say it here or in segment 8:** Workflow A calls Groq for every site on every run. Change detection, which would skip unchanged pages, is designed but not built.
+**Change detection (built, T29):** `Lookup · Stored content hash` → `Check · Content changed`. Unchanged pages go to `Touch` and make no Groq call; show `crawl_runs` with `changed = f, llm_calls = 0`. **Honesty line:** the hash covers the criteria text only, so a changed prompt does not re-structure an unchanged page.
 
 ---
 
@@ -148,7 +148,7 @@ Why the live upload will show zeros: re-uploading the identical file is a no-op 
 
 **Screen:** README, "Limitations" section.
 
-> Plainly: ingestion, the three workflows, the funnel, the guard and the failure drills are built and measured. Designed but not built: change detection and the cost table. I have measured up to a hundred thousand users.
+> Plainly: ingestion, the three workflows, the funnel, the guard and the failure drills are built and measured. Designed but not built: the cost table. I have measured up to a hundred thousand users.
 >
 > Deliberate trade-offs: Sydney, because the account is locked there; Function URLs instead of API Gateway; a single-AZ database to stay on the cheap tier. The README has every command and every number.
 
@@ -185,5 +185,5 @@ Every number in the narration comes from a recorded run. If any of them changes,
 - No cold-cache figure for 100,000 users (only the warm-cache run in `scripts/benchmark.md` exists), and nothing beyond 100,000 users.
 - No dollar costs (T46 not written).
 - No "security review done" (T45 not run).
-- No "change detection" as built (T29). The LLM Gateway is built (T26); its 429 wait was seen live, but the 20b fallback only in a throwaway drill copy, so do not say a production run fell back. The error workflow is built (T25); do not say it catches errors a workflow handles itself. The DLQ alarm is built (T21) but has no notification target.
+- Change detection (T29) is built; do not say it re-runs when the prompt changes. The LLM Gateway is built (T26); its 429 wait was seen live, but the 20b fallback only in a throwaway drill copy, so do not say a production run fell back. The error workflow is built (T25); do not say it catches errors a workflow handles itself. The DLQ alarm is built (T21) but has no notification target.
 - No UI features beyond the deployed page: the grouped reject table and CSV download (T41) are built locally, not deployed.

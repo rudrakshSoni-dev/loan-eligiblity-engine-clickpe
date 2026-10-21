@@ -256,3 +256,8 @@ Live export after the restart: gateway nodes `bda6a353d43cbab7` / connections `1
 A run through the gateway can be read like any execution (see "Stage 3 (T35)"): the caller's execution shows the gateway's answer on `LLM · … (LLM Gateway)`, and each call is its own execution of `wfllmgateway01` (mode `integrated`) with one run of `Attempt`, `LLM · Groq chat completion`, `Read` and `Log` per attempt and one run of `Wait · Rate-limit backoff` per wait.
 
 Throwaway workflows from the T26 checks, all inactive and left in the n8n database until they are deleted in the editor: drivers `t26driver0001` to `t26driver0004` (Manual Trigger → Code with the requests → Execute Workflow, mode each) and two copies of the gateway, `t26gwdrill0001` (no 429 waits, to force the fallback) and `t26gwdrill0002` (Groq JSON mode instead of the strict schema, to force a malformed reply). The copies were published for the drills, unpublished afterwards, and n8n was restarted.
+
+
+## Change detection (T29)
+
+No migration and no new credential. Workflow A (27 nodes) was imported and run with the T28 commands; the new nodes use `rds-postgres`. A scratch helper read the newest execution's per-node output counts from `database.sqlite` (read-only, `flatted` decode as in "Stage 3 (T35)"). To force one lender through the LLM again: `UPDATE loan_products SET content_hash = repeat('0', 64) WHERE id = <id> AND NOT is_seed` via `scripts/rds_query.sh`, then run A; the next upsert restores the real hash.

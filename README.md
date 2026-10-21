@@ -250,7 +250,7 @@ A NAT Gateway and interface endpoints cost money for no benefit here. Lambdas th
 
 ### Crawling strategy
 
-Three lenders are crawled with a plain GET from the n8n instance's own IP: ICICI, HDFC and IDFC FIRST. BankBazaar is a disabled spare. Each page's robots.txt was parsed per path and allows it. Every bank now redirects to a `bank.in` domain, so the site list stores final URLs. One CSS selector per site only narrows the page to the eligibility region; a text-anchored normaliser decides what counts as a criterion, and a redesign that breaks a selector produces `no_criteria_found` instead of a silent empty result. Kotak was rejected because its static HTML has no income, age or score criteria. Per-site failure branches mean one dead site never stops the others (drill: HDFC unreachable, ICICI and IDFC FIRST still upserted). Products are never deleted; after 3 consecutive failed crawls a product becomes inactive and is reactivated by the next good crawl.
+Three lenders are crawled with a plain GET from the n8n instance's own IP: ICICI, HDFC and IDFC FIRST. BankBazaar is a disabled spare. Each page's robots.txt was parsed per path and allows it. Every bank now redirects to a `bank.in` domain, so the site list stores final URLs. One CSS selector per site only narrows the page to the eligibility region; a text-anchored normaliser decides what counts as a criterion, and a redesign that breaks a selector produces `no_criteria_found` instead of a silent empty result. Kotak was rejected because its static HTML has no income, age or score criteria. Per-site failure branches mean one dead site never stops the others (drill: HDFC unreachable, ICICI and IDFC FIRST still upserted). Products are never deleted; after 3 consecutive failed crawls a product becomes inactive and is reactivated by the next good crawl. **Change detection (T29):** before any Groq call, Postgres compares the SHA-256 of the normalised criteria text with the stored `content_hash`; an unchanged page only bumps `last_seen_at` and logs `crawl_runs` with `changed = false, llm_calls = 0`. Measured on the instance: three unchanged lenders made 0 Groq calls (executions 131, 139), one forced change made exactly 1 (execution 133), and a failing lookup fell back to the LLM for all 3 instead of skipping them (execution 135).
 
 ### Optimization Treasure Hunt
 
@@ -323,7 +323,8 @@ Stated plainly, because these are known:
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
 - **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
 - **Built, not just designed (T26):** the LLM Gateway sub-workflow is the only caller of Groq. Drilled live: a real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out for 15 s and the retry answered; with waits disabled in a throwaway copy, a 429 switched to `gpt-oss-20b`, which answered; a reply that broke the schema was rejected. Workflow B no longer spaces Stage 3 requests 20 s apart; it waits only when Groq returns 429. A verdict produced by the 20b fallback is cached like any other.
-- **Designed, not implemented:** crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45).
+- **Designed, not implemented:** the cost table (T46) and the security review (T45).
+- **Change detection is keyed on the criteria text only (T29).** If the prompt or model changes, an unchanged page is not re-structured until its `content_hash` is cleared or the text changes.
 - **UI polish (T41) is built and tested locally but not deployed.** The deployed `batch-status` does not yet return the grouped reject report or the CSV download.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
@@ -333,7 +334,7 @@ Stated plainly, because these are known:
 
 ## Future work
 
-- Finish the designed items above, starting with crawl change detection.
+- Finish the designed items above, starting with the security review.
 - API Gateway with authentication and throttling in front of the Function URLs.
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.
