@@ -4,7 +4,6 @@ The nodes are read from the exported workflow JSON and chained as n8n chains the
 previous output, so a change made in the editor and exported is what the tests check.
 """
 
-import json
 import os
 import subprocess
 import uuid
@@ -18,147 +17,41 @@ from tests.workflow_b_helpers import (
     NODE_BINARY,
     add_product,
     new_batch,
-    node_query,
-    run_code_node,
     single_row,
 )
-from tests.workflow_c_helpers import WORKFLOW_C
+from tests.workflow_c_helpers import (
+    ALIASES,
+    CONFIG_VALIDATE_NODE,
+    FAIL_NODE,
+    FAIL_PARAMS,
+    FIRST_USER,
+    FOURTH_USER,
+    FROM_ADDRESS,
+    READ_BATCH_NODE,
+    RELEASE_NODE,
+    RELEASE_PARAMS,
+    SECOND_USER,
+    THIRD_USER,
+    add_match,
+    add_user_with_id,
+    batch_status,
+    build_emails,
+    claim,
+    code,
+    guard,
+    node_sql,
+    run_chain,
+    select_recipients,
+    set_config,
+    two_users_three_offers,
+    unnotified,
+    validated_config,
+)
 
 pytestmark = [
     pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set"),
     pytest.mark.skipif(NODE_BINARY is None, reason="node not installed"),
 ]
-
-READ_BATCH_NODE = "Check · Read batch_id"
-CONFIG_LOAD_NODE = "Config · Load settings"
-CONFIG_VALIDATE_NODE = "Config · Validate settings"
-CLAIM_NODE = "Claim · matched to notifying"
-SELECT_NODE = "Compose · Select recipients"
-BUILD_NODE = "Compose · Build emails"
-GUARD_NODE = "Guard · Recipients are test inboxes"
-RELEASE_NODE = "Release · notifying back to matched"
-FAIL_NODE = "Fail · Mark batch failed (Notify)"
-
-BATCH_PARAMS = {"$1": ":batch_id"}
-SELECT_PARAMS = {"$1": ":batch_id", "$2": ":max_emails"}
-RELEASE_PARAMS = {"$1": ":batch_id", "$2": ":composed", "$3": ":waiting", "$4": ":dry_run"}
-FAIL_PARAMS = {"$1": ":batch_id", "$2": ":message"}
-
-ALIASES = ["mrrssoni12@gmail.com", "mrrssoni12+one@gmail.com", "mrrssoni12+two@gmail.com"]
-FIRST_USER = uuid.UUID("00000000-0000-4000-8000-000000000001")
-SECOND_USER = uuid.UUID("00000001-0000-4000-8000-000000000001")
-THIRD_USER = uuid.UUID("00000002-0000-4000-8000-000000000001")
-FOURTH_USER = uuid.UUID("00000003-0000-4000-8000-000000000001")
-
-
-def node_sql(name: str, placeholders: dict[str, str]) -> str:
-    return node_query(name, placeholders, WORKFLOW_C)
-
-
-def code(name: str, item: Any, nodes: dict[str, list[dict[str, Any]]] | None = None) -> Any:
-    return run_code_node(name, item, nodes, WORKFLOW_C)
-
-
-def set_config(conn: Any, key: str, value: Any) -> None:
-    conn.run(
-        "UPDATE app_config SET value = CAST(:value AS jsonb) WHERE key = :key",
-        key=key,
-        value=json.dumps(value),
-    )
-
-
-def validated_config(conn: Any, batch_id: uuid.UUID) -> dict[str, Any]:
-    loaded = single_row(conn, conn.run(node_sql(CONFIG_LOAD_NODE, {})))
-    output = code(CONFIG_VALIDATE_NODE, loaded, {READ_BATCH_NODE: [{"batch_id": str(batch_id)}]})
-    config: dict[str, Any] = output[0]["json"]
-    return config
-
-
-def add_user_with_id(
-    conn: Any, batch_id: uuid.UUID, user_id: uuid.UUID, name: str, email: str
-) -> None:
-    conn.run(
-        "INSERT INTO users (user_id, name, email, monthly_income, credit_score,"
-        " employment_status, age, batch_id) VALUES (:id, :name, :email, 50000, 720,"
-        " 'Salaried', 30, :batch)",
-        id=user_id,
-        name=name,
-        email=email,
-        batch=batch_id,
-    )
-
-
-def add_match(
-    conn: Any,
-    batch_id: uuid.UUID,
-    user_id: uuid.UUID,
-    product_id: int,
-    reason: str = "meets every published criterion",
-    notified: bool = False,
-) -> None:
-    conn.run(
-        "INSERT INTO matches (user_id, product_id, stage, reason, batch_id, notified_at)"
-        " VALUES (:u, :p, 'rules', :reason, :b, CASE WHEN :notified THEN now() END)",
-        u=user_id,
-        p=product_id,
-        reason=reason,
-        b=batch_id,
-        notified=notified,
-    )
-
-
-def claim(conn: Any, batch_id: uuid.UUID) -> dict[str, Any]:
-    return single_row(conn, conn.run(node_sql(CLAIM_NODE, BATCH_PARAMS), batch_id=batch_id))
-
-
-def select_recipients(conn: Any, batch_id: uuid.UUID, max_emails: int = 5) -> dict[str, Any]:
-    rows = conn.run(node_sql(SELECT_NODE, SELECT_PARAMS), batch_id=batch_id, max_emails=max_emails)
-    return single_row(conn, rows)
-
-
-def build_emails(conn: Any, batch_id: uuid.UUID, selected: dict[str, Any]) -> dict[str, Any]:
-    config = validated_config(conn, batch_id)
-    output = code(BUILD_NODE, selected, {CONFIG_VALIDATE_NODE: [config]})
-    built: dict[str, Any] = output[0]["json"]
-    return built
-
-
-def guard(
-    conn: Any, batch_id: uuid.UUID, built: dict[str, Any], config: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    settings = config if config is not None else validated_config(conn, batch_id)
-    output = code(GUARD_NODE, built, {CONFIG_VALIDATE_NODE: [settings]})
-    guarded: dict[str, Any] = output[0]["json"]
-    return guarded
-
-
-def release(conn: Any, batch_id: uuid.UUID, guarded: dict[str, Any]) -> dict[str, Any]:
-    rows = conn.run(
-        node_sql(RELEASE_NODE, RELEASE_PARAMS),
-        batch_id=batch_id,
-        composed=len(guarded["emails"]),
-        waiting=guarded["users_waiting"],
-        dry_run=guarded["dry_run"],
-    )
-    return single_row(conn, rows)
-
-
-def run_chain(conn: Any, batch_id: uuid.UUID, max_emails: int = 5) -> dict[str, Any]:
-    assert claim(conn, batch_id)["claimed"] == 1
-    selected = select_recipients(conn, batch_id, max_emails)
-    guarded = guard(conn, batch_id, build_emails(conn, batch_id, selected))
-    return {**guarded, "released": release(conn, batch_id, guarded)}
-
-
-def batch_status(conn: Any, batch_id: uuid.UUID) -> str:
-    return str(conn.run("SELECT status FROM upload_batches WHERE id = :id", id=batch_id)[0][0])
-
-
-def unnotified(conn: Any, batch_id: uuid.UUID) -> int:
-    rows = conn.run(
-        "SELECT count(*) FROM matches WHERE batch_id = :id AND notified_at IS NULL", id=batch_id
-    )
-    return int(rows[0][0])
 
 
 @pytest.fixture
@@ -171,24 +64,6 @@ def matched_batch(conn: Any) -> uuid.UUID:
     return new_batch(conn, "matched")
 
 
-def two_users_three_offers(conn: Any, batch_id: uuid.UUID) -> dict[str, int]:
-    cheap = add_product(
-        conn,
-        "Cheap Loan",
-        interest_rate_min=10.5,
-        interest_rate_max=14,
-        source_url="https://bank.example/cheap",
-    )
-    dear = add_product(conn, "Dear Loan", interest_rate_min=12, interest_rate_max=12)
-    other = add_product(conn, "Other Loan", interest_rate_min=11, interest_rate_max=18)
-    add_user_with_id(conn, batch_id, FIRST_USER, "Asha Rao", "asha@example.invalid")
-    add_user_with_id(conn, batch_id, SECOND_USER, "Ben Roy", "ben@example.invalid")
-    add_match(conn, batch_id, FIRST_USER, dear)
-    add_match(conn, batch_id, FIRST_USER, cheap)
-    add_match(conn, batch_id, SECOND_USER, other)
-    return {"cheap": cheap, "dear": dear, "other": other}
-
-
 def test_migration_seeds_safe_defaults(conn: Any, matched_batch: uuid.UUID) -> None:
     config = validated_config(conn, matched_batch)
     assert config == {
@@ -196,6 +71,7 @@ def test_migration_seeds_safe_defaults(conn: Any, matched_batch: uuid.UUID) -> N
         "dry_run": True,
         "aliases": ALIASES,
         "max_emails": 5,
+        "from_address": FROM_ADDRESS,
     }
 
 
@@ -211,6 +87,10 @@ def test_migration_seeds_safe_defaults(conn: Any, matched_batch: uuid.UUID) -> N
         ("max_emails_per_run", 10000),
         ("test_inbox_aliases", []),
         ("test_inbox_aliases", "a@b.co"),
+        ("from_address", 5),
+        ("from_address", ["a@b.co"]),
+        ("from_address", "not an email"),
+        ("from_address", "a@b.co, c@d.co"),
     ],
 )
 def test_app_config_check_rejects_malformed_values(conn: Any, key: str, value: Any) -> None:
@@ -222,6 +102,7 @@ def test_app_config_accepts_valid_values_and_refuses_unknown_keys(conn: Any) -> 
     set_config(conn, "dry_run", False)
     set_config(conn, "max_emails_per_run", 9999)
     set_config(conn, "test_inbox_aliases", ["only@example.com"])
+    set_config(conn, "from_address", "sender@example.com")
     with pytest.raises(DatabaseError, match="check constraint"):
         conn.run(
             "INSERT INTO app_config (key, value, description) VALUES ('send_to_real', 'true', 'x')"
@@ -255,6 +136,19 @@ def test_app_config_updated_at_moves_on_change(conn: Any) -> None:
         ),
         ({"dry_run": True, "test_inbox_aliases": ALIASES, "max_emails_per_run": 0}, "max_emails"),
         ({"dry_run": True, "test_inbox_aliases": ALIASES, "max_emails_per_run": "5"}, "max_emails"),
+        (
+            {"dry_run": True, "test_inbox_aliases": ALIASES, "max_emails_per_run": 5},
+            "from_address must be one email address",
+        ),
+        (
+            {
+                "dry_run": True,
+                "test_inbox_aliases": ALIASES,
+                "max_emails_per_run": 5,
+                "from_address": "a@b.co,c@d.co",
+            },
+            "from_address",
+        ),
     ],
 )
 def test_validate_node_fails_closed_on_missing_or_malformed_settings(
@@ -275,9 +169,11 @@ def test_validate_node_normalises_and_deduplicates_aliases() -> None:
         "dry_run": False,
         "test_inbox_aliases": [" A@Example.com ", "a@example.com", "b@example.com"],
         "max_emails_per_run": 3,
+        "from_address": " sender@example.com ",
     }
     output = code(CONFIG_VALIDATE_NODE, {"config": config}, {READ_BATCH_NODE: [{"batch_id": "b"}]})
     assert output[0]["json"]["aliases"] == ["a@example.com", "b@example.com"]
+    assert output[0]["json"]["from_address"] == "sender@example.com"
 
 
 @pytest.mark.parametrize("value", [None, "", "not-a-uuid", "9d278e88-0000-0000-0000-00000000000g"])
@@ -397,9 +293,11 @@ def test_build_redirects_every_user_to_a_test_inbox_deterministically(
 def test_build_writes_subject_text_and_html_for_one_user(
     conn: Any, matched_batch: uuid.UUID
 ) -> None:
-    two_users_three_offers(conn, matched_batch)
+    products = two_users_three_offers(conn, matched_batch)
     built = build_emails(conn, matched_batch, select_recipients(conn, matched_batch))
     asha, ben = built["emails"]
+    assert asha["product_ids"] == [products["cheap"], products["dear"]]
+    assert ben["product_ids"] == [products["other"]]
     assert asha["subject"] == "[TEST] 2 personal loan options you may qualify for"
     assert ben["subject"] == "[TEST] 1 personal loan option you may qualify for"
     assert asha["offer_count"] == 2
