@@ -236,3 +236,23 @@ docker exec n8n n8n list:workflow --active=true      # B, C and E must be listed
 ```
 
 A and B/C were re-imported with only the `errorWorkflow` setting changed. The drill workflow `t25drill000001` (path `t25-error-drill`) was unpublished and answers 404; like the earlier probes it stays inactive in the n8n database until it is deleted in the editor. Read the stored failures with `scripts/rds_query.sh "SELECT * FROM n8n_errors ORDER BY id DESC LIMIT 5"`.
+
+## LLM Gateway (T26)
+
+`G · LLM Gateway` (`wfllmgateway01`) is a sub-workflow called by A and B; like C it must be published, not just imported. No migration and no new credential: it uses `groq-api` and `rds-postgres`. The three changed files were sent as one gzipped tar through SSM Run Command (remote SHA-256 equal to the local files) and imported gateway first, because A and B refer to it by id:
+
+```bash
+docker exec n8n n8n import:workflow --input=/tmp/t26wf/workflow-g-llm-gateway.json
+docker exec n8n n8n publish:workflow --id=wfllmgateway01
+docker exec n8n n8n import:workflow --input=/tmp/t26wf/workflow-a-product-discovery.json
+docker exec n8n n8n import:workflow --input=/tmp/t26wf/workflow-b-matching.json
+docker exec n8n n8n publish:workflow --id=wfbmatching001
+cd /opt/clickpe/n8n && docker compose restart n8n
+docker exec n8n n8n list:workflow --active=true      # B, C, E and wfllmgateway01
+```
+
+Live export after the restart: gateway nodes `bda6a353d43cbab7` / connections `18b277e7ee75f11e`, A `272d31f6973e207f` / `abf5330570d91d55`, B `995d290e08b303c7` / `720b5a436bf42f47`, each identical to the repo file (SHA-256 of the name-sorted nodes and of the connections, first 16 hex).
+
+A run through the gateway can be read like any execution (see "Stage 3 (T35)"): the caller's execution shows the gateway's answer on `LLM · … (LLM Gateway)`, and each call is its own execution of `wfllmgateway01` (mode `integrated`) with one run of `Attempt`, `LLM · Groq chat completion`, `Read` and `Log` per attempt and one run of `Wait · Rate-limit backoff` per wait.
+
+Throwaway workflows from the T26 checks, all inactive and left in the n8n database until they are deleted in the editor: drivers `t26driver0001` to `t26driver0004` (Manual Trigger → Code with the requests → Execute Workflow, mode each) and two copies of the gateway, `t26gwdrill0001` (no 429 waits, to force the fallback) and `t26gwdrill0002` (Groq JSON mode instead of the strict schema, to force a malformed reply). The copies were published for the drills, unpublished afterwards, and n8n was restarted.

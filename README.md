@@ -62,6 +62,8 @@ flowchart TB
                 wfA["Workflow A<br/>Product discovery"]
                 wfB["Workflow B<br/>Matching"]
                 wfC["Workflow C<br/>Notification"]
+                wfE["Workflow E<br/>Error handler"]
+                wfG["Workflow G<br/>LLM Gateway (sub-workflow)"]
             end
         end
     end
@@ -83,13 +85,21 @@ flowchart TB
     status -- "read-only counts, funnel" --> rds
 
     wfA -- "daily 06:00 IST crawl" --> lenders
-    wfA -- "structure criteria" --> groq
-    wfA -- "upsert loan_products, crawl_runs, llm_calls" --> rds
+    wfA -- "Execute Workflow: structure criteria" --> wfG
+    wfA -- "upsert loan_products, crawl_runs" --> rds
     wfB -- "Stage 1 SQL, Stage 2 rules, Stage 3 cohorts" --> rds
-    wfB -- "borderline cohorts only" --> groq
+    wfB -- "Execute Workflow: uncached cohorts only" --> wfG
+    wfG -- "strict schema; 429: retry-after wait, then 20b fallback" --> groq
+    wfG -- "24 h budget read, one llm_calls row per attempt" --> rds
     wfB -- "Execute Workflow" --> wfC
     wfC -- "matches, app_config" --> rds
     wfC -- "AssumeRole clickpe-n8n-ses-role" --> ses
+    wfA -. "Error Workflow" .-> wfE
+    wfB -. "Error Workflow" .-> wfE
+    wfC -. "Error Workflow" .-> wfE
+    wfG -. "Error Workflow" .-> wfE
+    wfE -- "n8n_errors row" --> rds
+    wfE -- "one alert email, test alias" --> ses
     ses -- "redirected recipients only" --> inbox
     admin -- "port forward 5678" --> ssm
     ssm -.-> ec2
@@ -187,11 +197,13 @@ Browse to `http://localhost:5678`, create the owner account and enable 2FA under
 
 The public API is off, so workflows are imported with the n8n CLI inside the container through SSM Run Command. The exact commands for import, publish and restart are in [infra/n8n.md](infra/n8n.md) ("Importing and running a workflow", "Publishing Workflow B", "Workflow C"). Order matters:
 
-1. Import and publish Workflow C (`wfcnotification01`), because B calls it by id and a callee must be published.
-2. Import and publish Workflow B (`wfbmatching001`), then restart n8n so the webhook is registered.
-3. Import Workflow A (`wfaproductdisc01`). It runs daily at 06:00 IST, or on demand with `n8n execute`.
+1. Import and publish Workflow E (`wferrorhandler01`), because the others name it as their Error Workflow and n8n skips one that is not published.
+2. Import and publish the LLM Gateway (`wfllmgateway01`), because A and B call it by id and a callee must be published.
+3. Import and publish Workflow C (`wfcnotification01`), because B calls it by id.
+4. Import and publish Workflow B (`wfbmatching001`), then restart n8n so the webhook is registered.
+5. Import Workflow A (`wfaproductdisc01`). It runs daily at 06:00 IST, or on demand with `n8n execute`.
 
-`docker exec n8n n8n list:workflow --active=true` must list B and C.
+`docker exec n8n n8n list:workflow --active=true` must list B, C, E and the LLM Gateway.
 
 To prove the exported files load into a clean n8n without touching your instance:
 
@@ -249,7 +261,7 @@ So the engine spends tokens only on what columns cannot express:
 1. **LLM at ingest, not at match time.** Workflow A structures a product's criteria once, with a strict JSON schema (`temperature 0`, `reasoning_effort low`).
 2. **Stage 1, SQL.** One set-based `INSERT … SELECT` pairs users and active products on the hard criteria (NULL means no limit) and keeps near misses within 5% of an income or score threshold. Pairs stay in Postgres.
 3. **Stage 2, rules.** An indicative EMI check (₹5,00,000 over 60 months at the published rate, capped at 65% of income, a figure BankBazaar publishes) and a classifier set in SQL: `clear_match`, `clear_reject` or `borderline`. Products with `parse_confidence` of at least 0.70 resolve borderline pairs without an LLM.
-4. **Stage 3, cohorts.** Borderline pairs are grouped by product, borderline reason, employment and a coarse band of the triggering feature, not by raw values, which would give 1,028 to 5,528 cohorts per product on this data (measured). One strict-schema request per product.
+4. **Stage 3, cohorts.** Borderline pairs are grouped by product, borderline reason, employment and a coarse band of the triggering feature, not by raw values, which would give 1,028 to 5,528 cohorts per product on this data (measured). One strict-schema request per product. Every Groq call in the system goes through one LLM Gateway sub-workflow, which checks the answer against the schema, waits out a 429 for Groq's `retry-after` (at most 60 s, 3 times), then falls back to `gpt-oss-20b`, refuses calls the 24 h budget cannot cover, and writes one `llm_calls` row per attempt.
 5. **Cache.** `cohort_verdicts` is keyed by cohort and the product's content hash, so a product change invalidates its verdicts and a re-upload costs zero calls.
 6. **Budget guard.** Pairs left when the token or call budget is spent are recorded as `unresolved_budget`, never guessed.
 
@@ -300,7 +312,7 @@ docker run -d --rm --name pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
 TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 TEST_DB_PASSWORD=test make check
 ```
 
-Result of the last run: `All checks passed!`, `80 files already formatted`, `Success: no issues found in 65 source files`, **`506 passed`** and **100.00% coverage** of `lambdas/shared`. Without a database, `329 passed, 177 skipped` and 99.82%.
+Result of the last run: `All checks passed!`, `96 files already formatted`, `Success: no issues found in 79 source files`, **`618 passed`** and **100.00% coverage** of `lambdas/shared`. Without a database, `425 passed, 193 skipped` and 99.82%.
 
 The SQL and Code nodes inside the exported workflows are tested where they live: the exported SQL runs on PostgreSQL 16 and the exported Code nodes run under Node.js inside pytest. Mutation probes (weakening a guard on purpose) were run for the critical paths, and each one failed at least one test.
 
@@ -310,7 +322,8 @@ Stated plainly, because these are known:
 
 - **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
 - **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
-- **Designed, not implemented:** the reusable Groq "LLM Gateway" sub-workflow (T26, so Workflows A and B call Groq with their own HTTP Request nodes), crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45).
+- **Built, not just designed (T26):** the LLM Gateway sub-workflow is the only caller of Groq. Drilled live: a real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out for 15 s and the retry answered; with waits disabled in a throwaway copy, a 429 switched to `gpt-oss-20b`, which answered; a reply that broke the schema was rejected. Workflow B no longer spaces Stage 3 requests 20 s apart; it waits only when Groq returns 429. A verdict produced by the 20b fallback is cached like any other.
+- **Designed, not implemented:** crawl change detection (T29, so Workflow A calls Groq for every site each run), the cost table (T46), and the security review (T45).
 - **UI polish (T41) is built and tested locally but not deployed.** The deployed `batch-status` does not yet return the grouped reject report or the CSV download.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
@@ -320,7 +333,7 @@ Stated plainly, because these are known:
 
 ## Future work
 
-- Finish the designed items above, starting with the LLM Gateway.
+- Finish the designed items above, starting with crawl change detection.
 - API Gateway with authentication and throttling in front of the Function URLs.
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.

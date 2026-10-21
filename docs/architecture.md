@@ -48,6 +48,7 @@ flowchart TB
                 wfB["Workflow B<br/>Matching"]
                 wfC["Workflow C<br/>Notification"]
                 wfE["Workflow E<br/>Error handler"]
+                wfG["Workflow G<br/>LLM Gateway (sub-workflow)"]
             end
         end
     end
@@ -69,16 +70,19 @@ flowchart TB
     status -- "read-only counts, funnel" --> rds
 
     wfA -- "daily 06:00 IST crawl" --> lenders
-    wfA -- "structure criteria" --> groq
-    wfA -- "upsert loan_products, crawl_runs, llm_calls" --> rds
+    wfA -- "Execute Workflow: structure criteria" --> wfG
+    wfA -- "upsert loan_products, crawl_runs" --> rds
     wfB -- "Stage 1 SQL, Stage 2 rules, Stage 3 cohorts" --> rds
-    wfB -- "borderline cohorts only" --> groq
+    wfB -- "Execute Workflow: uncached cohorts only" --> wfG
+    wfG -- "strict schema; 429: retry-after wait, then 20b fallback" --> groq
+    wfG -- "24 h budget read, one llm_calls row per attempt" --> rds
     wfB -- "Execute Workflow" --> wfC
     wfC -- "matches, app_config" --> rds
     wfC -- "AssumeRole clickpe-n8n-ses-role" --> ses
     wfA -. "Error Workflow" .-> wfE
     wfB -. "Error Workflow" .-> wfE
     wfC -. "Error Workflow" .-> wfE
+    wfG -. "Error Workflow" .-> wfE
     wfE -- "n8n_errors row" --> rds
     wfE -- "one alert email, test alias" --> ses
     ses -- "redirected recipients only" --> inbox
@@ -116,10 +120,10 @@ flowchart TB
 4. The invocation whose conditional `loading → processed` UPDATE returns a row POSTs `{batch_id}` to Workflow B,
    exactly once per batch.
 5. Workflow B: Stage 1 SQL pre-filter, Stage 2 deterministic rules, Stage 3 cohort verdicts (cache first, Groq for
-   misses only), then inserts `matches`, finalizes `pipeline_runs` and calls Workflow C.
+   misses only, through the LLM Gateway), then inserts `matches`, finalizes `pipeline_runs` and calls Workflow C.
 6. Workflow C composes emails, redirects every recipient to `TEST_INBOX_ALIASES`, aborts if any recipient is outside
    that list, then sends through SES unless `dry_run` is true, and marks `notified_at`.
-7. If A, B or C fails an automatic execution, n8n starts Workflow E, which stores an `n8n_errors` row and sends one
+7. If A, B, C or the LLM Gateway fails an automatic execution, n8n starts Workflow E, which stores an `n8n_errors` row and sends one
    alert email to the first test alias.
 
 ## Designed, not implemented
@@ -128,7 +132,6 @@ These are not in the deployed system and are drawn nowhere above.
 
 | Item | Task | State |
 |---|---|---|
-| Reusable Groq "LLM Gateway" sub-workflow | T26 | TODO; A and B call Groq with their own HTTP Request nodes |
 | Crawl change detection (skip Groq when criteria text is unchanged) | T29 | TODO; Workflow A calls Groq for every site each run |
 | CloudWatch alarm on `ingest-dlq` depth | T21 | Built and drilled: alarm, batch marked `failed` on the 5th receive, `scripts/redrive_dlq.sh` |
 | Transactional outbox for the n8n trigger | n/a | Production upgrade; `scripts/retrigger_batch.sh` is the recovery path |
