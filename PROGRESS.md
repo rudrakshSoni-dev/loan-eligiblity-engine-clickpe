@@ -22,15 +22,15 @@
 | T18 | P0 | load-chunk Lambda (inside VPC) | DONE | 2026-10-21 | 10,000 rows in 2 chunks → 10,000 users; identical re-upload 0 inserted / 0 updated; redelivery no-op; ranged GET + IfMatch checked on real S3; shared coverage 100% with DB |
 | T19 | P0 | Completion → n8n trigger | DONE | 2026-10-21 | Only the `try_complete` winner POSTs (5 s, 3 attempts); live: 4 batches → 4 POSTs, 4 n8n executions, 5 losing checks per 6-chunk batch; n8n-down drill → `webhook_failed`, retrigger script → 200; local race 100 deliveries → 10 POSTs, mutation → 2–4 per batch |
 | T20 | P0 | batch-status Lambda | DONE | 2026-10-21 | GET ?batch_id= → counters, first 5 rejects, match/notified counts, latest funnel (NULL = not measured); 400/404/405/503; 5 DB tests on PG16; shared coverage 100% |
-| T21 | P1 | DLQ handling + alarm | SKIPPED (optional, dropped by user 2026-10-21) |  |
+| T21 | P1 | DLQ handling + alarm | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
 | T23 | P0 | docker-compose | DONE | 2026-10-21 | n8n 2.44.4 healthy on EC2; editor only via SSM tunnel (200), public IP times out; webhook allowlist 200 inside / 403 outside; owner account + 2FA still to be created in browser |
 | T24 | P0 | n8n credentials | DONE | 2026-10-21 | 4 credentials; Postgres (verified TLS via mounted RDS CA) and AWS Assume Role (system credentials, SES-only role, no static keys) tests green |
-| T25 | P1 | Workflow E — global error handler | SKIPPED (optional, dropped by user 2026-10-21) |  |
-| T26 | P1 | Groq sub-workflow (LLM Gateway) | SKIPPED (optional, dropped by user 2026-10-21) |  |
+| T25 | P1 | Workflow E — global error handler | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T27 | P0 | Crawl targets ⚖️ | DONE | 2026-10-21 | ICICI, HDFC, IDFC FIRST primary + BankBazaar spare; criteria in static HTML from the EC2 IP; robots allow all 4 paths; banks moved to `bank.in` (301) |
 | T28 | P0 | Workflow A: fetch + extract | DONE | 2026-10-21 | 3 lenders HTTP 200 → 13 / 18 / 6 criteria lines; spare + 404 + DNS failure variant: 4 extracted, 2 routed to the failure branch; imported and run on EC2 via the n8n CLI |
-| T29 | P1 | Workflow A: change detection | SKIPPED (optional, dropped by user 2026-10-21) |  |
+| T29 | P1 | Workflow A: change detection | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T30 | P0 | Workflow A: structuring via LLM Gateway | DONE | 2026-10-21 | Direct Groq call (T26 not built); 3 lenders structured; drills: 401, 400, forced bad 200 rejected (7 reasons), real 429; every failure in `crawl_runs`, every call in `llm_calls`; Retry On Fail re-ran an INSERT 3× → removed |
 | T31 | P0 | Workflow A: upsert + lifecycle | DONE | 2026-10-21 | One statement upserts `loan_products` and logs the `ok` run; re-run → same ids, 0 changed; 404 + forced DB error don't stop other sites; 3 failed runs → `active=false`, next good run reactivates; found and fixed 2 n8n behaviours (batching aborts siblings, Merge doesn't wait) |
 | T32 | P0 | Workflow B: webhook + run setup | DONE | 2026-10-21 | Header-auth webhook + allowlist; one statement claims `processed → matching`, counts pairs, inserts `pipeline_runs`; live Lambda trigger → 202, replay 409, forced DB error 500 (drill found and fixed a swallowed-error bug) |
@@ -38,16 +38,16 @@
 | T34 | P0 | Workflow B: Stage 2 deterministic rules ⚖️ | DONE | 2026-10-21 | Live on the 10k sample: 14,165 candidates → 10,405 clear match / 1,539 clear reject / 2,221 borderline in 625 ms; independent check agrees on all 14,165; EMI rule 0 rejects (break-even 30.24% p.a.); idempotent re-run; forced-error drill → batch `failed` |
 | T35 | P0 | Workflow B: Stage 3 cohort LLM evaluation ⚖️ | DONE | 2026-10-21 | Live on the 10k sample: 2,221 borderline pairs → 20 cohorts → 2 Groq calls, 3,655 tokens → 1,436 eligible / 785 not eligible; next run 20/20 cache hits, 0 calls; budget drill 2,221 `unresolved_budget`, 0 calls; forced error → `failed`; found stale planner statistics (Form 16 s → 168 ms with `ANALYZE`) |
 | T36 | P0 | Workflow B: persist + metrics + chain | DONE | 2026-10-21 | Live on the 10k sample: 30,000 → 14,165 → 10,405 / 1,539 / 2,221 → 20 cohorts → 1,436 / 785 → **11,841 matches** (6,017 users), batch `matched`; re-run inserts 0, 0 LLM calls; CHECK ties `final_matches` to Stage 2 + 3; Workflow C hand-off deferred to T38 (C does not exist) |
-| T37 | P1 | Benchmark at scale | SKIPPED (optional, dropped by user 2026-10-21) |  |
+| T37 | P1 | Benchmark at scale | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T38 | P0 | Workflow C: compose + recipient guard | DONE | 2026-10-21 | Live: 5 of 6,017 waiting users composed, guard checked 5, batch back to `matched`; drill with the original address → guard blocks 2 of 2, batch `failed`, execution `error`; B → C hand-off verified; nothing sent (sending is T39) |
 | T39 | P0 | Workflow C: send + mark notified | DONE | 2026-10-21 | Live: real sample batch, cap 5 → 5 SES message ids, 10 matches marked, 6,012 still waiting, batch `notified`; reset + rerun → 0 sent; unverified-sender drill → 403, batch `failed`, nothing marked; dry run → 0 sent; delivered to the Gmail test mailbox but filed in **Spam**; 477 passed, 17/17 mutation probes caught |
 | T40 | P0 | Upload page | DONE | 2026-10-21 |  |
 | T41 | P2 | UI polish | BLOCKED (live deploy pending: `sls deploy` was denied by the permission classifier; the user runs it, then the live check) | 2026-10-21 | Rejects grouped by problem, CSV download (spreadsheet-safe, capped at 2,000 rows), System/Light/Dark switch; 506 passed, coverage 100%, 6 mutation probes caught; verified in headless Chrome against the real handler on local PG16 |
 | T42 | P0 | End-to-end run | DONE | 2026-10-21 | Fresh state, real 10,000-row CSV uploaded from the user's browser → batch `notified` in 41.5 s: 2 chunks, 10,000 users, 30,000 → 14,165 → 10,405 / 2,221 / 1,539 → 20 cohorts → 2 Groq calls (3,536 tokens) → 11,841 matches; 5 SES emails, 10 matches notified; received in Gmail (Spam) |
 | T43 | P0 | Idempotency + failure drills | TODO | |  |
-| T44 | P1 | Test coverage pass | SKIPPED (optional, dropped by user 2026-10-21) |  |
-| T45 | P1 | Security review | SKIPPED (optional, dropped by user 2026-10-21) |  |
-| T46 | P1 | Cost table | SKIPPED (optional, dropped by user 2026-10-21) |  |
+| T44 | P1 | Test coverage pass | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T45 | P1 | Security review | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T46 | P1 | Cost table | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T47 | P0 | Export workflows | TODO | |  |
 | T48 | P0 | Architecture diagram | TODO | |  |
 | T49 | P0 | README | TODO | |  |
