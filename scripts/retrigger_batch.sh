@@ -8,6 +8,15 @@ SECRET_PARAMETER=/clickpe/n8n/webhook_secret
 URL_PARAMETER=/clickpe/n8n/webhook_url
 UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 WAIT_ATTEMPTS=30
+TOKEN_TTL_SECONDS=60
+MINT_TOKEN_PY="import base64, hashlib, hmac, json, os, sys, time
+b64 = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b\"=\").decode()
+pack = lambda value: b64(json.dumps(value, separators=(\",\", \":\"), sort_keys=True).encode())
+now = int(time.time())
+claims = {\"iss\": \"clickpe-retrigger\", \"batch_id\": sys.argv[1], \"iat\": now, \"exp\": now + ${TOKEN_TTL_SECONDS}}
+signing_input = pack({\"alg\": \"HS256\", \"typ\": \"JWT\"}) + \".\" + pack(claims)
+signature = hmac.new(os.environ[\"SIGNING_KEY\"].encode(), signing_input.encode(), hashlib.sha256).digest()
+print(\"Authorization: Bearer \" + signing_input + \".\" + b64(signature))"
 WAIT_SECONDS=2
 
 export AWS_PROFILE="${AWS_PROFILE:-clickpe}"
@@ -30,8 +39,8 @@ WEBHOOK_URL="$(aws ssm get-parameter --name "${URL_PARAMETER}" --query Parameter
 
 REMOTE_SCRIPT="$(cat <<EOF
 set -eu
-SECRET="\$(aws ssm get-parameter --region ${AWS_REGION} --name ${SECRET_PARAMETER} --with-decryption --query Parameter.Value --output text)"
-printf 'X-Webhook-Secret: %s\n' "\${SECRET}" | curl -sS -o /dev/null -w 'webhook HTTP %{http_code}\n' --max-time 5 -H @- -H 'Content-Type: application/json' --data '{"batch_id":"${BATCH_ID}"}' '${WEBHOOK_URL}'
+export SIGNING_KEY="\$(aws ssm get-parameter --region ${AWS_REGION} --name ${SECRET_PARAMETER} --with-decryption --query Parameter.Value --output text)"
+python3 -c '${MINT_TOKEN_PY}' '${BATCH_ID}' | curl -sS -o /dev/null -w 'webhook HTTP %{http_code}\n' --max-time 5 -H @- -H 'Content-Type: application/json' --data '{"batch_id":"${BATCH_ID}"}' '${WEBHOOK_URL}'
 EOF
 )"
 

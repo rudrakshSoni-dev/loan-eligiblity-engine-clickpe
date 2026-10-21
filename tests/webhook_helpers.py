@@ -2,8 +2,12 @@
 
 `RecordingSender` replaces the network for handler tests. `WebhookReceiver` is a real HTTP server on
 127.0.0.1, so tests of `send_request` go through urllib and sockets exactly as the Lambda does.
+`token_claims` checks a received bearer token with its own HMAC code, not the module under test.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import threading
 import time
@@ -28,6 +32,25 @@ class RecordingSender:
 
     def batch_ids(self) -> list[str]:
         return [json.loads(r.data)["batch_id"] for r in self.requests]  # type: ignore[arg-type]
+
+
+def _base64url_decode(part: str) -> bytes:
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+
+def token_claims(authorization: str, secret: str) -> dict[str, Any]:
+    """Verify a `Bearer` HS256 token and return its claims; AssertionError if it is forged."""
+    scheme, token = authorization.split(" ")
+    assert scheme == "Bearer"
+    header_part, claims_part, signature_part = token.split(".")
+    assert "=" not in token
+    expected = hmac.new(
+        secret.encode(), f"{header_part}.{claims_part}".encode(), hashlib.sha256
+    ).digest()
+    assert hmac.compare_digest(_base64url_decode(signature_part), expected)
+    assert json.loads(_base64url_decode(header_part)) == {"alg": "HS256", "typ": "JWT"}
+    claims: dict[str, Any] = json.loads(_base64url_decode(claims_part))
+    return claims
 
 
 @dataclass

@@ -224,7 +224,7 @@ def test_runtime_is_built_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> No
         "DB_PASSWORD": "pw",
         "UPLOAD_BUCKET": BUCKET,
         "N8N_WEBHOOK_URL": "http://172.31.26.164:5678/webhook/match-batch",
-        "N8N_WEBHOOK_SECRET": "example-secret",
+        "N8N_WEBHOOK_SECRET": "example-signing-key-0123456789abcdef",
         "AWS_REGION": "ap-southeast-2",
         "AWS_ACCESS_KEY_ID": "AKIDEXAMPLE",
         "AWS_SECRET_ACCESS_KEY": "example-secret",

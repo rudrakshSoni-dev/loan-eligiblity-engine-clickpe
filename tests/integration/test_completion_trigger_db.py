@@ -23,15 +23,15 @@ from lambdas.shared.batches import create_batch, upload_key
 from lambdas.shared.chunks import ChunkMessage, encode_message
 from lambdas.shared.config import DbConfig, LoadChunkConfig, WebhookConfig
 from lambdas.shared.db import Database
-from lambdas.shared.notify import SECRET_HEADER, send_request
+from lambdas.shared.notify import AUTH_HEADER, send_request
 from tests.chunk_helpers import BUCKET, FakeS3, line_chunks
-from tests.webhook_helpers import webhook_receiver
+from tests.webhook_helpers import token_claims, webhook_receiver
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "good_users.csv"
 UNUSED_DB_CONFIG = DbConfig("unused", 5432, "unused", "unused", "unused", ca_bundle=None)
-SECRET = "example-secret"
+SECRET = "example-signing-key-0123456789abcdef"
 RACE_TRIALS = 10
 DELIVERIES_PER_CHUNK = 2
 BARRIER_TIMEOUT_SECONDS = 30
@@ -99,7 +99,9 @@ def test_concurrent_and_duplicate_finishers_post_to_n8n_exactly_once_per_batch(
     )
     assert statuses == [["processed", chunk_count, chunk_count]] * RACE_TRIALS
     assert Counter(n8n.batch_ids()) == Counter({str(b): 1 for b in batches})
-    assert {r.headers[SECRET_HEADER] for r in n8n.received} == {SECRET}
+    assert [token_claims(r.headers[AUTH_HEADER], SECRET)["batch_id"] for r in n8n.received] == (
+        n8n.batch_ids()
+    )
     assert stage_counts(caplog, "batch_processed") == Counter({str(b): 1 for b in batches})
     assert stage_counts(caplog, "webhook_sent") == Counter({str(b): 1 for b in batches})
     assert sum(stage_counts(caplog, "completion_checked").values()) >= RACE_TRIALS

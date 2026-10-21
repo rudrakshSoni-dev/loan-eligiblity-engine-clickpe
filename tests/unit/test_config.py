@@ -22,7 +22,7 @@ DB_ENV = {
 }
 WEBHOOK_ENV = {
     "N8N_WEBHOOK_URL": "http://10.0.0.5:5678/webhook/match-batch",
-    "N8N_WEBHOOK_SECRET": "secret-value",
+    "N8N_WEBHOOK_SECRET": "secret-value-0123456789abcdef0123",
 }
 
 
@@ -69,6 +69,14 @@ def test_urls_must_be_http() -> None:
     env = {**DB_ENV, **WEBHOOK_ENV, "UPLOAD_BUCKET": "b", "N8N_WEBHOOK_URL": "10.0.0.5:5678"}
     with pytest.raises(ConfigError, match="N8N_WEBHOOK_URL must be an http"):
         load_chunk_config(env)
+
+
+def test_a_webhook_signing_key_shorter_than_32_characters_is_refused() -> None:
+    env = {**DB_ENV, **WEBHOOK_ENV, "UPLOAD_BUCKET": "b", "N8N_WEBHOOK_SECRET": "x" * 31}
+    with pytest.raises(ConfigError, match="N8N_WEBHOOK_SECRET must be at least 32 characters"):
+        load_chunk_config(env)
+    accepted = load_chunk_config({**env, "N8N_WEBHOOK_SECRET": "x" * 32})
+    assert len(accepted.webhook.secret) == 32
 
 
 def test_upload_url_config_and_custom_port() -> None:

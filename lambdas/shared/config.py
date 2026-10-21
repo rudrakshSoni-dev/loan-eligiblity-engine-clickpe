@@ -14,6 +14,7 @@ from pathlib import Path
 RDS_CA_BUNDLE = Path(__file__).resolve().parent / "rds-global-bundle.pem"
 
 DEFAULT_DB_PORT = 5432
+MIN_SIGNING_KEY_CHARS = 32
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
 
 
@@ -92,7 +93,13 @@ class WebhookConfig:
 
     @classmethod
     def read(cls, env: _EnvReader) -> WebhookConfig:
-        return cls(url=env.http_url("N8N_WEBHOOK_URL"), secret=env.text("N8N_WEBHOOK_SECRET"))
+        secret = env.text("N8N_WEBHOOK_SECRET")
+        if secret and len(secret) < MIN_SIGNING_KEY_CHARS:
+            env.problems.append(
+                f"N8N_WEBHOOK_SECRET must be at least {MIN_SIGNING_KEY_CHARS} characters"
+                " (HS256 signing key)"
+            )
+        return cls(url=env.http_url("N8N_WEBHOOK_URL"), secret=secret)
 
     def __repr__(self) -> str:
         return f"WebhookConfig(url={self.url!r})"
