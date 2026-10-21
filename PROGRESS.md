@@ -26,8 +26,8 @@
 | T22 | P0 | Deploy + smoke test | DONE | 2026-10-21 | Stack deployed (280 s); smoke test passes; 10,000-row sample → `processed` in 6.9 s, identical re-upload 0 inserted / 0 updated; malformed fixture 1 ok / 10 rejected; queues and DLQ empty |
 | T23 | P0 | docker-compose | DONE | 2026-10-21 | n8n 2.44.4 healthy on EC2; editor only via SSM tunnel (200), public IP times out; webhook allowlist 200 inside / 403 outside; owner account + 2FA still to be created in browser |
 | T24 | P0 | n8n credentials | DONE | 2026-10-21 | 4 credentials; Postgres (verified TLS via mounted RDS CA) and AWS Assume Role (system credentials, SES-only role, no static keys) tests green |
-| T25 | P1 | Workflow E — global error handler | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
-| T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
+| T25 | P1 | Workflow E — global error handler | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped). Must also export to `n8n/workflows/` (T47) |
+| T26 | P1 | Groq sub-workflow (LLM Gateway) | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped). Must also export to `n8n/workflows/` (T47) |
 | T27 | P0 | Crawl targets ⚖️ | DONE | 2026-10-21 | ICICI, HDFC, IDFC FIRST primary + BankBazaar spare; criteria in static HTML from the EC2 IP; robots allow all 4 paths; banks moved to `bank.in` (301) |
 | T28 | P0 | Workflow A: fetch + extract | DONE | 2026-10-21 | 3 lenders HTTP 200 → 13 / 18 / 6 criteria lines; spare + 404 + DNS failure variant: 4 extracted, 2 routed to the failure branch; imported and run on EC2 via the n8n CLI |
 | T29 | P1 | Workflow A: change detection | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
@@ -48,7 +48,7 @@
 | T44 | P1 | Test coverage pass | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T45 | P1 | Security review | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped). Must include the T43 finding: Workflow B executions store the incoming `X-Webhook-Secret` header in plain text (38 of 102 stored executions); value was exposed in a session transcript, rotation recommended |
 | T46 | P1 | Cost table | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
-| T47 | P0 | Export workflows | TODO | |  |
+| T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
 | T48 | P0 | Architecture diagram | TODO | |  |
 | T49 | P0 | README | TODO | |  |
 | T50 | P0 | Video script | TODO | |  |
@@ -1011,3 +1011,20 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Re-uploading the same 10,000 users created a new batch with 0 users. Is that a bug? A: No, it's the idempotency design. The upsert only rewrites a row whose data changed, so unchanged users keep their original `batch_id`, and Workflow B matches only the users a batch introduced or changed. Nothing changed, so there are 0 pairs, 0 matches and 0 emails, even with sending switched on.
   - Q: If n8n is down, why isn't the SQS message retried until n8n comes back? A: The chunk loaded and committed, so retrying it would be a no-op load plus another failed POST. Only the single invocation that won the completion check owns the notify, and it logs `webhook_failed` with the batch id. Recovery is `scripts/retrigger_batch.sh`, which refuses anything not `processed`, and Workflow B's claim refuses a replay with 409.
   - Q: One lender's site is down. Why doesn't that product disappear from matching? A: A failed fetch only writes a `failed` row in `crawl_runs`. A product is retired only after 3 failed runs in a row, and the next good run reactivates it, so a brief outage never removes offers users could still get.
+
+### T47 — Export workflows (2026-10-22)
+- Files: `scripts/verify_workflow_import.sh` (new), `PROGRESS.md`, `docs/rubric-evidence.md`. The three exports in `n8n/workflows/` were already committed; this task proves they are the deployed ones and that they load from nothing.
+- Scope note: the task text names A, B, C, E and the LLM Gateway. E (T25) and the Gateway (T26) are still TODO, so there is nothing to export for them; whoever builds them adds the file to `n8n/workflows/` and runs the script below. Nothing was reduced silently.
+- Evidence:
+  - Live vs repo: `n8n export:workflow --all --separate` on `i-02ffa9d08e8403a4a`, then SHA-256 of the sorted nodes + connections (first 16 hex): A `wfaproductdisc01` 24 nodes `9a480fa7928bd94e`, B `wfbmatching001` 33 nodes `73810a75b2932aba`, C `wfcnotification01` 23 nodes `152ee49d7270d1ce`. The same computation on the repo files gives identical values and node counts. The instance also holds 14 throwaway probe / drill workflows from earlier tasks (`T19 stub`, `T3x drill`, `T3x driver`, ...); they are deliberately not exported.
+  - Pinned data: `pinData` is `{}` in all three files; `staticData` is null.
+  - Secrets: `grep -Ei "(api[_-]?key|secret|password|bearer|AKIA|gsk_)"` over `n8n/workflows/*.json` hits only the credential name `webhook-secret` and a sticky-note sentence; `gsk_|AKIA` count 0; no 12-digit account id, ARN, email address or `172.31.x.x` address. Credentials appear only as references: `rds-postgres`, `groq-api`, `webhook-secret`, `aws-ses-assume-role`.
+  - Fresh import: `scripts/verify_workflow_import.sh` starts a new `docker.n8n.io/n8nio/n8n:2.44.4` container with an empty volume, imports each file (`Successfully imported 1 workflow.` three times), exports everything back and lists `"A · Product discovery"`, `"B · Matching"`, `"C · Notification"`; the container is removed on exit (`docker ps -a` shows none).
+  - Quality gates (no Python changed): `make check` → `329 passed, 177 skipped`, `Required test coverage of 80.0% reached. Total coverage: 99.82%` (the 177 skips need `TEST_DB_HOST`).
+- Rubric: n8n Workflow Design (workflows reproducible from the repo), Docs (a reader can import them).
+- Explain it back:
+  - Built: a repeatable proof that the repo's workflow JSON is what runs in production and loads into a clean n8n.
+  - Why this over the obvious alternative (export from the editor and commit): an editor export can drift from what was imported by CLI during testing. Comparing a node + connection hash against the live instance, then importing into an empty container, shows both "same as deployed" and "works without my instance's state".
+  - Q: Why hash only nodes and connections? A: Export metadata (`updatedAt`, `versionId`, `active`) changes on every import and would give false differences.
+  - Q: Credentials are not in the export, so does import work for a reviewer? A: The import succeeds and nodes keep the credential names; the reviewer creates the four named credentials (README, T49) before running anything.
+  - Q: Why not export the drill workflows? A: They are throwaway test harnesses with forced failures; shipping them would add noise and a forced-error path to the submission.
