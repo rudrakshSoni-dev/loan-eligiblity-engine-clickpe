@@ -138,3 +138,10 @@ docker exec n8n n8n list:workflow --active=true      # B · Matching must be lis
 The throwaway workflow `t32faildrill01` (forced database error, path `t32-fail-drill`) was unpublished and
 answers 404; like `t23probe0001`, `t19stubrecv1` and `scratchprobe0001` it stays inactive in the n8n
 database until the owner account exists to delete it in the editor.
+
+## Stage 1 drill (T33)
+
+`t33faildrill01` is a copy of Workflow B on path `t33-fail-drill` whose Stage 1 query is `SELECT 1/0`. It was
+published, called once from the instance (claim 202, Stage 1 retried 3 times in 4,047 ms, batch set `failed`),
+then unpublished with `docker exec n8n n8n unpublish:workflow --id=t33faildrill01` and a restart; the path then
+answers 404. Like the earlier probes it stays inactive in the n8n database until it is deleted in the editor.

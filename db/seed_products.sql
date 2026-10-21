@@ -2,7 +2,7 @@ INSERT INTO loan_products AS p (
     source, product_name, source_url,
     interest_rate_min, interest_rate_max, min_monthly_income,
     min_credit_score, max_credit_score, min_age, max_age,
-    allowed_employment, raw_criteria_text, content_hash, parse_confidence, is_seed
+    allowed_employment, raw_criteria_text, content_hash, parse_confidence, is_seed, active
 )
 SELECT
     'seed', v.product_name, NULL,
@@ -11,7 +11,8 @@ SELECT
     v.employment, v.criteria,
     encode(sha256(convert_to(v.criteria, 'UTF8')), 'hex'),
     1.0,
-    true
+    true,
+    false
 FROM (VALUES
     ('Seed · Salaried Personal Loan', 10.50, 16.00, 30000, 700, NULL, 21, 58,
      ARRAY['Salaried'],

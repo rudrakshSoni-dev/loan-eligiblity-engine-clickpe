@@ -39,6 +39,7 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 25. [Product structuring: strict schema, then distrust the answer](#product-structuring-strict-schema-then-distrust-the-answer)
 26. [Product storage and lifecycle: one statement per site, retire by run history](#product-storage-and-lifecycle-one-statement-per-site-retire-by-run-history)
 27. [Workflow B entry: claim, count and record in one statement](#workflow-b-entry-claim-count-and-record-in-one-statement)
+28. [Workflow B Stage 1: SQL pre-filter that keeps near misses](#workflow-b-stage-1-sql-pre-filter-that-keeps-near-misses)
 
 ---
 
@@ -1116,4 +1117,81 @@ credential after the recording, and never open the Webhook node's output panel o
 | Forced `SELECT 1/0` in a throwaway copy | HTTP 500 `could not start matching run` |
 
 `active_products = 8` is the 5 labelled seed products plus the 3 crawled ones; Workflow B matches against
-both until the seed rows are deactivated or kept on purpose (decision for T33).
+both until the seed rows are deactivated or kept on purpose (decision for T33). Decided in T33: deactivated, see the next section.
+
+## Workflow B Stage 1: SQL pre-filter that keeps near misses
+
+**Choice (T33, approved by the user).** Three decisions, then one statement.
+
+1. **Seed products take no part in matching.** The 5 seed rows (ids 1–5) were set `active = false` by
+   literal id on RDS, and `db/seed_products.sql` now inserts new seed rows inactive. Its upsert never touches
+   `active`, so re-seeding cannot switch them back on. `active` stays the one switch read by both the T32
+   claim count and Stage 1, and no email can offer a made-up "Seed ·" product. For the sample batch
+   `total_pairs` drops from 80,000 to 30,000 (10,000 users × 3 crawled products).
+2. **Candidate pairs stay in Postgres.** Stage 1 is one `INSERT … SELECT` into a new table,
+   `match_candidates(run_id, user_id, product_id, near_miss_criteria)` (migration `0002`). n8n gets one
+   summary row, not 14,165 items. n8n holds every item in memory and saves every node's output in SQLite on a
+   2 GB `t4g.small`; at T37's 100k users that would be over 100k items per node. Consequence for T34: the
+   Code node decides the rules per product, and SQL applies them to the pairs.
+3. **Near misses are kept, tagged with the criteria they missed.** Income and credit-score floors and the
+   score ceiling get a 5% margin (`near_miss_margin`, a named value in the statement's first CTE). Age and
+   employment stay strict. The LLM stage exists to judge wording that columns cannot hold, such as ICICI's
+   "a credit score of 700 and above is **preferred**" and HDFC's "above 720 is **ideal**". A strict
+   pre-filter would drop the very users those words are about before anyone could ask.
+
+**The statement.** Batch users × active products, `NULL` criterion = no limit, written to
+`match_candidates`. `near_miss_criteria` is `{}` for a strict pass, or for example `{min_credit_score}`. A
+second node, `Record · Stage 1 funnel`, writes `stage1_pairs`, `stage1_near_miss` (new column, migration
+`0002`) and `stage_ms.stage1`.
+
+**Why a separate record node (found by measurement).** The first version did the insert and the
+`pipeline_runs` update in one statement and recorded **153 ms**. `EXPLAIN ANALYZE` of the same work showed
+**556 ms**: the three foreign-key checks on `match_candidates` (about 125 ms each for 14,165 rows) run at the
+end of the statement, after its `clock_timestamp()` had been read. The record node now measures from Stage 1's
+`statement_timestamp()` to after its commit, on the database clock. The fixed live run recorded **578 ms**,
+and the plan in [`stage1-explain.md`](stage1-explain.md) gives 567 ms.
+
+**Idempotent, so Retry On Fail is safe here** (unlike the T30 INSERT and the T32 claim). `ON CONFLICT DO
+NOTHING` on `(run_id, user_id, product_id)`, counts taken from the table rather than from what this call
+inserted, and the first measured `stage1` time is kept. Re-running both statements on RDS for run 7 inserted
+0 rows, gave the same counts and kept `stage1_ms = 578`. Without the keep-first rule an earlier re-run had
+replaced 561 ms with 79 ms, which would have shown the cost of a no-op.
+
+**Failure branch.** Both nodes retry 3 times with 2 s between tries, then go to `Fail · Mark batch failed
+(Stage 1)`. That node moves the batch `matching → failed` with `error = 'matching stage 1 failed: <message>'`
+and sets `finished_at` on the run; a batch in any other state is left alone. Measured with a throwaway copy
+(`t33faildrill01`, Stage 1 replaced by `SELECT 1/0`): 202 from the claim, the Stage 1 node ran 4,047 ms
+(3 tries), then the batch was `failed` with `matching stage 1 failed: division by zero`, the run closed,
+`stage1_pairs` stayed NULL (not measured) and 0 candidates were written. The execution is saved as `success`
+because the error was handled, so Workflow E (T25) will not see it; the batch's `error` column is the record.
+
+**Measured (2026-10-21, RDS PostgreSQL 16.9, sample batch `9d278e88…`, run 7).**
+
+| Product | Pairs | Strict | Near miss |
+|---|---|---|---|
+| ICICI Bank (11) | 5,903 | 4,425 | 1,478 |
+| HDFC Bank (12) | 2,583 | 1,840 | 743 |
+| IDFC FIRST Bank (13) | 5,679 | 4,140 | 1,539 |
+| **Total** (of 30,000) | **14,165** | **10,405** | **3,760** |
+
+Near misses by criteria: `{min_credit_score}` 3,718, `{min_monthly_income}` 29, both 13. These numbers are
+identical to a count made with an independent query before the node was built. 6,088 of the 10,000 users have
+at least one candidate.
+
+Hand check of 3 users against the stored criteria:
+- `bb0d9e4a…` (₹60,000, score 760, age 34, Salaried) is a strict pass for all three.
+- `03b9e667…` (₹65,000, score 690, age 44, Self-Employed) is a near miss on `min_credit_score` for ICICI
+  (690 < 700, ≥ 665) and IDFC FIRST (690 < 710, ≥ 674.5). HDFC excludes it (Salaried only).
+- `003190f1…` (₹37,000, score 790, age 36, Business) gets nothing.
+
+**Finding for T34/T35.** No crawled product lists `Business` in `allowed_employment`, so all 3,240 Business
+users in the sample (32%) are out at Stage 1. ICICI's text evaluates self-employed applicants on "business"
+vintage, so treating business owners as self-employed is arguable. It is a Workflow A structuring question,
+not a Stage 1 one, and is recorded rather than changed silently here.
+
+**Rejected.**
+- *Strict-only pre-filter* (the original spec): simpler, but the LLM would then only ever see users who
+  already pass every column, so soft thresholds could never be relaxed.
+- *Pairs as n8n items*: simplest for T34's Code node; does not scale on this instance (above).
+- *Dropping the `user_id` / `product_id` foreign keys* to save about 0.27 s per 14k rows: integrity and
+  cascading cleanup are worth more than that at this scale.

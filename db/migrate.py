@@ -35,7 +35,10 @@ from pg8000.exceptions import DatabaseError, InterfaceError
 
 DB_DIR = Path(__file__).resolve().parent
 
-MIGRATIONS: tuple[tuple[str, Path], ...] = (("0001_schema", DB_DIR / "schema.sql"),)
+MIGRATIONS: tuple[tuple[str, Path], ...] = (
+    ("0001_schema", DB_DIR / "schema.sql"),
+    ("0002_match_candidates", DB_DIR / "0002_match_candidates.sql"),
+)
 
 SEED_FILE = DB_DIR / "seed_products.sql"
 

@@ -14,9 +14,9 @@
           -140
         ],
         "parameters": {
-          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
-          "height": 640,
-          "width": 760,
+          "content": "## Workflow B · Matching (webhook, run setup, then the three-stage funnel)\n\n**Purpose.** When a CSV batch has finished loading, decide which active loan products each of its users is eligible for, spending as few LLM calls as possible.\n\n**Trigger.** `POST /webhook/match-batch` from the `load-chunk` Lambda with body `{\"batch_id\": \"<uuid>\"}`. Four layers guard it: security group (Lambda SG only), IP allowlist (VPC CIDR), Header Auth `X-Webhook-Secret` (credential `webhook-secret`), and the claim below, which refuses any batch that is not `processed`.\n\n**Input.** `batch_id`, a lower-case UUID.\n\n**Output.** Candidate pairs in `match_candidates` and the Stage 1 counts in `pipeline_runs`. Replies 202 `{batch_id, run_id, total_pairs}` and the batch is in `matching` with one `pipeline_runs` row. 400 = malformed `batch_id`, 409 = batch not in `processed` (a replay or an unknown id), 500 = database error (the Lambda retries 5xx).\n\n**Stages in this version.**\n1. `Check` reads and validates `batch_id`.\n2. `Claim` is one statement: `UPDATE upload_batches SET status = 'matching' WHERE status = 'processed'`, the `users_in_batch x active_products` count, and the `pipeline_runs` insert. Either all three happen or none does, so a batch can never sit in `matching` without a run row.\n3. `Respond` answers the Lambda at once; the funnel stages continue after the reply.\n4. `Stage 1 · SQL pre-filter` is one set-based statement in Postgres: batch users x active products on the hard criteria (NULL criterion = no limit; age and employment strict; income and credit-score floors and the score ceiling with a 5% near-miss margin). Pairs go to `match_candidates`, never into n8n items; each near miss names the criteria it missed, so Stage 2/3 can judge soft wording such as \"700 and above is preferred\".\n5. `Record · Stage 1 funnel` counts `match_candidates` for the run into `stage1_pairs` / `stage1_near_miss` and stores `stage_ms.stage1`, measured on the database clock from the start of Stage 1 to after its commit, so the end-of-statement foreign-key checks are included.\n\nBoth are idempotent (a re-run inserts nothing, records the same counts and keeps the first measured `stage1` time), which is why Retry On Fail is safe on them. A database error in either marks the batch `failed` and closes the run.\n\n**Scope of \"users in batch\".** `users.batch_id` names the batch that last inserted or changed a user, so an identical re-upload has 0 users in its own batch and 0 pairs. Those users were matched when they first arrived.\n\n**Error workflow.** Workflow E does not exist yet (T25); it will be set in this workflow's settings.",
+          "height": 860,
+          "width": 820,
           "color": 4
         }
       },
@@ -218,6 +218,83 @@
             "responseCode": 500
           }
         }
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH params AS (\n  SELECT 0.05::numeric AS near_miss_margin\n),\ncandidates AS (\n  SELECT u.user_id, p.id AS product_id,\n         array_remove(ARRAY[\n           CASE WHEN u.monthly_income < p.min_monthly_income THEN 'min_monthly_income' END,\n           CASE WHEN u.credit_score < p.min_credit_score THEN 'min_credit_score' END,\n           CASE WHEN u.credit_score > p.max_credit_score THEN 'max_credit_score' END\n         ], NULL) AS near_miss_criteria\n  FROM users u\n  JOIN loan_products p ON p.active\n  CROSS JOIN params m\n  WHERE u.batch_id = $2::uuid\n    AND (p.min_monthly_income IS NULL\n         OR u.monthly_income >= p.min_monthly_income * (1 - m.near_miss_margin))\n    AND (p.min_credit_score IS NULL\n         OR u.credit_score >= p.min_credit_score * (1 - m.near_miss_margin))\n    AND (p.max_credit_score IS NULL\n         OR u.credit_score <= p.max_credit_score * (1 + m.near_miss_margin))\n    AND (p.min_age IS NULL OR u.age >= p.min_age)\n    AND (p.max_age IS NULL OR u.age <= p.max_age)\n    AND (p.allowed_employment IS NULL OR u.employment_status = ANY (p.allowed_employment))\n),\ninserted AS (\n  INSERT INTO match_candidates (run_id, user_id, product_id, near_miss_criteria)\n  SELECT $1::bigint, user_id, product_id, near_miss_criteria FROM candidates\n  ON CONFLICT (run_id, user_id, product_id) DO NOTHING\n  RETURNING 1\n)\nSELECT $1::bigint::text AS run_id, $2::uuid::text AS batch_id,\n       (SELECT count(*) FROM inserted) AS inserted_now,\n       statement_timestamp() AS stage1_started_at",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000011",
+        "name": "Stage 1 · SQL pre-filter",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2140,
+          -60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "UPDATE pipeline_runs r\nSET stage1_pairs = c.pairs,\n    stage1_near_miss = c.near_miss,\n    stage_ms = CASE WHEN r.stage_ms ? 'stage1' THEN r.stage_ms\n               ELSE r.stage_ms || jsonb_build_object(\n                 'stage1', round(extract(epoch FROM clock_timestamp() - $3::timestamptz) * 1000)::int)\n               END\nFROM (\n  SELECT count(*) AS pairs,\n         count(*) FILTER (WHERE cardinality(near_miss_criteria) > 0) AS near_miss\n  FROM match_candidates\n  WHERE run_id = $1::bigint\n) c\nWHERE r.id = $1::bigint AND r.batch_id = $2::uuid\nRETURNING r.id::text AS run_id, r.batch_id::text AS batch_id, r.total_pairs,\n          r.stage1_pairs, r.stage1_pairs - r.stage1_near_miss AS stage1_strict,\n          r.stage1_near_miss, (r.stage_ms ->> 'stage1')::int AS stage1_ms",
+          "options": {
+            "queryReplacement": "={{ [$json.run_id, $json.batch_id, $json.stage1_started_at] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000013",
+        "name": "Record · Stage 1 funnel",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2380,
+          -160
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        },
+        "retryOnFail": true,
+        "maxTries": 3,
+        "waitBetweenTries": 2000,
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH failed AS (\n  UPDATE upload_batches\n  SET status = 'failed', error = left('matching stage 1 failed: ' || $3, 1000)\n  WHERE id = $2::uuid AND status = 'matching'\n  RETURNING id\n)\nUPDATE pipeline_runs r\nSET finished_at = now()\nFROM failed f\nWHERE r.id = $1::bigint AND r.batch_id = f.id AND r.finished_at IS NULL\nRETURNING r.id::text AS run_id, f.id::text AS batch_id",
+          "options": {
+            "queryReplacement": "={{ [$('Claim · processed to matching + create run').first().json.run_id, $('Claim · processed to matching + create run').first().json.batch_id, String($json.error?.message ?? $json.message ?? $json.error ?? 'unknown error')] }}"
+          }
+        },
+        "id": "b0000000-0000-4000-8000-000000000012",
+        "name": "Fail · Mark batch failed (Stage 1)",
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.5,
+        "position": [
+          2620,
+          60
+        ],
+        "credentials": {
+          "postgres": {
+            "id": "tNSuoJ0AbwOkWgJM",
+            "name": "rds-postgres"
+          }
+        }
       }
     ],
     "connections": {
@@ -291,6 +368,47 @@
           [
             {
               "node": "Respond · 409 batch not processed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Respond · 202 matching started": {
+        "main": [
+          [
+            {
+              "node": "Stage 1 · SQL pre-filter",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Stage 1 · SQL pre-filter": {
+        "main": [
+          [
+            {
+              "node": "Record · Stage 1 funnel",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 1)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Record · Stage 1 funnel": {
+        "main": [
+          [],
+          [
+            {
+              "node": "Fail · Mark batch failed (Stage 1)",
               "type": "main",
               "index": 0
             }

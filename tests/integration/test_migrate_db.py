@@ -26,7 +26,7 @@ from db.migrate import (
 
 pytestmark = pytest.mark.skipif(not os.environ.get("TEST_DB_HOST"), reason="TEST_DB_HOST not set")
 
-SCHEMA_TABLES = 10
+SCHEMA_TABLES = 11
 LEDGER_TABLES = 1
 
 
@@ -78,28 +78,32 @@ def test_second_run_applies_nothing_and_seed_changes_nothing(
         if e["stage"] in {"migrations_done", "seed_done"}
     ]
     assert done == [
-        ("migrations_done", 1),
+        ("migrations_done", 2),
         ("seed_done", 5),
         ("migrations_done", 0),
         ("seed_done", 0),
     ]
 
-    assert conn.run("SELECT version FROM schema_migrations") == [["0001_schema"]]
+    assert conn.run("SELECT version FROM schema_migrations ORDER BY version") == [
+        ["0001_schema"],
+        ["0002_match_candidates"],
+    ]
     tables = conn.run(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
     )
     assert tables == [[SCHEMA_TABLES + LEDGER_TABLES]]
 
 
-def test_seed_rows_are_flagged_and_hashed(db_env: dict[str, str], conn: Any) -> None:
+def test_seed_rows_are_flagged_hashed_and_inactive(db_env: dict[str, str], conn: Any) -> None:
     assert main(["--seed"], env=db_env) == 0
     rows = conn.run(
         "SELECT count(*), bool_and(is_seed), bool_and(source = 'seed'),"
         " bool_and(product_name LIKE 'Seed · %'), bool_and(raw_criteria_text LIKE 'SEED DATA.%'),"
-        " bool_and(content_hash = encode(sha256(convert_to(raw_criteria_text, 'UTF8')), 'hex'))"
+        " bool_and(content_hash = encode(sha256(convert_to(raw_criteria_text, 'UTF8')), 'hex')),"
+        " bool_and(NOT active)"
         " FROM loan_products"
     )
-    assert rows == [[5, True, True, True, True, True]]
+    assert rows == [[5, True, True, True, True, True, True]]
 
 
 def test_seed_never_rewrites_a_crawled_product(db_env: dict[str, str], conn: Any) -> None:
@@ -120,12 +124,12 @@ def test_edited_migration_is_refused_and_nothing_changes(db_env: dict[str, str],
     edited = [Migration(m.version, m.sql + "\nSELECT 1;") for m in load_migrations()]
     with pytest.raises(MigrationError, match="edited after it was applied"):
         migrate(conn, edited)
-    assert conn.run("SELECT count(*) FROM schema_migrations") == [[1]]
+    assert conn.run("SELECT count(*) FROM schema_migrations") == [[2]]
 
 
 def test_failed_migration_rolls_back_completely(db_env: dict[str, str], conn: Any) -> None:
-    """0001 and a half-done 0002 share one transaction, so neither leaves anything behind."""
-    broken = [*load_migrations(), Migration("0002_broken", "CREATE TABLE ok_t (id int); SELEC 1;")]
+    """The real migrations and a half-done 0003 share one transaction, so none leaves anything."""
+    broken = [*load_migrations(), Migration("0003_broken", "CREATE TABLE ok_t (id int); SELEC 1;")]
     with pytest.raises(DatabaseError, match="syntax error"):
         migrate(conn, broken)
     assert conn.run("SELECT to_regclass('users'), to_regclass('schema_migrations')") == [
