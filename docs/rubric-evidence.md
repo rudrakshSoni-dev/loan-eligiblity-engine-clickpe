@@ -99,7 +99,7 @@ Diagram, README, video.
 | Status | Evidence | Where | Task |
 |---|---|---|---|
 | ✅ | Design decisions doc: 19 sections, each with choice / rejected / why, every claim labelled cited / measured / estimate; approved | `docs/decisions.md` | T04, T07 |
-| ⬜ | Mermaid architecture diagram matching deployed reality | `docs/architecture.md`, `README.md` | T48 |
+| ✅ | Mermaid architecture diagram checked against `serverless.yml`, `infra/` and the exported workflows: VPC boundary, Lambdas in and out of the VPC, queues, DLQ, S3 gateway endpoint, private RDS, EC2 n8n with no inbound rules, Workflows A/B/C, Groq, SES; private-versus-public table; "designed, not implemented" list (Workflow E, LLM Gateway, change detection, DLQ alarm); rendered to PNG with mermaid-cli to prove the syntax | `docs/architecture.md`, `README.md` → Architecture | T48 |
 | ⬜ | README with copy-pasteable setup and measured design decisions | `README.md` | T49 |
 | ⬜ | Video script and recording | `docs/video-script.md` | T50–T52 |
 | ✅ | Upload UI (one static file, no framework): client checks (extension, 20 MB, header row) refuse bad files before a batch exists; upload progress bar; 4-step timeline (upload → chunks x/y → Workflow B → Workflow C); row, reject and match counters; first rejects with line numbers; full funnel with per-stage ms; resumable with `?batch_id=`; honest dry-run message when Workflow C sends nothing; `aria-live` status, labelled controls, reduced-motion and dark-mode support, no horizontal scroll at 390 px. Screenshots of a fresh browser run and of the real 10,000-user batch | `ui/index.html`, `docs/screenshots/t40-ui-browser-run.png`, `docs/screenshots/t40-ui-funnel-real-batch.png`; `PROGRESS.md` T40 | T40 |

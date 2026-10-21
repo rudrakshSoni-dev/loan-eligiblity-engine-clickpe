@@ -49,7 +49,7 @@
 | T45 | P1 | Security review | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped). Must include the T43 finding: Workflow B executions store the incoming `X-Webhook-Secret` header in plain text (38 of 102 stored executions); value was exposed in a session transcript, rotation recommended |
 | T46 | P1 | Cost table | TODO | | Reinstated by user 2026-10-21 (no optional task is skipped) |
 | T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
-| T48 | P0 | Architecture diagram | TODO | |  |
+| T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
 | T49 | P0 | README | TODO | |  |
 | T50 | P0 | Video script | TODO | |  |
 | T51 | P0 | Rehearsal | TODO | |  |
@@ -1028,3 +1028,19 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Why hash only nodes and connections? A: Export metadata (`updatedAt`, `versionId`, `active`) changes on every import and would give false differences.
   - Q: Credentials are not in the export, so does import work for a reviewer? A: The import succeeds and nodes keep the credential names; the reviewer creates the four named credentials (README, T49) before running anything.
   - Q: Why not export the drill workflows? A: They are throwaway test harnesses with forced failures; shipping them would add noise and a forced-error path to the submission.
+
+### T48 — Architecture diagram (2026-10-22)
+- Files: `docs/architecture.md` (new), `README.md` (Architecture section appended), `docs/rubric-evidence.md`, `PROGRESS.md`.
+- Evidence:
+  - Facts taken from `serverless.yml` (functions, VPC attachment, queues, DLQ, gateway endpoint, SGs), `infra/rds.md`, `infra/ec2.md`, `infra/n8n.md` and the node lists of the three exported workflows.
+  - `npx @mermaid-js/mermaid-cli@11.4.2 -p p.json -i d.mmd -o d.png` using `/usr/bin/google-chrome` → rendered without error; PNG inspected.
+  - First draft drew `get-upload-url` and `batch-status` outside the VPC; corrected to inside (both have `vpc:` in `serverless.yml`); only `split-csv` is outside.
+- Not drawn because not built: Workflow E (T25), LLM Gateway (T26), change detection (T29), DLQ alarm (T21); listed in the doc.
+- Quality gates: no Python touched, so ruff / mypy / pytest were not re-run. Secrets scan: resource names only, no secret values.
+- Rubric: Docs & Presentation (diagram).
+- Explain it back:
+  - Built: one Mermaid system diagram plus a private/public table, a no-NAT rationale and an honest list of unbuilt parts.
+  - Why this over the obvious alternative (a hand-drawn image): Mermaid lives in the repo, renders on GitHub, and is reviewed in diffs, so it can be kept equal to the code.
+  - Q: Which Lambdas are in the VPC and why? A: `load-chunk`, `get-upload-url`, `batch-status` need RDS; `split-csv` sends to SQS and never touches RDS, so it stays outside and no paid SQS endpoint is needed.
+  - Q: How does n8n reach Groq and SES with no NAT? A: It sits in a public subnet with an outbound-only public IP via the free Internet Gateway; the SG has no inbound rules.
+  - Q: What must change in the diagram when T25/T26/T29 land? A: Add Workflow E with error links from A/B/C, replace the two Groq HTTP nodes with a gateway sub-workflow, and move those rows out of "Designed, not implemented".
