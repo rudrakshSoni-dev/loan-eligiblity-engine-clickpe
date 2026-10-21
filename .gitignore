@@ -34,3 +34,5 @@ n8n/.n8n/
 .vscode/
 .idea/
 .DS_Store
+
+ui/config.js

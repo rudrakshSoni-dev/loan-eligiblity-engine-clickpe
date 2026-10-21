@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loan Eligibility Engine</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #1b1f24;
+    --muted: #5b6470;
+    --border: #d9dde3;
+    --accent: #1f6feb;
+    --ok: #1a7f37;
+    --warn: #9a6700;
+    --bad: #cf222e;
+    --track: #e6e9ee;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216;
+      --panel: #171b21;
+      --text: #e6e9ee;
+      --muted: #9aa4b1;
+      --border: #2c333c;
+      --accent: #4c8dff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+      --track: #262c34;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  p.lead { margin: 0 0 20px; color: var(--muted); }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  input[type="file"] { max-width: 100%; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .hint { color: var(--muted); font-size: 0.875rem; margin: 8px 0 0; }
+  .message { display: block; margin: 12px 0 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border); }
+  .message:empty { display: none; }
+  .message.error { border-color: var(--bad); color: var(--bad); }
+  .message.info { border-color: var(--accent); }
+  .message.done { border-color: var(--ok); color: var(--ok); }
+  progress { width: 100%; height: 10px; margin-top: 12px; accent-color: var(--accent); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; word-break: break-all; }
+  ol.timeline { list-style: none; margin: 0; padding: 0; }
+  ol.timeline li {
+    position: relative;
+    padding: 0 0 16px 32px;
+  }
+  ol.timeline li:last-child { padding-bottom: 0; }
+  ol.timeline li::before {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    background: var(--panel);
+  }
+  ol.timeline li::after {
+    content: "";
+    position: absolute;
+    left: 13px;
+    top: 20px;
+    bottom: 0;
+    width: 2px;
+    background: var(--track);
+  }
+  ol.timeline li:last-child::after { display: none; }
+  ol.timeline li[data-state="done"]::before { background: var(--ok); border-color: var(--ok); }
+  ol.timeline li[data-state="active"]::before { border-color: var(--accent); background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  ol.timeline li[data-state="failed"]::before { background: var(--bad); border-color: var(--bad); }
+  ol.timeline li[data-state="waiting"] .step-name { color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) { ol.timeline li[data-state="active"]::before { animation: none; } }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .step-name { font-weight: 600; }
+  .step-detail { color: var(--muted); font-size: 0.875rem; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .stat-label { color: var(--muted); font-size: 0.8rem; }
+  .stat-value { font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.group td { font-weight: 600; padding-top: 12px; }
+  tr.sub td:first-child { padding-left: 24px; color: var(--muted); }
+  tr.total td { font-weight: 700; border-top: 2px solid var(--text); }
+  .unmeasured { color: var(--muted); }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Loan Eligibility Engine</h1>
+  <p class="lead">Upload a users CSV. The file goes straight to S3, is loaded into PostgreSQL in parallel chunks, matched against crawled loan products by n8n, and matched users are emailed (test inboxes only).</p>
+
+  <section aria-labelledby="upload-heading">
+    <h2 id="upload-heading">1 · Upload</h2>
+    <form id="upload-form" novalidate>
+      <div class="row">
+        <label for="csv-file">Users CSV file</label>
+        <input id="csv-file" name="csv-file" type="file" accept=".csv,text/csv" aria-describedby="file-hint" required>
+        <button id="upload-button" type="submit" disabled>Upload and run</button>
+      </div>
+      <p id="file-hint" class="hint">Required columns: <span id="required-columns" class="mono"></span>. Maximum <span id="max-size"></span>.</p>
+    </form>
+    <progress id="upload-progress" max="100" value="0" aria-label="Upload progress" hidden></progress>
+    <output id="message" class="message" aria-live="polite"></output>
+  </section>
+
+  <section id="progress-section" aria-labelledby="progress-heading" hidden>
+    <h2 id="progress-heading">2 · Pipeline progress</h2>
+    <p class="hint">Batch <span id="batch-id" class="mono"></span> · status <strong id="batch-status"></strong> · <span id="elapsed"></span></p>
+    <ol class="timeline" id="timeline" aria-label="Pipeline stages"></ol>
+  </section>
+
+  <section id="counts-section" aria-labelledby="counts-heading" hidden>
+    <h2 id="counts-heading">3 · Rows and matches</h2>
+    <div class="stats">
+      <div class="stat"><div class="stat-label">Rows loaded</div><div class="stat-value" id="rows-ok">–</div></div>
+      <div class="stat"><div class="stat-label">Rows rejected</div><div class="stat-value" id="rows-rejected">–</div></div>
+      <div class="stat"><div class="stat-label">Matches</div><div class="stat-value" id="matches">–</div></div>
+      <div class="stat"><div class="stat-label">Matches notified (email sent)</div><div class="stat-value" id="notified">–</div></div>
+    </div>
+    <div id="rejects-block" hidden>
+      <h2 style="margin-top:16px">First rejected rows</h2>
+      <table>
+        <caption class="hint" style="text-align:left">Up to 5 shown; every reject is stored in <span class="mono">rejected_rows</span>.</caption>
+        <thead><tr><th scope="col" class="num">CSV line</th><th scope="col">Reason</th></tr></thead>
+        <tbody id="rejects-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="funnel-section" aria-labelledby="funnel-heading" hidden>
+    <h2 id="funnel-heading">4 · Matching funnel</h2>
+    <table>
+      <caption class="hint" style="text-align:left">Measured by Workflow B for this batch (latest run). A dash means the stage has not run yet.</caption>
+      <thead><tr><th scope="col">Stage</th><th scope="col" class="num">Count</th></tr></thead>
+      <tbody id="funnel-body"></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="config.js"></script>
+<script>
+"use strict";
+
+const REQUIRED_COLUMNS = ["user_id", "name", "email", "monthly_income", "credit_score", "employment_status", "age"];
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const HEADER_SAMPLE_BYTES = 64 * 1024;
+const POLL_INTERVAL_MS = 2000;
+const POLL_GIVE_UP_MS = 20 * 60 * 1000;
+const MATCHED_SETTLE_MS = 60 * 1000;
+const STATUS_ORDER = ["pending", "splitting", "loading", "processed", "matching", "matched", "notifying", "notified"];
+const TERMINAL_STATUSES = new Set(["notified", "failed"]);
+const STEPS = [
+  { key: "upload", name: "Upload to S3", until: null },
+  { key: "load", name: "Split and load chunks", until: "processed" },
+  { key: "match", name: "Match users to products (Workflow B)", until: "matched" },
+  { key: "notify", name: "Email matched users (Workflow C)", until: "notified" },
+];
+
+const config = window.LOAN_ENGINE_CONFIG || null;
+const el = (id) => document.getElementById(id);
+const numberFormat = new Intl.NumberFormat("en-IN");
+const formatCount = (value) => (value === null || value === undefined ? "–" : numberFormat.format(value));
+
+const state = { batchId: null, startedAt: null, uploaded: false, uploadPercent: 0, lastStatus: null, pollTimer: null };
+
+function showMessage(text, kind) {
+  const box = el("message");
+  box.textContent = text;
+  box.className = "message" + (kind ? " " + kind : "");
+}
+
+function formatBytes(bytes) {
+  return bytes >= 1024 * 1024 ? (bytes / (1024 * 1024)).toFixed(1) + " MB" : Math.max(1, Math.round(bytes / 1024)) + " KB";
+}
+
+function headerColumns(text) {
+  const firstLine = text.replace(/^﻿/, "").split(/\r?\n/, 1)[0];
+  return firstLine.split(",").map((name) => name.trim().replace(/^"(.*)"$/, "$1").trim().toLowerCase());
+}
+
+async function checkFile(file) {
+  const problems = [];
+  if (!/\.csv$/i.test(file.name)) problems.push("the file name must end in .csv");
+  if (file.size === 0) problems.push("the file is empty");
+  if (file.size > MAX_UPLOAD_BYTES) problems.push(`the file is ${formatBytes(file.size)}; the limit is ${formatBytes(MAX_UPLOAD_BYTES)}`);
+  if (problems.length) return problems;
+  const columns = headerColumns(await file.slice(0, HEADER_SAMPLE_BYTES).text());
+  const missing = REQUIRED_COLUMNS.filter((name) => !columns.includes(name));
+  const repeated = REQUIRED_COLUMNS.filter((name) => columns.indexOf(name) !== columns.lastIndexOf(name));
+  if (missing.length) problems.push("header row is missing: " + missing.join(", "));
+  if (repeated.length) problems.push("header row repeats: " + repeated.join(", "));
+  return problems;
+}
+
+async function requestUploadUrl() {
+  const response = await fetch(config.uploadUrlEndpoint, { method: "POST" });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`could not get an upload URL (HTTP ${response.status}${body.error ? ": " + body.error : ""})`);
+  return body;
+}
+
+function s3ErrorText(xml) {
+  const doc = new DOMParser().parseFromString(xml || "", "application/xml");
+  const code = doc.querySelector("Code");
+  const message = doc.querySelector("Message");
+  if (!code) return "no error detail";
+  return `${code.textContent}: ${message?.textContent ?? ""}`;
+}
+
+function postToS3(upload, file) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    Object.entries(upload.fields).forEach(([name, value]) => form.append(name, value));
+    form.append("file", file);
+    const request = new XMLHttpRequest();
+    request.open("POST", upload.url);
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      state.uploadPercent = Math.round((event.loaded / event.total) * 100);
+      el("upload-progress").value = state.uploadPercent;
+      renderTimeline(state.lastStatus);
+    };
+    request.onload = () => {
+      if (request.status === 204 || request.status === 201) {
+        resolve();
+        return;
+      }
+      reject(new Error(`S3 refused the upload (HTTP ${request.status}, ${s3ErrorText(request.responseText)})`));
+    };
+    request.onerror = () => reject(new Error("network error while uploading to S3"));
+    request.send(form);
+  });
+}
+
+function stepState(step, status) {
+  if (step.key === "upload") return state.uploaded ? "done" : "active";
+  if (!state.uploaded) return "waiting";
+  if (STATUS_ORDER.indexOf(state.lastKnownProgress) >= STATUS_ORDER.indexOf(step.until)) return "done";
+  if (step.key !== activeStepKey(state.lastKnownProgress) || state.settled) return "waiting";
+  return status === "failed" ? "failed" : "active";
+}
+
+function activeStepKey(status) {
+  const reached = STATUS_ORDER.indexOf(status);
+  const step = STEPS.find((candidate) => candidate.until && reached < STATUS_ORDER.indexOf(candidate.until));
+  return step ? step.key : "notify";
+}
+
+function stepDetail(step, document) {
+  if (step.key === "upload") return state.uploaded ? "stored as uploads/" + state.batchId + ".csv" : state.uploadPercent + "% sent";
+  if (!document) return "";
+  if (step.key === "load") {
+    const chunks = document.total_chunks === null ? "chunks not counted yet" : `${document.chunks_done}/${document.total_chunks} chunks`;
+    return `${chunks} · ${formatCount(document.rows_ok)} rows loaded, ${formatCount(document.rows_rejected)} rejected`;
+  }
+  if (step.key === "match") return document.funnel ? `${formatCount(document.matches)} matches stored` : "waiting for the n8n webhook";
+  if (state.settled) return "no email sent: Workflow C is in dry run (app_config dry_run = true) or did not run";
+  return `${formatCount(document.notified)} of ${formatCount(document.matches)} matches notified (emails per run are capped; test inboxes only)`;
+}
+
+function renderTimeline(status, document) {
+  const list = el("timeline");
+  list.replaceChildren(...STEPS.map((step) => {
+    const item = window.document.createElement("li");
+    const stepStatus = stepState(step, status);
+    item.dataset.state = stepStatus;
+    if (stepStatus === "active") item.setAttribute("aria-current", "step");
+    const name = window.document.createElement("div");
+    name.className = "step-name";
+    name.textContent = step.name + (stepStatus === "failed" ? " — failed" : "");
+    const detail = window.document.createElement("div");
+    detail.className = "step-detail";
+    detail.textContent = stepDetail(step, document || state.lastDocument);
+    item.append(name, detail);
+    return item;
+  }));
+}
+
+function renderCounts(document) {
+  el("counts-section").hidden = false;
+  el("rows-ok").textContent = formatCount(document.rows_ok);
+  el("rows-rejected").textContent = formatCount(document.rows_rejected);
+  el("matches").textContent = formatCount(document.matches);
+  el("notified").textContent = formatCount(document.notified);
+  el("rejects-block").hidden = document.first_rejects.length === 0;
+  el("rejects-body").replaceChildren(...document.first_rejects.map((reject) => {
+    const row = window.document.createElement("tr");
+    const line = window.document.createElement("td");
+    line.className = "num";
+    line.textContent = reject.line_no;
+    const reason = window.document.createElement("td");
+    reason.textContent = reject.reason;
+    row.append(line, reason);
+    return row;
+  }));
+}
+
+function funnelRows(f) {
+  const ms = f.stage_ms || {};
+  const timed = (label, key) => (ms[key] === undefined ? label : `${label} (${numberFormat.format(ms[key])} ms)`);
+  return [
+    ["group", "Candidate pairs (users × active products)", f.total_pairs],
+    ["group", timed("Stage 1 · SQL pre-filter: pairs passing hard criteria", "stage1"), f.stage1_pairs],
+    ["sub", "of which near misses (income or score within 5% of a limit)", f.stage1_near_miss],
+    ["group", timed("Stage 2 · deterministic rules", "stage2"), null],
+    ["sub", "clear match", f.stage2_clear],
+    ["sub", "borderline (sent to Stage 3)", f.stage2_borderline],
+    ["sub", "rejected (EMI affordability, rules)", f.stage2_reject],
+    ["group", timed("Stage 3 · cohort LLM evaluation", "stage3"), null],
+    ["sub", "cohorts", f.llm_cohorts],
+    ["sub", "cohort verdicts from cache", f.cache_hits],
+    ["sub", "LLM calls", f.llm_calls],
+    ["sub", "LLM tokens", f.llm_tokens],
+    ["sub", "borderline pairs judged eligible", f.stage3_eligible],
+    ["sub", "borderline pairs judged not eligible", f.stage3_not_eligible],
+    ["sub", "left unresolved: daily LLM budget spent", f.unresolved_budget],
+    ["sub", "left unresolved: LLM error", f.unresolved_error],
+    ["total", timed("Final matches (clear + eligible)", "persist"), f.final_matches],
+  ];
+}
+
+function renderFunnel(funnel) {
+  el("funnel-section").hidden = funnel === null;
+  if (funnel === null) return;
+  el("funnel-body").replaceChildren(...funnelRows(funnel).map(([kind, label, value]) => {
+    const row = window.document.createElement("tr");
+    row.className = kind;
+    const name = window.document.createElement("td");
+    name.textContent = label;
+    const count = window.document.createElement("td");
+    count.className = "num" + (value === null && kind !== "group" ? " unmeasured" : "");
+    count.textContent = kind === "group" && value === null ? "" : formatCount(value);
+    row.append(name, count);
+    return row;
+  }));
+}
+
+function renderElapsed(document) {
+  const created = Date.parse(document.created_at);
+  if (Number.isNaN(created)) return;
+  const resting = TERMINAL_STATUSES.has(document.status) || state.settled;
+  const until = resting ? Date.parse(document.updated_at) : Date.now();
+  const duration = formatDuration(Math.max(0, Math.round((until - created) / 1000)));
+  el("elapsed").textContent = resting ? `${duration} from batch creation to last update` : `${duration} since batch creation`;
+}
+
+function formatDuration(totalSeconds) {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) return `${hours} h ${minutes} min`;
+  if (minutes) return `${minutes} min ${seconds} s`;
+  return `${seconds} s`;
+}
+
+function render(document) {
+  if (document.status !== "failed") state.lastKnownProgress = document.status;
+  state.lastStatus = document.status;
+  state.lastDocument = document;
+  el("batch-status").textContent = document.status;
+  renderTimeline(document.status, document);
+  renderCounts(document);
+  renderFunnel(document.funnel);
+  renderElapsed(document);
+}
+
+async function fetchStatus() {
+  const response = await fetch(`${config.batchStatusEndpoint}?batch_id=${encodeURIComponent(state.batchId)}`, { cache: "no-store" });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`status check failed (HTTP ${response.status}${body.error ? ": " + body.error : ""})`);
+  return body;
+}
+
+function finishMessage(document) {
+  if (document.status === "failed") return [`Batch failed: ${document.error || "no error recorded"}.`, "error"];
+  return [`Done: ${formatCount(document.rows_ok)} rows loaded, ${formatCount(document.matches)} matches, ${formatCount(document.notified)} matches notified.`, "done"];
+}
+
+function settledAtMatched(document) {
+  if (document.status !== "matched") {
+    state.matchedSince = null;
+    return false;
+  }
+  state.matchedSince = state.matchedSince ?? Date.now();
+  state.settled = Date.now() - state.matchedSince >= MATCHED_SETTLE_MS;
+  return state.settled;
+}
+
+async function poll() {
+  try {
+    const document = await fetchStatus();
+    if (document.status !== state.lastStatus) showMessage(`Batch is ${document.status}.`, "info");
+    render(document);
+    if (TERMINAL_STATUSES.has(document.status)) {
+      showMessage(...finishMessage(document));
+      el("upload-button").disabled = !el("csv-file").files.length;
+      return;
+    }
+    if (settledAtMatched(document)) {
+      render(document);
+      showMessage(`Matching finished: ${formatCount(document.matches)} matches stored. The batch stayed "matched" for ${MATCHED_SETTLE_MS / 1000} s, so no email was sent (Workflow C dry run, or C did not run).`, "done");
+      el("upload-button").disabled = !el("csv-file").files.length;
+      return;
+    }
+  } catch (error) {
+    showMessage(error.message + " Retrying…", "error");
+  }
+  if (Date.now() - state.startedAt > POLL_GIVE_UP_MS) {
+    showMessage(`Stopped watching after ${POLL_GIVE_UP_MS / 60000} minutes at status "${state.lastStatus}". If it is stuck at "processed", re-send the n8n trigger with scripts/retrigger_batch.sh.`, "error");
+    el("upload-button").disabled = false;
+    return;
+  }
+  state.pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
+}
+
+function startWatching(batchId, alreadyUploaded) {
+  clearTimeout(state.pollTimer);
+  Object.assign(state, { batchId, startedAt: Date.now(), uploaded: alreadyUploaded, uploadPercent: 0, lastStatus: null, lastDocument: null, lastKnownProgress: "pending", matchedSince: null, settled: false });
+  el("progress-section").hidden = false;
+  el("counts-section").hidden = true;
+  el("funnel-section").hidden = true;
+  el("batch-id").textContent = batchId;
+  el("batch-status").textContent = alreadyUploaded ? "checking…" : "uploading";
+  renderTimeline(null);
+}
+
+async function handleSubmit(event) {
+  event.preventDefault();
+  const file = el("csv-file").files[0];
+  if (!file) return;
+  el("upload-button").disabled = true;
+  const problems = await checkFile(file);
+  if (problems.length) {
+    showMessage("Not uploaded: " + problems.join("; ") + ".", "error");
+    el("upload-button").disabled = false;
+    return;
+  }
+  try {
+    showMessage("Requesting a presigned upload…", "info");
+    const issued = await requestUploadUrl();
+    startWatching(issued.batch_id, false);
+    history.replaceState(null, "", `?batch_id=${issued.batch_id}`);
+    el("upload-progress").hidden = false;
+    el("upload-progress").value = 0;
+    showMessage(`Uploading ${file.name} (${formatBytes(file.size)}) directly to S3…`, "info");
+    await postToS3(issued.upload, file);
+    state.uploaded = true;
+    showMessage("Uploaded. Waiting for the loader…", "info");
+    renderTimeline(null);
+    poll();
+  } catch (error) {
+    showMessage(error.message + ".", "error");
+    el("upload-button").disabled = false;
+  }
+}
+
+function init() {
+  el("required-columns").textContent = REQUIRED_COLUMNS.join(", ");
+  el("max-size").textContent = formatBytes(MAX_UPLOAD_BYTES);
+  if (!config || !config.uploadUrlEndpoint || !config.batchStatusEndpoint) {
+    showMessage("Missing ui/config.js with the Function URLs. Start the page with scripts/serve_ui.sh.", "error");
+    return;
+  }
+  el("csv-file").addEventListener("change", () => {
+    el("upload-button").disabled = !el("csv-file").files.length;
+    showMessage("", "");
+  });
+  el("upload-form").addEventListener("submit", handleSubmit);
+  const resumeId = new URLSearchParams(location.search).get("batch_id");
+  if (resumeId) {
+    startWatching(resumeId, true);
+    poll();
+  }
+}
+
+init();
+</script>
+</body>
+</html>
