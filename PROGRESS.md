@@ -51,7 +51,7 @@
 | T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
 | T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
 | T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items (T21/T25/T26/T29/T37/T41 deploy/T45/T46) stated plainly; EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
-| T50 | P0 | Video script | TODO | |  |
+| T50 | P0 | Video script | DONE | 2026-10-22 | `docs/video-script.md`: 8 segments, 8.4 min of narration at 140 wpm (1,177 words) inside the 8:45 box; pre-record checklist, on-screen cues, number-to-source table, "not to claim" list |
 | T51 | P0 | Rehearsal | TODO | |  |
 | T52 | P0 | Record + upload | TODO | |  |
 | T53 | P0 | Final rubric audit | TODO | |  |
@@ -1068,3 +1068,23 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Is 2 LLM calls for 2,221 borderline pairs a fair comparison? A: It is the cold-cache count for one batch: the pairs collapse into 20 cohorts packed per product. The comparison point is 2,221 calls if each pair were asked separately. The cache then makes the same batch cost 0 calls.
   - Q: What breaks first at 100× the data? A: Not measured, so the README makes no claim. The chunked ingest is bounded per chunk and the SQL stages are set-based, but Stage 3 is limited by Groq's 200,000 tokens a day and the benchmark (T37) is still TODO.
 
+### T50 — Video script (2026-10-22)
+- Files: `docs/video-script.md` (new), `PROGRESS.md`, `docs/rubric-evidence.md`. No code changed.
+- Evidence:
+  - Segment boxes per CLAUDE.md T50 (1:00, 1:00, 1:30, 2:00, 0:45, 1:30, 0:30, 0:30 = 8:45). Narration word counts counted with a script over the quoted lines: 144 / 145 / 214 / 280 / 101 / 143 / 71 / 79 = 1,177 words = 8.41 min at 140 wpm. The first draft was 1,325 words (9.5 min); segments 2, 5, 6, 8 were cut to fit.
+  - Node names quoted in the script were read from the exported workflows in `n8n/workflows/` (A 24 nodes, B 33, C 23), not from memory.
+  - Every number spoken has a row in the "Number sources" table pointing at the task or execution that measured it (T04, T10, T11, T15, T22, T33 to T36, T38, T39, T42, T43).
+  - Secrets scan of `docs/video-script.md`: hits only the words `secret`, `webhook-secret`, `groq-api` as names. Quality gates not re-run: no Python or workflow file changed.
+- Decisions the script makes, so the user can overrule them:
+  1. The live upload re-uses `data/users.csv`, which is a no-op by design (T43a: 0 inserted, 0 pairs, 0 emails). The script says so on camera and shows the real funnel from the first-run batch `903ba6d4-…` through `?batch_id=`. A true fresh run needs the T42 reset (destructive; needs a new go).
+  2. `dry_run` stays `true` during recording. The emails shown are the five from the T42 run, in Spam, and the Spam cause is stated as "likely, not verified" as in `docs/decisions.md`.
+  3. The unbuilt items (T21, T25, T26, T29, T37) are said out loud in segment 8, and "Not to claim" lists what must not be said. If any of them is built before recording, segments 3, 4 and 8 and the "Not to claim" list must be edited.
+  4. The script tells the user not to open a Workflow B trigger node on camera, because n8n stores `X-Webhook-Secret` in execution data (T43 finding, T45).
+- Open: execution numbers 94 and 95 may be pruned by the time of recording (168 h retention); the script says to open the newest ones instead.
+- Rubric: Docs & Presentation (video script; recording is T52).
+- Explain it back:
+  - Built: a timed, segment-by-segment script with the exact narration, the screen to show, what to check, a pre-record checklist, a source for every number, and a list of claims not to make.
+  - Why this over the obvious alternative (bullet points to ad-lib from): the time box is the risk. Writing the narration out and counting words showed the first draft was 9.5 minutes, which a bullet list would only have revealed on the day. Reading a number off the script also makes it impossible to improvise a wrong one.
+  - Q: Why does the live run show zeros? A: Re-uploading an identical file is idempotent: the upsert rewrites only changed rows, so the new batch has no users, no pairs, no matches and no emails. That is a feature to show, and the funnel comes from the first-run batch.
+  - Q: Why does the script admit Workflow E and the LLM Gateway are missing? A: CLAUDE.md §0.4 forbids implying a designed feature is built, and a reviewer who reads the README Limitations will catch any gap between video and repo.
+  - Q: What happens to the script if T25, T26 or T29 are built later? A: Segments 3, 4 and 8, the "Number sources" table and "Not to claim" are edited; the rest stands.
