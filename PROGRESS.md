@@ -1296,7 +1296,8 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
 - Recorded: 10 Loom takes downloaded with `yt-dlp` (originals, 1280×562, 48 kHz audio), merged in order (`full_merged.mp4`, 992.6 s = sum of parts, audio and video end within 0.01 s).
 - Edited: 10 cut ranges from the T51 transcript review → `trimmed.mp4` 717.0 s; 1.4x with pitch kept (`atempo`) → 512.2 s; 5 s intro card + 4 s end card with the repo link → `final_demo_with_intro.mp4` 521.6 s = 8:42 (limit 9:00). Frames at the card boundaries checked. Files live in `~/demo-video`, outside the repo.
 - Known: Loom's recording controls and the face bubble are visible in the takes and cover part of the README near the end.
-- Open: upload (YouTube Unlisted or Drive "anyone with link"), open the link in incognito, add the link to README and to this entry.
+- Uploaded to Google Drive: https://drive.google.com/file/d/1EBOkaKMxpzgm_gbTInieEYtZfGlMFMxX/view?usp=sharing, linked at the top of the README. A logged-out `curl` of the link returns HTTP 200 with no redirect to Google sign-in, so it is shared publicly.
+- Open: play it once in an incognito window (Drive may still be processing the video).
 
 ### T53 — Final rubric audit (2026-10-22)
 - Method: read README, `docs/architecture.md`, `docs/decisions.md`, `docs/video-script.md`, `docs/rubric-evidence.md` and the 5 workflow exports as a strict reviewer, line by line against the brief (`The Loan Eligibility Engine (Engineering Intern).txt`), then re-ran every gate.

@@ -4,6 +4,8 @@ Submission for the Clickpe.ai engineering-intern assignment.
 
 An admin uploads a CSV of users in a browser. The file goes straight to S3, is split into 5,000-row chunks, and is loaded in parallel into a private PostgreSQL database by Lambda. When the last chunk lands, exactly one webhook starts an n8n pipeline that matches every user against loan products crawled from lender websites. A funnel of SQL, deterministic rules and a heavily cached LLM stage decides who is eligible. Matched users are emailed through SES, redirected to a test inbox only.
 
+**Demo video (8:42):** [watch on Google Drive](https://drive.google.com/file/d/1EBOkaKMxpzgm_gbTInieEYtZfGlMFMxX/view?usp=sharing). It covers the n8n workflows node by node, a live end-to-end run from the upload page, and the email arriving in the test inbox.
+
 Everything below was run on a real AWS account (`ap-southeast-2`). Numbers come from real runs, and the command or task that produced each one is in [PROGRESS.md](PROGRESS.md). What is designed but not built is listed under [Limitations](#limitations).
 
 | Measured on the 10,000-user sample CSV | Value |
