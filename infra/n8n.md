@@ -28,7 +28,8 @@ aws ssm send-command --instance-ids $I --document-name AWS-RunShellScript \
 ## Editor access (no inbound internet rule)
 
 ```bash
-aws ssm start-session --target i-02ffa9d08e8403a4a --document-name AWS-StartPortForwardingSession \
+aws ssm start-session --profile clickpe --region ap-southeast-2 --target i-02ffa9d08e8403a4a \
+  --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["5678"],"localPortNumber":["5678"]}'
 ```
 

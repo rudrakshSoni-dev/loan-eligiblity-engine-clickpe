@@ -194,9 +194,12 @@ n8n runs as the exact image `docker.n8n.io/n8nio/n8n:2.44.4` from [n8n/docker-co
 Open the editor through an SSM port forward. There is no internet path to it:
 
 ```bash
-aws ssm start-session --target <instance-id> --document-name AWS-StartPortForwardingSession \
+aws ssm start-session --profile clickpe --region ap-southeast-2 --target <instance-id> \
+  --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["5678"],"localPortNumber":["5678"]}'
 ```
+
+The demo instance is `i-02ffa9d08e8403a4a`. Without `--region` (or `AWS_REGION`) the CLI stops with `NoRegion`. The command needs the AWS Session Manager plugin installed locally; leave the terminal open while you use the editor. If something on your machine already listens on port 5678 (for example a local n8n), `localhost:5678` opens that instead: set `"localPortNumber":["5679"]` and browse to `http://localhost:5679`.
 
 Browse to `http://localhost:5678`, create the owner account and enable 2FA under Settings → Personal (this step is done in the browser). Then create four credentials by name, because workflows refer to the names only. Screenshots with values masked are in [docs/screenshots/](docs/screenshots).
 
