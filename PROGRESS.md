@@ -52,8 +52,8 @@
 | T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
 | T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items (T21/T25/T26/T29/T37/T41 deploy/T45/T46) stated plainly; EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
 | T50 | P0 | Video script | DONE | 2026-10-22 | `docs/video-script.md`: 8 segments, 8.4 min of narration at 140 wpm (1,177 words) inside the 8:45 box; pre-record checklist, on-screen cues, number-to-source table, "not to claim" list |
-| T51 | P0 | Rehearsal | TODO | |  |
-| T52 | P0 | Record + upload | TODO | |  |
+| T51 | P0 | Rehearsal | DONE | 2026-10-22 | Rehearsed through 10 Loom takes; transcript checked against the repo, 6 factually wrong lines and 1 repeat cut. The 10-question reviewer drill was not run (user's decision, time) |
+| T52 | P0 | Record + upload | IN PROGRESS | 2026-10-22 | Recorded and edited: `final_demo_with_intro.mp4`, 8:42 (5 s intro, 11:57 cut at 1.4x, 4 s end card). Upload + incognito check still to do |
 | T53 | P0 | Final rubric audit | TODO | |  |
 | T54 | P0 | Submit | TODO | |  |
 
@@ -1276,3 +1276,28 @@ Task T29 complete. Run the commit commands above, then start a new session (`/cl
   - Q: Why 95% and not 100%? A: 100% is what the run reached with a database; without one the DB-only branches in `load_chunk/handler.py` are skipped (98%), so 95% passes on a laptop with no Docker and still catches a real regression.
   - Q: Does 100% line coverage mean the COPY path is correct? A: No, it means every line ran. Correctness comes from the assertions: identical re-upload changes 0 rows, a redelivered chunk is a no-op, malformed rows give file line numbers, a refused row rolls the chunk back.
   - Q: Why did tests skip silently? A: Integration tests need `TEST_DB_HOST`; without it they skip so `make check` works anywhere. The README and this log state the with/without numbers separately.
+
+### T51 — Rehearsal (2026-10-22)
+- Files: `README.md` (setup fixes found while rehearsing), `infra/n8n.md`, `docs/architecture.excalidraw` (new), `docs/screenshots/loan-eligiblity-engine.svg` (new, exported by the user), `PROGRESS.md`, `docs/rubric-evidence.md`. No code changed.
+- What was rehearsed: segment scripts for architecture (Excalidraw walkthrough), live end to end per data file, n8n workflows, setup guide and wrap-up; the user recorded 10 Loom takes (16:33 in total).
+- Evidence:
+  - Live re-upload of `data/users.csv` with `dry_run = false`: 10,000 rows loaded, 0 matches, 0 notified, batch reached `notified` (UI screenshot shared in session); with `dry_run = true` the same upload ends at `matched`, as `docs/decisions.md` (T39) specifies.
+  - Fresh synthetic file `data/demo_new_users.csv` (50 rows, seed 20261023) uploaded with sending on: the recording shows 52 matches and the test emails arriving in the test inbox. `dry_run` set back to `true` afterwards and read back: `dry_run | true`, `max_emails_per_run | 5`.
+  - Local Whisper transcript (`small.en`, on the laptop, nothing uploaded) of the 10 takes, read against the repo. Wrong statements found and cut: Workflow B matching "through the LLM gateway"; real users receiving email; "0 rejected because the file was already loaded" (twice); emails "personalized using the LLM"; LLM Gateway described as building notification emails. A repeated ingestion recap and the LLM Gateway / Workflow E sections (partly garbled) were also cut.
+  - README checks while rehearsing: all 12 `bash` blocks pass `bash -n` with no unfilled placeholders; 27 referenced paths exist; `make check` → `448 passed, 243 skipped`, 98.04%; `scripts/verify_workflow_import.sh` imports all 5 workflows into a fresh n8n container.
+  - README fixes: `git clone <this repo>` and `--target <instance-id>` replaced (bash read `<` as a redirect); `--profile`/`--region` added to the SSM port forward (`NoRegion` otherwise); note to change only `localPortNumber` when local port 5678 is taken; Session Manager plugin in Prerequisites; how to get new matches and emails after an idempotent re-upload.
+  - n8n owner password was lost: `n8n user-management:reset` run on the instance through SSM (`Successfully reset the database to default user state.`); workflows A, B, C, E, G still present and B, C, E, G still active (`list:workflow --active=true`). The owner account and 2FA must be re-created in the browser (user's step).
+- Not done: the 10-question reviewer drill (`interview-drill`) was not run; the user chose to go straight to recording. The architecture take still has a muddled passage (around 0:50–1:22 of the take: order of the first Lambda, S3 and load-chunk) that was kept for time.
+- Rubric: Docs & Presentation (rehearsed video, README commands verified copy-paste safe, Excalidraw diagram).
+- Explain it back:
+  - Built: a rehearsed, fact-checked recording and a README whose commands run as pasted.
+  - Why transcribe instead of just cutting for length: cutting blind would have kept the claims a reviewer would catch (real users emailed, LLM on every match). Transcribing locally found them, and removing them also saved most of the time needed.
+  - Q: Why did the re-upload of `users.csv` show 0 matches? A: The upsert only rewrites rows whose data changed, so the new batch owns no users; 0 pairs, 0 matches, 0 emails is the idempotency result, not a fault.
+  - Q: Why did the batch stop at `matched` in dry run but reach `notified` with sending on? A: In dry run Workflow C releases the claim back to `matched`; with sending on and nobody waiting it finishes and moves the batch to `notified`.
+  - Q: Why did `localhost:5678` show a different n8n? A: A local n8n container on the laptop already held port 5678, so the SSM tunnel could not bind it; tunnelling to local port 5679 reaches the EC2 instance.
+
+### T52 — Record + upload (2026-10-22, in progress)
+- Recorded: 10 Loom takes downloaded with `yt-dlp` (originals, 1280×562, 48 kHz audio), merged in order (`full_merged.mp4`, 992.6 s = sum of parts, audio and video end within 0.01 s).
+- Edited: 10 cut ranges from the T51 transcript review → `trimmed.mp4` 717.0 s; 1.4x with pitch kept (`atempo`) → 512.2 s; 5 s intro card + 4 s end card with the repo link → `final_demo_with_intro.mp4` 521.6 s = 8:42 (limit 9:00). Frames at the card boundaries checked. Files live in `~/demo-video`, outside the repo.
+- Known: Loom's recording controls and the face bubble are visible in the takes and cover part of the README near the end.
+- Open: upload (YouTube Unlisted or Drive "anyone with link"), open the link in incognito, add the link to README and to this entry.
