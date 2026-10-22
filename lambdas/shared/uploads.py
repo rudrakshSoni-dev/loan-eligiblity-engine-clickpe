@@ -18,11 +18,15 @@ PRESIGN_EXPIRY_SECONDS = 300
 
 
 class PresignedUpload(TypedDict):
+    """The URL and form fields the browser posts the CSV with."""
+
     url: str
     fields: dict[str, str]
 
 
 class S3PostSigner(Protocol):
+    """The part of the boto3 S3 client that signs a presigned POST."""
+
     def generate_presigned_post(
         self,
         Bucket: str,  # noqa: N803

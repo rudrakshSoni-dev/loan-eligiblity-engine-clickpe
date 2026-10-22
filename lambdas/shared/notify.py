@@ -43,6 +43,8 @@ Sender = Callable[[urllib.request.Request, float], int]
 
 @dataclass(frozen=True)
 class NotifyResult:
+    """Outcome of announcing a batch: delivered or not, attempts, last status/error."""
+
     delivered: bool
     attempts: int
     status: int | None
@@ -74,6 +76,7 @@ def signed_token(secret: str, batch_id: uuid.UUID, issued_at: int) -> str:
 def build_request(
     webhook: WebhookConfig, batch_id: uuid.UUID, issued_at: int
 ) -> urllib.request.Request:
+    """Build the POST of `{batch_id}` with a freshly signed bearer token."""
     token = signed_token(webhook.secret, batch_id, issued_at)
     return urllib.request.Request(
         webhook.url,

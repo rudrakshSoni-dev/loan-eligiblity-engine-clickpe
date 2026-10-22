@@ -62,6 +62,8 @@ MAX_RECEIVES = 5
 
 @dataclass(frozen=True)
 class Runtime:
+    """Objects built once per warm container: config, database, S3 reader, sender."""
+
     config: LoadChunkConfig
     database: Database
     s3: S3RangeReader
@@ -70,6 +72,7 @@ class Runtime:
 
 @cache
 def runtime() -> Runtime:
+    """Configure logging and build the Runtime on the first invocation."""
     configure_logging(log_level(os.environ))
     config = load_chunk_config(os.environ)
     return Runtime(
@@ -120,6 +123,7 @@ def handle_record(app: Runtime, record: dict[str, Any]) -> bool:
 
 
 def receive_count(record: dict[str, Any]) -> int:
+    """Return how many times SQS has delivered this message."""
     return int(record.get("attributes", {}).get("ApproximateReceiveCount", 1))
 
 
@@ -157,6 +161,7 @@ def process(app: Runtime, message: ChunkMessage | SplitFailure) -> str | None:
 
 
 def load(app: Runtime, message: ChunkMessage) -> None:
+    """Read, validate and load one chunk, then run the completion check."""
     conn = app.database.connection()
     ids: dict[str, object] = {"batch_id": str(message.batch_id), "chunk_id": message.chunk_no}
     if not start_loading(conn, message.batch_id, message.total_chunks):
@@ -216,6 +221,7 @@ def load_in_transaction(
 
 
 def mark_failed(app: Runtime, batch_id: uuid.UUID, reason: str) -> None:
+    """Fail the batch with the reason (truncated) and log the outcome."""
     changed = fail_batch(app.database.connection(), batch_id, reason[:MAX_ERROR_LENGTH])
     log_event(
         logger,

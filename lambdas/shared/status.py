@@ -48,10 +48,12 @@ FUNNEL_SQL = (
 
 
 def iso(value: datetime | None) -> str | None:
+    """Return the timestamp in ISO 8601, or None."""
     return value.isoformat() if value is not None else None
 
 
 def funnel(conn: Connection, batch_id: uuid.UUID) -> dict[str, Any] | None:
+    """Return the latest pipeline run's counters for the batch, or None if not matched."""
     rows = conn.run(FUNNEL_SQL, id=batch_id)
     if not rows:
         return None

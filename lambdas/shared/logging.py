@@ -18,7 +18,10 @@ EVENT_ATTR = "event_fields"
 
 
 class JsonFormatter(logging.Formatter):
+    """Format a record as one JSON object, adding the Lambda request id if present."""
+
     def format(self, record: logging.LogRecord) -> str:
+        """Return the record as a JSON line with level, logger and event fields."""
         line: dict[str, Any] = {
             "level": record.levelname,
             "logger": record.name,
@@ -33,6 +36,7 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str = "INFO") -> None:
+    """Set the root level and give every root handler the JSON formatter."""
     root = logging.getLogger()
     root.setLevel(level)
     if not root.handlers:
@@ -42,12 +46,14 @@ def configure_logging(level: str = "INFO") -> None:
 
 
 def emit(logger: logging.Logger, level: int, stage: str, fields: Mapping[str, object]) -> None:
+    """Log one event whose message is `stage` and whose fields become JSON keys."""
     logger.log(level, stage, extra={EVENT_ATTR: {"stage": stage, **fields}})
 
 
 def log_event(
     logger: logging.Logger, stage: str, *, level: int = logging.INFO, **fields: object
 ) -> None:
+    """Log one structured event at `level` (INFO by default)."""
     emit(logger, level, stage, fields)
 
 

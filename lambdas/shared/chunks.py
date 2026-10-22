@@ -47,6 +47,8 @@ class SendError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ChunkMessage:
+    """One chunk to load: its batch, object version, byte range and line numbers."""
+
     batch_id: uuid.UUID
     s3_key: str
     etag: str
@@ -60,20 +62,26 @@ class ChunkMessage:
 
     @property
     def size(self) -> int:
+        """Number of bytes in the chunk."""
         return self.end_byte - self.start_byte
 
     @property
     def byte_range(self) -> str:
+        """HTTP Range header value for the chunk (inclusive end)."""
         return f"bytes={self.start_byte}-{self.end_byte - 1}"
 
 
 @dataclass(frozen=True, slots=True)
 class SplitFailure:
+    """Control message: the file cannot load, and why."""
+
     batch_id: uuid.UUID
     error: str
 
 
 class S3RangeReader(Protocol):
+    """The part of the boto3 S3 client that reads one byte range of an object."""
+
     def get_object(
         self,
         *,
@@ -85,6 +93,8 @@ class S3RangeReader(Protocol):
 
 
 class MessageSender(Protocol):
+    """The part of the boto3 SQS client that sends a batch of messages."""
+
     def send_message_batch(
         self,
         *,
@@ -94,6 +104,7 @@ class MessageSender(Protocol):
 
 
 def encode_message(message: ChunkMessage | SplitFailure) -> str:
+    """Serialise a chunk or control message to the JSON body sent to SQS."""
     if isinstance(message, SplitFailure):
         return json.dumps({"batch_id": str(message.batch_id), "error": message.error})
     return json.dumps(
@@ -140,6 +151,7 @@ def parse_message(body: str) -> ChunkMessage | SplitFailure:
 
 
 def batch_id_of(data: Mapping[str, Any]) -> uuid.UUID:
+    """Return the message's batch id; raise MessageError if absent or not a UUID."""
     try:
         return uuid.UUID(str(data["batch_id"]))
     except (KeyError, ValueError) as error:
@@ -147,6 +159,7 @@ def batch_id_of(data: Mapping[str, Any]) -> uuid.UUID:
 
 
 def text_field(data: Mapping[str, Any], name: str) -> str:
+    """Return a required non-empty string field or raise MessageError."""
     value = data.get(name)
     if not isinstance(value, str) or not value:
         raise MessageError(f"{name} must be a non-empty string")
@@ -154,6 +167,7 @@ def text_field(data: Mapping[str, Any], name: str) -> str:
 
 
 def count_field(data: Mapping[str, Any], name: str) -> int:
+    """Return a required non-negative integer field or raise MessageError."""
     value = data.get(name)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise MessageError(f"{name} must be a non-negative integer")
@@ -161,6 +175,7 @@ def count_field(data: Mapping[str, Any], name: str) -> int:
 
 
 def columns_field(data: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the header columns as a tuple or raise MessageError."""
     value = data.get("columns")
     if not isinstance(value, list) or not value or not all(isinstance(c, str) for c in value):
         raise MessageError("columns must be a non-empty list of strings")
@@ -168,6 +183,7 @@ def columns_field(data: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def check_consistency(message: ChunkMessage) -> None:
+    """Raise MessageError if key, chunk number, range or line number disagree."""
     problems = []
     if message.s3_key != upload_key(message.batch_id):
         problems.append(f"s3_key {message.s3_key!r} does not belong to batch {message.batch_id}")
@@ -226,6 +242,7 @@ def send_messages(
 
 
 def send_group(sqs: MessageSender, queue_url: str, pending: dict[str, str]) -> None:
+    """Send up to 10 messages, resending SQS-reported failures once."""
     errors: list[str] = []
     for _ in range(SEND_ATTEMPTS):
         entries = [{"Id": entry_id, "MessageBody": body} for entry_id, body in pending.items()]
@@ -239,6 +256,7 @@ def send_group(sqs: MessageSender, queue_url: str, pending: dict[str, str]) -> N
 
 
 def new_sqs_client(region: str) -> MessageSender:
+    """Build an SQS client for `region`; boto3 is imported only here."""
     import boto3
 
     client: MessageSender = boto3.client("sqs", region_name=region)

@@ -49,6 +49,8 @@ class UploadMissingError(Exception):
 
 
 class S3ObjectReader(Protocol):
+    """The part of the boto3 S3 client that reads a whole object version."""
+
     def get_object(
         self,
         *,
@@ -60,6 +62,8 @@ class S3ObjectReader(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Upload:
+    """One uploaded CSV as announced by its S3 event."""
+
     bucket: str
     batch_id: uuid.UUID
     s3_key: str
@@ -69,6 +73,8 @@ class Upload:
 
 @dataclass(frozen=True, slots=True)
 class Span:
+    """One CSV record in the file: byte range, line numbers and parsed fields."""
+
     start: int
     end: int
     first_line_no: int
@@ -79,6 +85,8 @@ class Span:
 
 @dataclass(slots=True)
 class OpenChunk:
+    """A chunk being built: byte range, first line and records so far."""
+
     start: int
     end: int
     first_line_no: int
@@ -144,6 +152,7 @@ def fetch_upload(s3: S3ObjectReader, upload: Upload) -> bytes:
 
 
 def size_problem(size: int, max_bytes: int) -> str | None:
+    """Return why a file of `size` bytes cannot load, or None if the size is fine."""
     if size == 0:
         return "file is empty"
     if size > max_bytes:

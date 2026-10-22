@@ -70,16 +70,21 @@ class MigrationError(Exception):
 
 @dataclass(frozen=True)
 class Migration:
+    """One migration file: its version and SQL text."""
+
     version: str
     sql: str
 
     @property
     def checksum(self) -> str:
+        """SHA-256 of the SQL text, stored in schema_migrations."""
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
 class DbSettings:
+    """Connection settings read from the environment."""
+
     host: str
     port: int
     database: str
@@ -89,10 +94,12 @@ class DbSettings:
 
 
 def log_event(stage: str, **fields: object) -> None:
+    """Log one JSON line with `stage` and the given fields."""
     LOG.info(json.dumps({"stage": stage, **fields}, default=str))
 
 
 def load_migrations(entries: Sequence[tuple[str, Path]] = MIGRATIONS) -> list[Migration]:
+    """Read the SQL of every migration in order."""
     return [Migration(version, path.read_text(encoding="utf-8")) for version, path in entries]
 
 
@@ -115,6 +122,7 @@ def pending_migrations(files: Sequence[Migration], applied: Mapping[str, str]) -
 
 
 def settings_from_env(env: Mapping[str, str]) -> DbSettings:
+    """Read DB_* variables; raise MigrationError naming any that are missing."""
     missing = [name for name in REQUIRED_ENV if not env.get(name)]
     if missing:
         raise MigrationError(f"missing environment variables: {', '.join(missing)}")
@@ -197,6 +205,7 @@ def seed(conn: Any, sql: str) -> int:
 
 
 def main(argv: Sequence[str] | None = None, env: Mapping[str, str] | None = None) -> int:
+    """Run migrations (and the seed with --seed); return 0 on success, 1 on failure."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--seed", action="store_true", help="upsert db/seed_products.sql")
     args = parser.parse_args(argv)

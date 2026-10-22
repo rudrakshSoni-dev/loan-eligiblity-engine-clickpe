@@ -88,16 +88,20 @@ FROM unnest(CAST(:lines AS integer[]), CAST(:reasons AS text[]), CAST(:raws AS t
 
 @dataclass(frozen=True, slots=True)
 class UpsertCounts:
+    """How the upsert treated the chunk's valid rows."""
+
     inserted: int
     updated: int
     unchanged: int
 
 
 def decode_chunk(data: bytes) -> str:
+    """Decode UTF-8, keeping undecodable bytes as surrogates so lines stay exact."""
     return data.decode("utf-8", errors="surrogateescape")
 
 
 def has_undecodable(text: str) -> bool:
+    """Return True if the text holds a byte that was not valid UTF-8."""
     return any(FIRST_ESCAPED_BYTE <= ord(c) <= LAST_ESCAPED_BYTE for c in text)
 
 
@@ -110,6 +114,7 @@ def storable(text: str) -> str:
 
 
 def reject_undecodable(records: Iterable[Record | Reject]) -> Iterator[Record | Reject]:
+    """Turn records that contain non-UTF-8 bytes into rejects."""
     for record in records:
         if isinstance(record, Record) and has_undecodable(record.raw):
             yield make_reject(record.line_no, UNDECODABLE_REASON, record.raw)
@@ -125,6 +130,7 @@ def validate_chunk(data: bytes, message: ChunkMessage) -> ValidationResult:
 
 
 def staging_csv(rows: Sequence[UserRow]) -> io.StringIO:
+    """Write the rows, numbered in file order, as CSV for COPY into staging."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     for seq, row in enumerate(rows):

@@ -73,6 +73,7 @@ def summarise(rejects: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
 
 
 def stored_reasons(conn: Connection, batch_id: uuid.UUID) -> list[tuple[int, str]]:
+    """Return the batch's stored (line_no, reason) pairs in line order."""
     return [(int(line), str(reason)) for line, reason in conn.run(REASONS_SQL, id=batch_id)]
 
 
@@ -83,6 +84,7 @@ def spreadsheet_safe(value: str | None) -> str:
 
 
 def rejects_csv(rows: Sequence[tuple[int, str, str | None]]) -> str:
+    """Render reject rows as CSV with formula-like cells neutralised."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\r\n")
     writer.writerow(CSV_HEADER)

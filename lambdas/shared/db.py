@@ -35,6 +35,7 @@ def tls_context(ca_bundle: str | None) -> ssl.SSLContext | None:
 
 
 def open_connection(config: DbConfig) -> Connection:
+    """Open a pg8000 connection that verifies the server certificate and hostname."""
     ca_bundle = str(config.ca_bundle) if config.ca_bundle else None
     return pg8000.native.Connection(
         user=config.user,
@@ -54,6 +55,7 @@ def server_error(error: DatabaseError) -> tuple[str, str]:
 
 
 def is_alive(conn: Connection) -> bool:
+    """Return True if a trivial query still succeeds on the connection."""
     try:
         conn.run("SELECT 1")
     except (InterfaceError, DatabaseError, OSError):
@@ -70,6 +72,7 @@ class Database:
         self._conn: Connection | None = None
 
     def connection(self) -> Connection:
+        """Return the cached connection, reconnecting once if it has died."""
         if self._conn is not None and is_alive(self._conn):
             return self._conn
         self.reset()

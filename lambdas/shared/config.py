@@ -63,6 +63,8 @@ class _EnvReader:
 
 @dataclass(frozen=True)
 class DbConfig:
+    """Connection settings for RDS; the password is kept out of `repr`."""
+
     host: str
     port: int
     database: str
@@ -72,6 +74,7 @@ class DbConfig:
 
     @classmethod
     def read(cls, env: _EnvReader) -> DbConfig:
+        """Read DB_* variables; the CA bundle defaults to the packaged RDS bundle."""
         override = env.optional_text("DB_SSLROOTCERT")
         return cls(
             host=env.text("DB_HOST"),
@@ -88,11 +91,14 @@ class DbConfig:
 
 @dataclass(frozen=True)
 class WebhookConfig:
+    """Where to POST a finished batch and the HS256 key that signs the token."""
+
     url: str
     secret: str
 
     @classmethod
     def read(cls, env: _EnvReader) -> WebhookConfig:
+        """Read the n8n URL and a signing key of at least 32 characters."""
         secret = env.text("N8N_WEBHOOK_SECRET")
         if secret and len(secret) < MIN_SIGNING_KEY_CHARS:
             env.problems.append(
@@ -107,6 +113,8 @@ class WebhookConfig:
 
 @dataclass(frozen=True)
 class UploadUrlConfig:
+    """Settings for get-upload-url: database, upload bucket, size cap."""
+
     db: DbConfig
     bucket: str
     max_upload_bytes: int
@@ -114,6 +122,8 @@ class UploadUrlConfig:
 
 @dataclass(frozen=True)
 class SplitCsvConfig:
+    """Settings for split-csv: target queue, size cap, records per chunk."""
+
     queue_url: str
     max_upload_bytes: int
     chunk_rows: int
@@ -121,6 +131,8 @@ class SplitCsvConfig:
 
 @dataclass(frozen=True)
 class LoadChunkConfig:
+    """Settings for load-chunk: database, upload bucket, n8n webhook."""
+
     db: DbConfig
     bucket: str
     webhook: WebhookConfig
@@ -128,10 +140,13 @@ class LoadChunkConfig:
 
 @dataclass(frozen=True)
 class BatchStatusConfig:
+    """Settings for batch-status: the database only."""
+
     db: DbConfig
 
 
 def log_level(env: Mapping[str, str]) -> str:
+    """Return LOG_LEVEL upper-cased (default INFO); raise ConfigError if unknown."""
     level = env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
     if level not in LOG_LEVELS:
         raise ConfigError(f"LOG_LEVEL must be one of {sorted(LOG_LEVELS)}, got {level!r}")
@@ -139,6 +154,7 @@ def log_level(env: Mapping[str, str]) -> str:
 
 
 def upload_url_config(env: Mapping[str, str]) -> UploadUrlConfig:
+    """Build get-upload-url's config or raise one ConfigError naming every problem."""
     reader = _EnvReader(env)
     config = UploadUrlConfig(
         db=DbConfig.read(reader),
@@ -150,6 +166,7 @@ def upload_url_config(env: Mapping[str, str]) -> UploadUrlConfig:
 
 
 def split_csv_config(env: Mapping[str, str]) -> SplitCsvConfig:
+    """Build split-csv's config or raise one ConfigError naming every problem."""
     reader = _EnvReader(env)
     config = SplitCsvConfig(
         queue_url=reader.http_url("INGEST_QUEUE_URL"),
@@ -161,6 +178,7 @@ def split_csv_config(env: Mapping[str, str]) -> SplitCsvConfig:
 
 
 def load_chunk_config(env: Mapping[str, str]) -> LoadChunkConfig:
+    """Build load-chunk's config or raise one ConfigError naming every problem."""
     reader = _EnvReader(env)
     config = LoadChunkConfig(
         db=DbConfig.read(reader),
@@ -172,6 +190,7 @@ def load_chunk_config(env: Mapping[str, str]) -> LoadChunkConfig:
 
 
 def batch_status_config(env: Mapping[str, str]) -> BatchStatusConfig:
+    """Build batch-status's config or raise one ConfigError naming every problem."""
     reader = _EnvReader(env)
     config = BatchStatusConfig(db=DbConfig.read(reader))
     reader.raise_if_invalid()

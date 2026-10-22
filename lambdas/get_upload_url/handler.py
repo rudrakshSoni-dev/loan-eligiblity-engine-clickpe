@@ -35,6 +35,8 @@ ALLOWED_METHOD = "POST"
 
 @dataclass(frozen=True)
 class Runtime:
+    """Objects built once per warm container: config, database, S3 signer."""
+
     config: UploadUrlConfig
     database: Database
     s3: S3PostSigner
@@ -42,6 +44,7 @@ class Runtime:
 
 @cache
 def runtime() -> Runtime:
+    """Configure logging and build the Runtime on the first invocation."""
     configure_logging(log_level(os.environ))
     config = upload_url_config(os.environ)
     return Runtime(
@@ -52,6 +55,7 @@ def runtime() -> Runtime:
 
 
 def json_response(status: HTTPStatus, body: dict[str, Any]) -> dict[str, Any]:
+    """Build a Function URL JSON response."""
     return {
         "statusCode": status.value,
         "headers": {"content-type": "application/json"},
@@ -60,6 +64,7 @@ def json_response(status: HTTPStatus, body: dict[str, Any]) -> dict[str, Any]:
 
 
 def http_method(event: dict[str, Any]) -> str:
+    """Return the request's HTTP method, upper-cased."""
     method = event.get("requestContext", {}).get("http", {}).get("method", "")
     return str(method).upper()
 

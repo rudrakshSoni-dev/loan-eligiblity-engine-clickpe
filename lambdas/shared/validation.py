@@ -62,16 +62,21 @@ class FieldError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ColumnLayout:
+    """Header columns in file order and the position of each required column."""
+
     columns: tuple[str, ...]
     positions: Mapping[str, int]
 
     @property
     def ignored(self) -> tuple[str, ...]:
+        """Columns present in the file that the loader does not use."""
         return tuple(c for c in self.columns if c not in REQUIRED_COLUMNS)
 
 
 @dataclass(frozen=True, slots=True)
 class Record:
+    """One parsed CSV record with the file line it starts on and its raw text."""
+
     line_no: int
     fields: list[str]
     raw: str
@@ -79,6 +84,8 @@ class Record:
 
 @dataclass(frozen=True, slots=True)
 class Reject:
+    """One refused record: its line, every problem found, and its raw text."""
+
     line_no: int
     reason: str
     raw: str
@@ -86,6 +93,8 @@ class Reject:
 
 @dataclass(frozen=True, slots=True)
 class UserRow:
+    """A validated, normalised row ready for the `users` table."""
+
     user_id: uuid.UUID
     name: str
     email: str
@@ -97,15 +106,19 @@ class UserRow:
 
 @dataclass(slots=True)
 class ValidationResult:
+    """Valid rows and rejects from one chunk or file."""
+
     valid: list[UserRow] = field(default_factory=list)
     rejects: list[Reject] = field(default_factory=list)
 
 
 def make_reject(line_no: int, reason: str, raw: str) -> Reject:
+    """Build a reject, truncating the raw text to MAX_RAW_LENGTH."""
     return Reject(line_no=line_no, reason=reason, raw=raw[:MAX_RAW_LENGTH])
 
 
 def shown(value: str) -> str:
+    """Quote a value for a reject reason, cut to MAX_SHOWN_VALUE_LENGTH characters."""
     return repr(
         value[:MAX_SHOWN_VALUE_LENGTH] + ("…" if len(value) > MAX_SHOWN_VALUE_LENGTH else "")
     )
@@ -162,18 +175,21 @@ def read_records(text: str, first_line_no: int = 1) -> Iterator[Record | Reject]
 
 
 def parse_user_id(value: str) -> uuid.UUID:
+    """Return the UUID or raise FieldError."""
     if not UUID_PATTERN.fullmatch(value):
         raise FieldError(f"{shown(value)} is not a UUID")
     return uuid.UUID(value)
 
 
 def parse_name(value: str) -> str:
+    """Return the name or raise FieldError if it is too long."""
     if len(value) > MAX_NAME_LENGTH:
         raise FieldError(f"longer than {MAX_NAME_LENGTH} characters")
     return value
 
 
 def parse_email(value: str) -> str:
+    """Return the lower-cased email or raise FieldError if it is not valid."""
     email = value.lower()
     if not (email.isascii() and len(email) <= MAX_EMAIL_LENGTH and EMAIL_PATTERN.fullmatch(email)):
         raise FieldError(f"{shown(value)} is not a valid email address")
@@ -181,12 +197,15 @@ def parse_email(value: str) -> str:
 
 
 def parse_monthly_income(value: str) -> Decimal:
+    """Return a positive amount with up to 2 decimals or raise FieldError."""
     if not AMOUNT_PATTERN.fullmatch(value) or Decimal(value) <= 0:
         raise FieldError(f"{shown(value)} is not a positive amount (digits, up to 2 decimals)")
     return Decimal(value)
 
 
 def whole_number_between(low: int, high: int) -> Callable[[str], int]:
+    """Return a parser that accepts whole numbers from `low` to `high`."""
+
     def parse(value: str) -> int:
         if not WHOLE_NUMBER_PATTERN.fullmatch(value) or not low <= int(value) <= high:
             raise FieldError(f"{shown(value)} is not a whole number from {low} to {high}")
@@ -196,6 +215,7 @@ def whole_number_between(low: int, high: int) -> Callable[[str], int]:
 
 
 def parse_employment_status(value: str) -> str:
+    """Map any casing or punctuation to the canonical employment value."""
     status = EMPLOYMENT_BY_KEY.get(re.sub(r"[^a-z]", "", value.lower()))
     if status is None:
         raise FieldError(f"{shown(value)} is not one of {', '.join(EMPLOYMENT_STATUSES)}")
@@ -261,6 +281,7 @@ def validate_rows(records: Iterable[Record | Reject], layout: ColumnLayout) -> V
 def reject_if_duplicate(
     row: UserRow, record: Record, first_line: dict[uuid.UUID, int]
 ) -> UserRow | Reject:
+    """Keep the first row for a user_id; later ones become rejects."""
     seen_at = first_line.setdefault(row.user_id, record.line_no)
     if seen_at == record.line_no:
         return row

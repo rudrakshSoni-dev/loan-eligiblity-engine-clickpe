@@ -33,18 +33,22 @@ REJECTS_DOWNLOAD = "rejects"
 
 @dataclass(frozen=True)
 class Runtime:
+    """Objects built once per warm container: config and database."""
+
     config: BatchStatusConfig
     database: Database
 
 
 @cache
 def runtime() -> Runtime:
+    """Configure logging and build the Runtime on the first invocation."""
     configure_logging(log_level(os.environ))
     config = batch_status_config(os.environ)
     return Runtime(config=config, database=Database(config.db))
 
 
 def json_response(status: HTTPStatus, body: dict[str, Any]) -> dict[str, Any]:
+    """Build a Function URL JSON response that is never cached."""
     return {
         "statusCode": status.value,
         "headers": {"content-type": "application/json", "cache-control": "no-store"},
@@ -56,6 +60,7 @@ NOT_FOUND = json_response(HTTPStatus.NOT_FOUND, {"error": "unknown batch_id"})
 
 
 def csv_attachment(batch_id: uuid.UUID, body: str) -> dict[str, Any]:
+    """Build a Function URL response that downloads the rejects CSV."""
     return {
         "statusCode": HTTPStatus.OK.value,
         "headers": {
@@ -68,16 +73,19 @@ def csv_attachment(batch_id: uuid.UUID, body: str) -> dict[str, Any]:
 
 
 def http_method(event: dict[str, Any]) -> str:
+    """Return the request's HTTP method, upper-cased."""
     method = event.get("requestContext", {}).get("http", {}).get("method", "")
     return str(method).upper()
 
 
 def query_parameter(event: dict[str, Any], name: str) -> str | None:
+    """Return one query-string value, or None."""
     value = (event.get("queryStringParameters") or {}).get(name)
     return None if value is None else str(value)
 
 
 def requested_batch_id(event: dict[str, Any]) -> uuid.UUID | None:
+    """Return `batch_id` from the query string, or None if it is not a UUID."""
     raw = query_parameter(event, "batch_id") or ""
     try:
         return uuid.UUID(raw)
@@ -92,6 +100,7 @@ class DatabaseUnavailableError(Exception):
 def read_batch[T](
     app: Runtime, stage: str, batch_id: uuid.UUID, reader: Callable[[Connection, uuid.UUID], T]
 ) -> T:
+    """Run one timed read; on a connection error reset it and raise Unavailable."""
     try:
         with timed(logger, stage, batch_id=str(batch_id)) as fields:
             result = reader(app.database.connection(), batch_id)

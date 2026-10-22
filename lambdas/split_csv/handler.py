@@ -48,6 +48,8 @@ Plan = list[ChunkMessage | SplitFailure]
 
 @dataclass(frozen=True)
 class Runtime:
+    """Objects built once per warm container: config, S3 reader, SQS client."""
+
     config: SplitCsvConfig
     s3: S3ObjectReader
     sqs: MessageSender
@@ -55,6 +57,7 @@ class Runtime:
 
 @cache
 def runtime() -> Runtime:
+    """Configure logging and build the Runtime on the first invocation."""
     configure_logging(log_level(os.environ))
     region = os.environ["AWS_REGION"]
     return Runtime(
@@ -71,6 +74,7 @@ def handler(event: dict[str, Any], context: object) -> dict[str, Any]:
 
 
 def split_record(app: Runtime, record: dict[str, Any]) -> int:
+    """Plan and queue the messages for one S3 record; return how many were sent."""
     upload = upload_from_record(record)
     if upload is None:
         key = record.get("s3", {}).get("object", {}).get("key")

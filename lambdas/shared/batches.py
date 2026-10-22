@@ -26,6 +26,8 @@ UPLOAD_PREFIX = "uploads/"
 
 
 class BatchStatus(StrEnum):
+    """Every status an upload batch can have, as stored in `upload_batches.status`."""
+
     PENDING = "pending"
     LOADING = "loading"
     PROCESSED = "processed"
@@ -61,15 +63,18 @@ class BatchStateError(Exception):
 
 
 def upload_key(batch_id: uuid.UUID) -> str:
+    """Return the only S3 key a batch's CSV may have: `uploads/{batch_id}.csv`."""
     return f"{UPLOAD_PREFIX}{batch_id}.csv"
 
 
 def check_transition(current: BatchStatus, target: BatchStatus) -> None:
+    """Raise InvalidTransitionError unless TRANSITIONS allows current → target."""
     if target not in TRANSITIONS[current]:
         raise InvalidTransitionError(f"batch status cannot change from {current} to {target}")
 
 
 def create_batch(conn: Connection) -> uuid.UUID:
+    """Insert a new `pending` batch row and return its id."""
     batch_id = uuid.uuid4()
     conn.run(
         "INSERT INTO upload_batches (id, s3_key) VALUES (:id, :key)",
