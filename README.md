@@ -129,7 +129,7 @@ flowchart TB
 - An AWS account and a CLI profile named `clickpe`. This account is locked by an organisation SCP to `ap-southeast-2`; the region is one value in `serverless.yml`.
 - Three SES identities verified in that region: a Gmail address and its `+one` and `+two` aliases. SES stays in the sandbox, which is a second guard against mailing real users.
 - A Groq API key.
-- Local tools: Node.js 22, `uv`, Docker, `jq`, `curl`, Python 3.12.
+- Local tools: Node.js 22, `uv`, Docker, `jq`, `curl`, Python 3.12, and the AWS CLI v2 with the Session Manager plugin (every RDS and n8n command goes through SSM).
 - The sample `users.csv` in `data/`. The folder is gitignored because the file is personal data.
 
 ```bash
@@ -245,7 +245,13 @@ scripts/verify_workflow_import.sh
     UPDATE app_config SET value = 'true' WHERE key = 'dry_run';
     ```
 
-    Run the first statement to send and the second to turn sending off again.
+    Run the first statement to send and the second to turn sending off again, for example with `scripts/rds_query.sh "<SQL>"`, which runs psql on the n8n host through SSM.
+
+    Uploading a file the database already holds is a no-op by design: 0 rows inserted or updated, so 0 pairs, 0 matches and 0 emails. To see new matches and emails, upload users the database has never seen. A new seed gives new user ids, and every address ends in `@example.invalid`:
+
+    ```bash
+    uv run python scripts/gen_synthetic_users.py --rows 50 --seed 20261024 --output data/demo_new_users.csv
+    ```
 5. If n8n was down when a batch finished loading, the batch stays `processed`. Re-send the trigger with `scripts/retrigger_batch.sh <batch_id>`.
 
 ## Design decisions
