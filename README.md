@@ -133,7 +133,8 @@ flowchart TB
 - The sample `users.csv` in `data/`. The folder is gitignored because the file is personal data.
 
 ```bash
-git clone <this repo> && cd loan-eligiblity-engine-clickpe
+git clone https://github.com/rudrakshSoni-dev/loan-eligiblity-engine-clickpe.git
+cd loan-eligiblity-engine-clickpe
 make install
 ```
 
@@ -194,12 +195,13 @@ n8n runs as the exact image `docker.n8n.io/n8nio/n8n:2.44.4` from [n8n/docker-co
 Open the editor through an SSM port forward. There is no internet path to it:
 
 ```bash
-aws ssm start-session --profile clickpe --region ap-southeast-2 --target <instance-id> \
+N8N_INSTANCE_ID=i-02ffa9d08e8403a4a
+aws ssm start-session --profile clickpe --region ap-southeast-2 --target "$N8N_INSTANCE_ID" \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["5678"],"localPortNumber":["5678"]}'
 ```
 
-The demo instance is `i-02ffa9d08e8403a4a`. Without `--region` (or `AWS_REGION`) the CLI stops with `NoRegion`. The command needs the AWS Session Manager plugin installed locally; leave the terminal open while you use the editor. If something on your machine already listens on port 5678 (for example a local n8n), `localhost:5678` opens that instead: set `"localPortNumber":["5679"]` and browse to `http://localhost:5679`.
+`i-02ffa9d08e8403a4a` is the demo instance; in another account use your own instance id. Without `--region` (or `AWS_REGION`) the CLI stops with `NoRegion`. The command needs the AWS Session Manager plugin installed locally; leave the terminal open while you use the editor. If something on your machine already listens on port 5678 (for example a local n8n), `localhost:5678` opens that instead: change only `localPortNumber` to `5679` and browse to `http://localhost:5679`. `portNumber` stays `5678`, because that is where n8n listens on the instance.
 
 Browse to `http://localhost:5678`, create the owner account and enable 2FA under Settings → Personal (this step is done in the browser). Then create four credentials by name, because workflows refer to the names only. Screenshots with values masked are in [docs/screenshots/](docs/screenshots).
 
