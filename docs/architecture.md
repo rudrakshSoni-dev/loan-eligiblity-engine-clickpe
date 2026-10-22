@@ -1,7 +1,8 @@
 # Architecture
 
 Region `ap-southeast-2`, stack `clickpe-loan-engine`, default VPC `vpc-0cddb8b4387b5bbdc` (`172.31.0.0/16`).
-Every box below exists in `serverless.yml`, `infra/` or `n8n/workflows/`; items not built are drawn dashed and
+Every box below exists in `serverless.yml`, `infra/` or `n8n/workflows/`. Dashed arrows are failure paths
+(async failure destination, Error Workflow) and the SSM tunnel. Items that are not built are not drawn; they are
 listed under "Designed, not implemented".
 
 ## System diagram
@@ -134,6 +135,6 @@ These are not in the deployed system and are drawn nowhere above.
 
 | Item | Task | State |
 |---|---|---|
-| CloudWatch alarm on `ingest-dlq` depth | T21 | Built and drilled: alarm, batch marked `failed` on the 5th receive, `scripts/redrive_dlq.sh` |
+| Notification target (SNS) for the `ingest-dlq` and `split-failures` alarms | n/a | The alarms are built and drilled (T21); nobody is notified yet |
 | Transactional outbox for the n8n trigger | n/a | Production upgrade; `scripts/retrigger_batch.sh` is the recovery path |
 | API Gateway in front of the Function URLs, Multi-AZ RDS, Secrets Manager | n/a | Production upgrades only |

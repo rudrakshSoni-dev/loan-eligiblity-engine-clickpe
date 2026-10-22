@@ -113,13 +113,13 @@ flowchart TB
 
 | Path | What it holds |
 |---|---|
-| [serverless.yml](serverless.yml) | The whole AWS ingestion stack: bucket, queues, four Lambdas, IAM roles, security group, S3 Gateway Endpoint |
+| [serverless.yml](serverless.yml) | The whole AWS ingestion stack: bucket, queues, four Lambdas, IAM roles, security group, S3 Gateway Endpoint, alarms. RDS and the n8n host are created by the scripted CLI commands in `infra/`, so `sls remove` can never delete them |
 | [lambdas/](lambdas) | `get_upload_url`, `split_csv`, `load_chunk`, `batch_status` (thin handlers) and `shared/` (pure, unit-tested logic) |
 | [db/](db) | `schema.sql`, numbered migrations, `seed_products.sql`, the checksummed migration runner `migrate.py` |
-| [n8n/](n8n) | `docker-compose.yml` and the exported workflows A, B and C |
+| [n8n/](n8n) | `docker-compose.yml` and the five exported workflows: A (product discovery), B (matching), C (notification), E (error handler) and G (LLM Gateway) |
 | [ui/](ui) | One static page, no framework |
 | [infra/](infra) | Step-by-step records and scripts for RDS, EC2, n8n, and the IAM policy documents |
-| [scripts/](scripts) | `smoke_test.sh`, `benchmark_run.sh`, `benchmark.md`, `gen_synthetic_users.py`, `measure_naive_llm.py`, `rds_query.sh`, `retrigger_batch.sh`, `serve_ui.sh`, `verify_workflow_import.sh`, `check_package.py` |
+| [scripts/](scripts) | `smoke_test.sh`, `benchmark_run.sh`, `benchmark.md`, `gen_synthetic_users.py`, `measure_naive_llm.py`, `rds_query.sh`, `redrive_dlq.sh`, `retrigger_batch.sh`, `serve_ui.sh`, `set_db_role_passwords.sh`, `verify_workflow_import.sh`, `check_package.py` |
 | [tests/](tests) | Unit tests, PostgreSQL-backed integration tests, CSV fixtures |
 | [docs/](docs) | `decisions.md` (every choice, the rejected option and the evidence), `architecture.md`, `data-notes.md`, `stage1-explain.md`, `rubric-evidence.md`, screenshots |
 | [PROGRESS.md](PROGRESS.md) | Per-task log with commands and trimmed output for every number in this README |
@@ -361,9 +361,9 @@ The SQL and Code nodes inside the exported workflows are tested where they live:
 
 Stated plainly, because these are known:
 
-- **Built, not just designed (T21):** CloudWatch alarms on `ingest-dlq` and `split-failures` (visible messages > 0, no notification target yet), a loader that marks the batch `failed` with the chunk number on the fifth receive, and `scripts/redrive_dlq.sh`. Redriving cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
-- **Built, not just designed (T25):** Workflow E records every failed automatic execution of A, B and C in `n8n_errors` and sends one alert email to a test alias. It only runs because it is published; an Error Workflow that is merely imported is refused by n8n 2.44.4. A failure that a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it.
-- **Built, not just designed (T26):** the LLM Gateway sub-workflow is the only caller of Groq. Drilled live: a real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out for 15 s and the retry answered; with waits disabled in a throwaway copy, a 429 switched to `gpt-oss-20b`, which answered; a reply that broke the schema was rejected. Workflow B no longer spaces Stage 3 requests 20 s apart; it waits only when Groq returns 429. A verdict produced by the 20b fallback is cached like any other.
+- **DLQ alarms have no notification target (T21).** The CloudWatch alarms on `ingest-dlq` and `split-failures` go to ALARM (drilled) but notify nobody yet. Redriving with `scripts/redrive_dlq.sh` cannot revive a batch that is already `failed`: the loader skips it, so the file must be uploaded again.
+- **Workflow E sees only unhandled failures (T25).** It records failed automatic executions of A, B, C and the LLM Gateway in `n8n_errors` and sends one alert to a test alias. A failure a workflow handles itself (for example Workflow B marking a batch `failed` and ending normally) is not an n8n error, so E does not see it. E must be published, not only imported: n8n 2.44.4 skips an unpublished Error Workflow.
+- **The 20b fallback was proven only on a throwaway copy (T26).** A real 429 ("TPM: Limit 8000, Used 4797, Requested 5049", `retry-after` 14 s) was waited out live and the retry answered. The switch to `gpt-oss-20b` was drilled with waits disabled in a copy of the gateway. A verdict produced by the 20b model is cached like any other.
 - **Change detection is keyed on the criteria text only (T29).** If the prompt or model changes, an unchanged page is not re-structured until its `content_hash` is cleared or the text changes.
 - **Demo data.** The 5 seed products are fake and labelled so. Only three lenders are crawled. A lender's published rate is missing for ICICI and HDFC, so their rows have a lower `parse_confidence` and an EMI check of "not checked".
 - **Matches are indicative.** The eligibility rules use public criteria text and stated assumptions; they are not a credit decision.
@@ -378,3 +378,4 @@ Stated plainly, because these are known:
 - A transactional outbox for the n8n trigger instead of the documented retrigger script.
 - Multi-AZ RDS, Secrets Manager with rotation, and DKIM on a verified domain for SES production access.
 - Step Functions Inline Map for fan-out, the runner-up considered in `docs/decisions.md`.
+- RDS, the n8n host and the SES role as a separate, termination-protected CloudFormation stack instead of the scripted CLI commands in `infra/`.

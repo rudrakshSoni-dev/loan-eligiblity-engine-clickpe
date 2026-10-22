@@ -45,11 +45,12 @@ network/security, database, n8n/LLM) is summarised here; the cited sources are l
 31. [Workflow B persist: matches written from the database, final count read back](#workflow-b-persist-matches-written-from-the-database-final-count-read-back)
 32. [Workflow C: compose and recipient guard](#workflow-c-compose-and-recipient-guard)
 33. [Workflow C sending: SES at the sandbox rate, send then mark](#workflow-c-sending-ses-at-the-sandbox-rate-send-then-mark)
-34. [LLM Gateway (T26)](#llm-gateway-t26)
-35. [DLQ handling (T21)](#dlq-handling-t21)
-36. [Workflow E: global error handler (T25)](#workflow-e-global-error-handler-t25)
+34. [DLQ handling (T21)](#dlq-handling-t21)
+35. [Workflow E: global error handler (T25)](#workflow-e-global-error-handler-t25)
+36. [LLM Gateway (T26)](#llm-gateway-t26)
 37. [Change detection (T29)](#change-detection-t29)
 38. [Security review (T45)](#security-review-t45)
+39. [Cost (T46)](#cost-t46)
 
 ---
 
@@ -151,9 +152,9 @@ strings, drops extra fields and treats every field as a string
 ([ItemReader](https://docs.aws.amazon.com/step-functions/latest/dg/input-output-itemreader.html)).
 That silently repairs malformed rows and destroys the per-line reject report.
 
-**Time-crunch fallback.** If `split-csv` (T17, P1) is cut, `load-chunk` is triggered by S3 directly
-and loads the file in chunked transactions; the README then calls the SQS fan-out "designed, not
-implemented".
+**Time-crunch fallback (not needed).** The plan was that if `split-csv` (T17) were cut, `load-chunk`
+would be triggered by S3 directly and load the file in chunked transactions. T17 was built and
+deployed, so the fan-out is the running design.
 
 ## Concurrency cap: SQS MaximumConcurrency, not reserved concurrency
 
@@ -715,9 +716,16 @@ borderline band.
 ## Infrastructure as code: Serverless Framework v3
 
 **Choice.** Serverless Framework 3.40.0 with `serverless-python-requirements` 6.1.2, pinned in
-`package.json` / `package-lock.json`. All resources are in one `serverless.yml`: the four functions, the S3
-bucket, both queues, the event source mapping, the S3 Gateway Endpoint, the Lambda security group and
-the per-function roles.
+`package.json` / `package-lock.json`. The whole ingestion stack is in one `serverless.yml`: the four
+functions, the S3 bucket, the three queues, the event source mapping, the S3 Gateway Endpoint, the
+Lambda security group, the per-function roles and the two alarms.
+
+**Not in `serverless.yml` (stated plainly).** The RDS instance, the EC2 n8n host, their security
+groups, the SES-only IAM role and the three security-group ingress rules are created by the scripted
+AWS CLI commands in `infra/rds.md`, `infra/ec2.md` and `infra/iam/`. Keeping the stateful database
+and n8n host outside the application stack means an `sls remove` can never delete them; the cost is
+that a fresh account needs those commands before `sls deploy` instead of one command. Moving them into
+CloudFormation (as a separate, termination-protected stack) is future work.
 
 **Rejected.**
 - *Serverless Framework v4.* It requires a Serverless account login, and a paid licence for

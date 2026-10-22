@@ -48,13 +48,13 @@
 | T44 | P1 | Test coverage pass | DONE | 2026-10-22 | Coverage gate now covers all of `lambdas` (handlers too) at a 95% floor; 100.00% branch coverage, 691 passed against postgres:16 |
 | T45 | P1 | Security review | DONE | 2026-10-22 | 12-item live checklist; fixed: webhook key in n8n executions (signed 60 s HS256 token, key rotated, 7 live drills), master DB user everywhere (`app_ingest` / `app_n8n`, 39 role tests, A/B/C/E + upload live), account S3 BPA; 6 residual risks with fixes; 691 passed |
 | T46 | P1 | Cost table | DONE | 2026-10-22 | Demo stack $42.26/month at list prices (RDS + n8n host = 91%); 1M users/month ≈ $42.3 without email, +$60.17 if all matched users were mailed; NAT ($43.07) and per-pair LLM ($585.18) priced as avoided costs |
-| T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and LLM Gateway do not exist yet: T25 / T26 must add their exports |
-| T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; diagram labels T21/T25/T26/T29 as not built |
-| T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items (T21/T25/T26/T29/T37/T41 deploy/T45/T46) stated plainly; EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
+| T47 | P0 | Export workflows | DONE | 2026-10-22 | A, B, C: node + connection hashes identical to the live EC2 n8n, no pinned data, no secrets, all 3 import into a fresh n8n 2.44.4 container (`scripts/verify_workflow_import.sh`). E and the LLM Gateway were added later the same way (T25, T26): 5 exports |
+| T48 | P0 | Architecture diagram | DONE | 2026-10-22 | `docs/architecture.md` + README section; rendered with mermaid-cli; T21/T25/T26/T29 were built later and the diagram updated (T26, T53) |
+| T49 | P0 | README | DONE | 2026-10-22 | README in the required section order; every number traced to a measured run; unbuilt items at the time stated plainly (all built since; T53 rewrote the Limitations to match); EC2 launch commands added to `infra/ec2.md`; 506 passed, 100% coverage on `lambdas/shared` |
 | T50 | P0 | Video script | DONE | 2026-10-22 | `docs/video-script.md`: 8 segments, 8.4 min of narration at 140 wpm (1,177 words) inside the 8:45 box; pre-record checklist, on-screen cues, number-to-source table, "not to claim" list |
 | T51 | P0 | Rehearsal | DONE | 2026-10-22 | Rehearsed through 10 Loom takes; transcript checked against the repo, 6 factually wrong lines and 1 repeat cut. The 10-question reviewer drill was not run (user's decision, time) |
 | T52 | P0 | Record + upload | IN PROGRESS | 2026-10-22 | Recorded and edited: `final_demo_with_intro.mp4`, 8:42 (5 s intro, 11:57 cut at 1.4x, 4 s end card). Upload + incognito check still to do |
-| T53 | P0 | Final rubric audit | TODO | |  |
+| T53 | P0 | Final rubric audit | DONE | 2026-10-22 | Estimate ≈ 89/100 (n8n 27/30, Cloud 18/20, Backend 27/30, Docs 17/20 if the video link lands); 9 fixes applied (stale docs, false "all resources in serverless.yml" claim, 99 docstrings, junk files); 691 passed, 100% coverage; 3 open items need the user (video link, collaborators, submit) |
 | T54 | P0 | Submit | TODO | |  |
 
 Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`. ⚖️ = architectural choice; needs the user's "go" before coding.
@@ -1179,8 +1179,6 @@ Statuses: `TODO`, `IN PROGRESS`, `DONE`, `SKIPPED (reason)`, `BLOCKED (reason)`.
   - Q: Strict Structured Outputs guarantee the schema, so why validate again? A: The guarantee belongs to one mode and one model. The JSON-mode drill showed that a schema-breaking reply would otherwise reach the caller as `ok`. The check is cheap, and the callers still apply their own meaning checks (A's grounding, B's one verdict per cohort).
   - Q: What happens if a caller sends 10 items at once? A: Execute Workflow runs in mode "each", so each item is its own gateway execution and its own answer, in order. Mode "once" would deliver all items to one execution, whose output is only the last node's, so answers on different paths would be lost; `Prepare` throws on more than one item and a wiring test pins mode "each".
 
-Task T26 complete. Run the commit commands above, then start a new session (`/clear` or a fresh `claude`) for the next task.
-
 
 ### T29 — Workflow A: change detection (2026-10-22)
 - Files: `n8n/workflows/workflow-a-product-discovery.json` (24 → 27 nodes: `Lookup · Stored content hash`, `Tag · Content unchanged`, `Check · Content changed`, `Touch · last_seen_at + crawl_runs (unchanged)`, `Mark · Touch failed`; sticky note stage 3 added), `tests/integration/test_change_detection_db.py`, `tests/unit/test_workflow_a_change_detection.py`, `docs/decisions.md` (new section "Change detection (T29)"), `docs/rubric-evidence.md`, `infra/n8n.md`, `README.md`, `docs/architecture.md`, `docs/video-script.md` (T29 moved from "not built" to built). Scratch generator, drill variant and execution reader are in the session scratchpad only.
@@ -1203,8 +1201,6 @@ Task T26 complete. Run the commit commands above, then start a new session (`/cl
   - Q: What happens if the database lookup fails? A: It continues on the regular output with no `unchanged: true`, so the page goes to the LLM. Execution 135 proved it: 3 calls, nothing skipped. Failing closed would leave a changed criterion stale, which costs more than one call.
   - Q: If I change the prompt, will an unchanged page be re-structured? A: No. The hash covers the text only. Clearing `content_hash` for that product forces a re-run, and this limit is stated in the README and decisions.md.
   - Q: How do you know the skip path never calls Groq? A: A wiring test walks the connection graph from `Touch` and asserts the gateway node is unreachable, and the live ledger stayed at 90 rows across execution 131.
-
-Task T29 complete. Run the commit commands above, then start a new session (`/clear` or a fresh `claude`) for the next task.
 
 ### T45 — Security review (2026-10-22)
 - Files: `lambdas/shared/notify.py`, `lambdas/shared/config.py`, `n8n/workflows/workflow-b-matching.json`, `db/0009_app_roles.sql` (new), `db/migrate.py`, `scripts/set_db_role_passwords.sh` (new), `scripts/retrigger_batch.sh`, `serverless.yml`, `.env.example`, `tests/integration/test_app_roles_db.py` (new), `tests/unit/test_notify.py`, `tests/unit/test_config.py`, `tests/unit/test_load_chunk.py`, `tests/unit/test_workflow_b_wiring.py`, `tests/webhook_helpers.py`, `tests/integration/test_completion_trigger_db.py`, `tests/integration/test_migrate_db.py`, `docs/decisions.md` (new section "Security review (T45)", webhook / trigger / Workflow B entry / secrets updated), `README.md`, `docs/architecture.md`, `docs/video-script.md`, `infra/n8n.md`, `docs/rubric-evidence.md`, `PROGRESS.md`.
@@ -1301,3 +1297,45 @@ Task T29 complete. Run the commit commands above, then start a new session (`/cl
 - Edited: 10 cut ranges from the T51 transcript review → `trimmed.mp4` 717.0 s; 1.4x with pitch kept (`atempo`) → 512.2 s; 5 s intro card + 4 s end card with the repo link → `final_demo_with_intro.mp4` 521.6 s = 8:42 (limit 9:00). Frames at the card boundaries checked. Files live in `~/demo-video`, outside the repo.
 - Known: Loom's recording controls and the face bubble are visible in the takes and cover part of the README near the end.
 - Open: upload (YouTube Unlisted or Drive "anyone with link"), open the link in incognito, add the link to README and to this entry.
+
+### T53 — Final rubric audit (2026-10-22)
+- Method: read README, `docs/architecture.md`, `docs/decisions.md`, `docs/video-script.md`, `docs/rubric-evidence.md` and the 5 workflow exports as a strict reviewer, line by line against the brief (`The Loan Eligibility Engine (Engineering Intern).txt`), then re-ran every gate.
+- Files: `README.md`, `docs/architecture.md`, `docs/decisions.md`, `docs/rubric-evidence.md`, `PROGRESS.md`, 17 Python files under `lambdas/` and `db/` (docstrings only)
+- Evidence:
+  - `TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55433 TEST_DB_PASSWORD=test make check` (throwaway `postgres:16`, removed afterwards) → `All checks passed!`, `99 files already formatted`, `Success: no issues found in 82 source files`, `TOTAL 1209 0 222 0 100%`, `691 passed in 155.30s`. Same result before and after the docstring pass.
+  - Workflow hygiene (script over `n8n/workflows/*.json`): A 26 / B 31 / C 22 / E 8 / G 12 nodes, every name descriptive (`Stage · …` style), 1 sticky note each, `errorWorkflow = wferrorhandler01` on A, B, C, G, no pinned data. Network nodes without Retry On Fail are only the failure-branch writes (deliberate since T30: a retried INSERT duplicated rows).
+  - Secrets: `grep -rIoE "AKIA[0-9A-Z]{16}|gsk_[A-Za-z0-9]{20,}|-----BEGIN (RSA |EC )?PRIVATE KEY"` over the tree → 0; same patterns over `git log -p` → 0. The CLAUDE.md §0.3 name grep lists only variable names and placeholders (values checked in T45).
+  - Docstrings: 73 → 172 of 190 functions/classes. `git diff -- lambdas db`: 0 removed lines, 0 added lines other than docstrings and the formatter's blank line after a class docstring. The 18 without are private helpers, dunders, Protocol stub methods and one nested parser.
+- Score estimate (strict reviewer, only what is visible; an estimate, not a measurement):
+
+  | Rubric line | Estimate | Why points are kept | Why points may be lost |
+  |---|---|---|---|
+  | n8n Workflow Design (30) | 27 | 5 workflows with a reusable LLM Gateway and a global Error Workflow; change detection; 3-stage funnel with measured numbers (30,000 → 14,165 → 2,221 borderline → 20 cohorts → 2 calls); cache, budget guard, 100k benchmark; per-site failure isolation drilled | Only 3 real products, so "dozens of products" is never exercised; much of the matching is SQL run by Postgres nodes, which a reviewer may read as "not in n8n" |
+  | Cloud Architecture (20) | 18 | Presigned POST, S3 → split → SQS → loader with DLQ and alarms, private RDS with verified TLS, no NAT, SSM-only n8n, signed webhook token, per-function IAM, DB roles | RDS, EC2 and the SES role are created by scripted CLI, not `serverless.yml` (now stated); public `AuthType NONE` Function URLs; account-specific VPC IDs in `serverless.yml` |
+  | Backend & Code Quality (30) | 27 | Typed modular Python, thin handlers, COPY + idempotent upsert, exactly-once completion, 691 tests, 100% branch coverage, mypy strict | The rubric says "well-commented"; the code has no inline comments by project rule. Module docstrings plus 172/190 function docstrings mitigate it |
+  | Docs & Presentation (20) | 17 | Excalidraw + Mermaid diagrams that match the deployed system, README in brief order with measured numbers, decision log, cost table, honest Limitations | No video link anywhere yet (T52); README is long (380 lines); Loom controls cover part of the screen near the end of the video |
+  | **Total** | **≈ 89** | | Without the video link Docs drops by up to ~8 |
+
+- Fixed in this task (each < 1 h):
+  1. `docs/decisions.md` claimed "All resources are in one `serverless.yml`". False: RDS, EC2, their SGs, the SES role and the 3 ingress rules come from `infra/`. Now stated with the trade-off (`sls remove` can never delete stateful resources) and listed as future work; README repo map and Future work say the same.
+  2. README repo map listed workflows "A, B and C" (5 exist) and missed `redrive_dlq.sh` and `set_db_role_passwords.sh`.
+  3. README Limitations had three "Built, not just designed" bullets (T21, T25, T26); rewritten as the limits those features still have (no alarm target, E sees only unhandled failures, 20b fallback drilled only on a copy).
+  4. `docs/architecture.md` said unbuilt items are "drawn dashed" (the dashed arrows are failure paths) and listed the built T21 alarm under "Designed, not implemented"; both corrected.
+  5. `docs/decisions.md` index missed "Cost (T46)" and was out of order; the stale "time-crunch fallback" paragraph now says T17 was built.
+  6. `docs/rubric-evidence.md`: 3 rows still marked 🟡 "not yet deployed" (T10, T17, T18; deployed in T22), stale T48 / T49 rows, T52 row marked ⬜ although recorded.
+  7. `PROGRESS.md`: two pasted hand-off lines removed from the T26 / T29 logs; T47 / T48 / T49 table notes no longer say E, the gateway and change detection are missing.
+  8. 99 one-line docstrings (user's choice: public API only).
+  9. Deleted 2 untracked junk files at the repo root (user's choice): an empty `main` and a file accidentally named `ec2 create-security-group --group-name clickpe-rds-sg \` holding AWS CLI output.
+- Ranked open items (not fixed here):
+  1. Upload the video, check it in incognito, add the link to README and the form (T52 → T54). Highest point value.
+  2. Confirm the 4 collaborators are invited and the repo is private (T54).
+  3. Leave `docs/screenshots/demo-working.png` and `Screenshot from 2026-10-21 22-31-50.png` uncommitted (unreferenced), or reference them before committing.
+  4. User's decision: keep PROGRESS / Makefile / pyproject references to the gitignored CLAUDE.md as they are.
+  5. Over 1 h, not attempted: RDS / EC2 / SES role as a CloudFormation stack; a 4th crawl source (BankBazaar spare) to grow the product list.
+- Rubric: all four lines re-graded; Docs (+ consistent diagram notes, README repo map, Limitations), Cloud (+ honest IaC scope), Backend (+ docstrings)
+- Explain it back:
+  - Built: an audit of the repo as a reviewer sees it, which found docs that lagged behind work finished later the same day and one false claim about `serverless.yml`, fixed them, and added docstrings so "well-commented" is met without breaking the no-comments rule.
+  - Why this over the obvious alternative (re-reading only the README): reviewers also open `docs/` and the workflow JSON, and the stale lines were in `architecture.md`, `decisions.md` and the evidence tracker, not only the README.
+  - Q: Why not move RDS and EC2 into `serverless.yml` now? A: They are live and stateful. Importing them into CloudFormation or recreating them is hours of work and puts the demo database at risk two steps before submission. Stating the scope honestly costs nothing and the reason (an `sls remove` must never delete the database) holds.
+  - Q: Does the docstring pass change behaviour? A: No. The diff has 0 removed lines and only docstrings plus formatter blank lines added; the full suite still gives 691 passed and 100% branch coverage.
+  - Q: Where is the score most at risk? A: Docs & Presentation: without a working video link the video half of that line scores nothing, which outweighs every other open item.
