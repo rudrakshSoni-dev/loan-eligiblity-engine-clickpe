@@ -19,6 +19,10 @@ Everything below was run on a real AWS account (`ap-southeast-2`). Numbers come 
 
 ## Architecture
 
+![Architecture: browser upload to S3, SQS fan-out to load-chunk, private RDS, n8n workflows A, B, C and E on EC2, SES to the test inbox](docs/screenshots/loan-eligiblity-engine.svg)
+
+Editable source: [docs/architecture.excalidraw](docs/architecture.excalidraw). The Mermaid diagram below is the detailed version, including the Error Workflow links.
+
 Full detail, private-versus-public table and the list of designed-but-not-built items: [docs/architecture.md](docs/architecture.md).
 
 ```mermaid
